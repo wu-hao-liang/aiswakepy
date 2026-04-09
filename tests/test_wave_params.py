@@ -1,0 +1,143 @@
+"""Tests for shipwake.stages.wave_params — Step 6."""
+
+import numpy as np
+import pandas as pd
+import pytest
+
+from aiswakepy.stages.wave_params import compute_wave_params, export_gis
+
+_G = 9.78
+_KNOTS_TO_MS = 0.5144444
+
+
+def _make_row(**kwargs) -> pd.DataFrame:
+    """Build a single-row DataFrame with all required columns."""
+    defaults = dict(
+        mmsi=123456789,
+        width=30.0,
+        length=200.0,
+        draught=10.0,
+        obstime=pd.Timestamp("2024-01-01 00:00:00"),
+        longitude=103.85,
+        latitude=1.29,
+        sog=8.0,
+        cog=90.0,
+        typecargo=80,      # tanker
+        WaterDepth=15.0,
+        segment_id=1,
+    )
+    defaults.update(kwargs)
+    return pd.DataFrame([defaults])
+
+
+# ---------------------------------------------------------------------------
+# Hand-calculated reference values for a tanker at 8 kts, depth 15 m
+# L=200, B=30, d=10, SOG=8kts, depth=15m, type=tanker (L_Le method)
+# Cb=0.86, Le=200/7≈28.571
+# LengthWL = 200*0.8 = 160
+# SOGms = 8*0.5144444 = 4.1155...
+# Alpha = 2.35*(1-0.86) = 0.329
+# Beta = 1 + 8*tanh(0.45*(160/28.571 - 2))^3 = 1 + 8*tanh(0.45*(5.6-2))^3
+#       = 1 + 8*tanh(1.62)^3 ≈ 1 + 8*(0.9253)^3 ≈ 1 + 8*0.792 ≈ 7.34
+# FroudeM = (4.1155/sqrt(9.78*160)) * exp(0.329*10/15)
+#          = (4.1155/39.56) * exp(0.2193)
+#          = 0.10402 * 1.2452 ≈ 0.1295
+# FroudeD = 4.1155 / sqrt(9.78*15) = 4.1155 / 12.116 ≈ 0.3397
+# BF = Beta*(FroudeM-0.1)^2 ≈ 7.34*(0.0295)^2 ≈ 0.00639
+# GHV2 = BF*(B/(2*L))^(-1/3) = 0.00639*(30/400)^(-1/3) = 0.00639*(0.075)^(-1/3)
+#       = 0.00639 * 2.3714 ≈ 0.01516
+# H_Kriebel = GHV2/g * SOGms^2 = 0.01516/9.78 * 16.937 ≈ 0.02626
+# Theta = 35.27*(1-exp(12*(0.3397-1))) = 35.27*(1-exp(-7.924)) ≈ 35.27*0.99964 ≈ 35.257
+# WakeDirPort = 90 - 35.257 ≈ 54.74
+# WakeDirStarboard = 90 + 35.257 ≈ 125.26
+
+def test_hand_calc_single_row():
+    df = _make_row(sog=8.0, cog=90.0, WaterDepth=15.0)
+    result = compute_wave_params(df, cb_method="L_Le", g=_G)
+    assert len(result) == 1, "Row should pass all filters"
+
+    r = result.iloc[0]
+    assert r["SOGms"] == pytest.approx(8.0 * _KNOTS_TO_MS, rel=1e-4)
+    assert r["block_coeff"] == pytest.approx(0.86, rel=1e-4)
+    assert r["bow_entry_m"] == pytest.approx(200.0 / 7, rel=1e-4)
+    assert r["LengthWL"] == pytest.approx(160.0, rel=1e-4)
+    assert r["Alpha"] == pytest.approx(0.329, rel=1e-3)
+    assert r["FroudeM"] == pytest.approx(0.1295, rel=0.02)
+    assert r["FroudeD"] == pytest.approx(0.3397, rel=0.01)
+    assert r["H_Kriebel"] > 0
+    assert r["Theta"] == pytest.approx(35.26, abs=0.5)
+
+
+def test_wake_dir_uses_theta_not_90():
+    """WakeDirPort = COG - θ, NOT COG - 90."""
+    df = _make_row(sog=8.0, cog=90.0, WaterDepth=15.0)
+    result = compute_wave_params(df, cb_method="L_Le", g=_G)
+    assert len(result) == 1
+    r = result.iloc[0]
+    theta = r["Theta"]
+    assert r["WakeDirPort"] == pytest.approx(90.0 - theta, rel=1e-6)
+    assert r["WakeDirStarboard"] == pytest.approx(90.0 + theta, rel=1e-6)
+    # Confirm it is NOT ±90
+    assert abs(r["WakeDirPort"] - 0.0) > 5.0
+
+
+def test_froude_low_filtered():
+    """SOG so low that FroudeM < 0.1 → row removed."""
+    df = _make_row(sog=0.1, WaterDepth=15.0)
+    result = compute_wave_params(df)
+    assert len(result) == 0
+
+
+def test_froude_high_filtered():
+    """Very high speed → FroudeM > 0.5 → row removed."""
+    df = _make_row(sog=25.0, WaterDepth=5.0)
+    result = compute_wave_params(df)
+    assert len(result) == 0
+
+
+def test_sog_limit_filtered():
+    df = _make_row(sog=15.0, WaterDepth=15.0)
+    result = compute_wave_params(df, max_sog_knots=12.0)
+    assert len(result) == 0
+
+
+def test_bl_ratio_filtered():
+    """Beam/Length = 30/50 = 0.6 > 0.3 → filtered."""
+    df = _make_row(length=50.0, width=30.0, WaterDepth=15.0, sog=5.0)
+    result = compute_wave_params(df, max_bl_ratio=0.3)
+    assert len(result) == 0
+
+
+def test_zero_depth_filtered():
+    df = _make_row(WaterDepth=0.0)
+    result = compute_wave_params(df)
+    assert len(result) == 0
+
+
+def test_multiple_rows_mixed_filter():
+    rows = [
+        _make_row(sog=8.0, WaterDepth=15.0).iloc[0],   # valid
+        _make_row(sog=0.1, WaterDepth=15.0).iloc[0],   # FroudeM too low
+        _make_row(sog=15.0, WaterDepth=15.0).iloc[0],  # SOG too high
+    ]
+    df = pd.DataFrame(rows).reset_index(drop=True)
+    result = compute_wave_params(df)
+    assert len(result) == 1
+
+
+def test_gis_export_columns():
+    df = _make_row(sog=8.0, WaterDepth=15.0)
+    wave = compute_wave_params(df)
+    gis = export_gis(wave)
+    assert "WaterDepth" in gis.columns
+    assert "H_Kriebel" in gis.columns
+    assert "WakeDirPort" in gis.columns
+    assert "WakeDirStarboard" in gis.columns
+    assert len(gis.columns) == 15
+
+
+def test_does_not_mutate_input():
+    df = _make_row(sog=8.0, WaterDepth=15.0)
+    original_cols = set(df.columns)
+    _ = compute_wave_params(df)
+    assert set(df.columns) == original_cols

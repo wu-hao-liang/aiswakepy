@@ -1,0 +1,52 @@
+# Python
+__pycache__/
+*.py[oc]
+*.pyd
+build/
+dist/
+wheels/
+*.egg-info/
+.eggs/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# uv
+.python-version
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb_checkpoints/
+
+# Test / coverage
+.pytest_cache/
+.coverage
+htmlcov/
+coverage.xml
+
+# Example data — large binary and input files not tracked in git
+examples/bathymetry/
+examples/tide/
+examples/ais/
+examples/coastline/
+examples/matlab_reference/
+
+# Pipeline outputs
+output/
+output_validation/
+
+# OS
+Thumbs.db
+.DS_Store
+desktop.ini
+
+# Claude Code
+.claude/
+
+# IDEs
+.vscode/
+.idea/
+*.suo
+*.user

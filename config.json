@@ -1,0 +1,42 @@
+{
+  "ais": {
+    "raw_csv": "examples/ais/AIS_2563.csv",
+    "min_speed_knots": 0.5,
+    "interp_spacing_m": 20,
+    "traj_gap_s": 600,
+    "interp_trigger_m": 100
+  },
+  "vessel": {
+    "cb_method": "L_Le",
+    "block_coeff_csv": "aiswakepy/vessel/ShipDataEDnew.csv",
+    "waterline_factor": 0.8
+  },
+  "bathymetry": {
+    "source": "examples/bathymetry/61803960_WestCoast_HD_25m_mCD_Prod_v20260220.mesh",
+    "tide_dfs0": "examples/tide/Predicted Water Level (CD)_2024_WestCoast_6min.dfs0",
+    "underkeel_margin_m": 1.0
+  },
+  "coastline": {
+    "shapefile": "examples/coastline/Coast_P1.shp"
+  },
+  "wave": {
+    "max_froude_m": 0.5,
+    "min_froude_m": 0.1,
+    "max_bf": 0.4,
+    "max_sog_knots": 12.0,
+    "max_bl_ratio": 0.3,
+    "rho_water": 1026,
+    "gravity": 9.78
+  },
+  "impact": {
+    "max_propagation_m": 2000,
+    "wake_cutoff_m": 0.01
+  },
+  "output": {
+    "directory": "output/",
+    "save_parquet": true,
+    "plot_wave_height_map": true,
+    "plot_period_map": true,
+    "plot_vessel_diagrams": false
+  }
+}
