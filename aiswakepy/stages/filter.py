@@ -15,7 +15,6 @@ from pathlib import Path
 import geopandas as gpd
 import numpy as np
 import pandas as pd
-from shapely.geometry import Point
 from shapely.ops import unary_union
 
 from aiswakepy.geo.geodesy import forward_point, geodetic_distance
@@ -92,13 +91,11 @@ def validate_speed(df: pd.DataFrame) -> pd.DataFrame:
     v_calc = np.full(len(df), np.nan)
     dist_m = np.full(len(df), np.nan)
 
-    for i in range(1, len(df)):
-        if segs[i] == segs[i - 1]:
-            d = geodetic_distance(lons[i - 1], lats[i - 1], lons[i], lats[i])
-            dt = (times[i] - times[i - 1]) / np.timedelta64(1, "s")
-            dist_m[i] = d
-            if dt > 0:
-                v_calc[i] = (d / dt) / _KNOTS_TO_MS  # m/s → knots
+    same_seg = segs[1:] == segs[:-1]
+    d = geodetic_distance(lons[:-1], lats[:-1], lons[1:], lats[1:])
+    dt = (times[1:] - times[:-1]) / np.timedelta64(1, "s")
+    dist_m[1:] = np.where(same_seg, d, np.nan)
+    v_calc[1:] = np.where(same_seg & (dt > 0), d / dt / _KNOTS_TO_MS, np.nan)
 
     # First point of each segment: keep reported SOG
     sog = df["sog"].to_numpy(dtype=float).copy()
@@ -131,41 +128,53 @@ def interpolate_trajectories(
         and pd.api.types.is_numeric_dtype(df[c])
     ]
 
-    new_rows: list[pd.DataFrame] = []
+    out_chunks: list[pd.DataFrame] = []
 
     for _, seg_df in df.groupby("segment_id", sort=False):
         seg_df = seg_df.reset_index(drop=True)
-        seg_rows = [seg_df.iloc[[0]]]
+        n = len(seg_df)
 
-        for i in range(1, len(seg_df)):
+        # One numpy buffer per column; avoids O(N²) DataFrame concat within segment
+        col_bufs: dict[str, list[np.ndarray]] = {c: [] for c in numeric_cols}
+        time_buf: list[np.ndarray] = []
+        segid_buf: list[np.ndarray] = []
+
+        def _push_single(idx: int) -> None:
+            for col in numeric_cols:
+                col_bufs[col].append(np.array([seg_df.at[idx, col]], dtype=float))
+            time_buf.append(np.array([seg_df.at[idx, "obstime"].timestamp()]))
+            segid_buf.append(np.array([seg_df.at[idx, "segment_id"]], dtype=int))
+
+        _push_single(0)
+
+        for i in range(1, n):
             dist = seg_df.at[i, "_dist_to_prev_m"]
             if pd.isna(dist) or dist <= trigger_m:
-                seg_rows.append(seg_df.iloc[[i]])
-                continue
+                _push_single(i)
+            else:
+                n_pts = max(2, int(np.ceil(dist / spacing_m)) + 1)
+                ts = np.linspace(0.0, 1.0, n_pts)[1:]
 
-            n_pts = max(2, int(np.ceil(dist / spacing_m)) + 1)
-            ts = np.linspace(0.0, 1.0, n_pts)[1:]  # exclude start (already added)
+                t0 = seg_df.at[i - 1, "obstime"].timestamp()
+                t1 = seg_df.at[i, "obstime"].timestamp()
+                time_buf.append(t0 + (t1 - t0) * ts)
+                segid_buf.append(
+                    np.full(len(ts), seg_df.at[i, "segment_id"], dtype=int)
+                )
 
-            t0 = seg_df.at[i - 1, "obstime"].timestamp()
-            t1 = seg_df.at[i, "obstime"].timestamp()
+                for col in numeric_cols:
+                    v0 = float(seg_df.at[i - 1, col])
+                    v1 = float(seg_df.at[i, col])
+                    col_bufs[col].append(v0 + (v1 - v0) * ts)
 
-            interp_times = pd.to_datetime(
-                [t0 + (t1 - t0) * t for t in ts], unit="s", utc=False
-            )
+        data = {col: np.concatenate(col_bufs[col]) for col in numeric_cols}
+        data["obstime"] = pd.to_datetime(
+            np.concatenate(time_buf), unit="s", utc=False
+        )
+        data["segment_id"] = np.concatenate(segid_buf)
+        out_chunks.append(pd.DataFrame(data))
 
-            block = {}
-            for col in numeric_cols:
-                v0 = seg_df.at[i - 1, col]
-                v1 = seg_df.at[i, col]
-                block[col] = v0 + (v1 - v0) * ts
-
-            block["obstime"] = interp_times
-            block["segment_id"] = seg_df.at[i, "segment_id"]
-            seg_rows.append(pd.DataFrame(block))
-
-        new_rows.append(pd.concat(seg_rows, ignore_index=True))
-
-    result = pd.concat(new_rows, ignore_index=True)
+    result = pd.concat(out_chunks, ignore_index=True)
     if "_dist_to_prev_m" in result.columns:
         result = result.drop(columns=["_dist_to_prev_m"])
     return result
@@ -181,7 +190,7 @@ def mask_land(df: pd.DataFrame, coastline_shp: str | Path) -> pd.DataFrame:
     land = unary_union(coast.geometry)
 
     points = gpd.GeoSeries(
-        [Point(lon, lat) for lon, lat in zip(df["longitude"], df["latitude"])],
+        gpd.points_from_xy(df["longitude"], df["latitude"]),
         crs="EPSG:4326",
     )
     in_land = points.within(land)

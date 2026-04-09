@@ -61,6 +61,7 @@ class OutputConfig(BaseModel):
     plot_wave_height_map: bool = True
     plot_period_map: bool = True
     plot_vessel_diagrams: bool = False
+    plot_top_n_per_bin: int = 10
 
 
 class ShipwakeConfig(BaseModel):

@@ -244,6 +244,23 @@
 
 ---
 
+## Step 12: Performance Optimization for 2M Records
+
+**Goal**: Scale the pipeline from ~2,300 to ~2,000,000 AIS records. Target: 3–12 min end-to-end (down from 45 min – 2.5 hrs). Full plan in `PERFORMANCE_PLAN.md`.
+
+| Fix | File(s) | Change | Status |
+|-----|---------|--------|--------|
+| 1 | `stages/filter.py` | Vectorize `validate_speed` — replace per-row loop with numpy array call to `geodetic_distance` | ✅ done |
+| 2 | `stages/filter.py` | Vectorize `mask_land` — replace list-comp `[Point(…)]` with `gpd.points_from_xy()` | ✅ done |
+| 3 | `stages/filter.py` | Reduce allocations in `interpolate_trajectories` — numpy buffers per column, single `pd.concat` per segment | ✅ done |
+| 4 | `geo/coastline.py` + `stages/shore_impact.py` | STRtree spatial index for coastline intersection; vectorized ray endpoints; `rich.progress` bar | ✅ done |
+| 5 | `viz/wave_map.py` + `config.py` | Coastline-binned top-N point selection before scatter (configurable `plot_top_n_per_bin`) | ✅ done |
+| 6 | `pipeline.py` | Replace `print()` with `rich.console.Console`; add per-stage elapsed timing | ✅ done |
+
+**Verification**: `uv run pytest tests/ -q` after each fix; `uv run python validate_pipeline.py` after all fixes.
+
+---
+
 ## Step 11: End-to-End Validation with Real Data
 
 **Goal**: Run the pipeline on the actual example dataset from the project and compare with MATLAB outputs.

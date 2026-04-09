@@ -8,8 +8,74 @@ import geopandas as gpd
 import numpy as np
 from shapely.geometry import LineString, MultiPolygon, Point, Polygon
 from shapely.ops import unary_union
+from shapely.strtree import STRtree
 
 from aiswakepy.geo.geodesy import forward_point, geodetic_distance
+
+
+def _extract_boundary_segments(geom) -> list[LineString]:
+    """Recursively decompose a geometry's boundary into individual 2-point LineStrings."""
+    segments: list[LineString] = []
+    if geom.geom_type in ("LinearRing", "LineString"):
+        coords = list(geom.coords)
+        for i in range(len(coords) - 1):
+            segments.append(LineString([coords[i], coords[i + 1]]))
+    elif hasattr(geom, "geoms"):
+        for g in geom.geoms:
+            segments.extend(_extract_boundary_segments(g))
+    return segments
+
+
+def build_coastline_index(
+    coastline: MultiPolygon | Polygon,
+) -> tuple[STRtree, list[LineString]]:
+    """Build a Shapely STRtree from individual boundary segments of the coastline.
+
+    Returns ``(strtree, segments)`` for use with
+    :func:`find_shore_intersection_indexed`.  Building the tree once and reusing
+    it across many rays reduces the shore-impact stage from O(N × C) to
+    O(N × (log C + k)).
+    """
+    segments = _extract_boundary_segments(coastline.boundary)
+    return STRtree(segments), segments
+
+
+def find_shore_intersection_indexed(
+    ray: LineString,
+    strtree: STRtree,
+    segments: list[LineString],
+) -> tuple[float, float, float] | None:
+    """Find the closest intersection using a pre-built STRtree.
+
+    Equivalent to :func:`find_shore_intersection` but uses the spatial index to
+    test only candidate segments whose bounding box overlaps the ray.
+    """
+    origin = ray.coords[0]
+    candidate_indices = strtree.query(ray)
+
+    best_pt: Point | None = None
+    best_dist = np.inf
+
+    for idx in candidate_indices:
+        isect = ray.intersection(segments[idx])
+        if isect.is_empty:
+            continue
+        pts = (
+            list(isect.geoms)
+            if hasattr(isect, "geoms")
+            else [isect]
+        )
+        for pt in pts:
+            if pt.geom_type != "Point":
+                continue
+            d = geodetic_distance(origin[0], origin[1], pt.x, pt.y)
+            if d < best_dist:
+                best_dist = d
+                best_pt = pt
+
+    if best_pt is None:
+        return None
+    return best_pt.x, best_pt.y, best_dist
 
 
 def load_coastline(shp_path: str | Path) -> MultiPolygon | Polygon:
