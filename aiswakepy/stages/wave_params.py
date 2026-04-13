@@ -55,22 +55,44 @@ def compute_wave_params(
     -------
     DataFrame with all computed columns, filtered rows removed.
     """
+    from aiswakepy._progress import Spinner
+    spinner = Spinner(desc="compute_wave_params")
+
     # --- Kriebel origin wave height and Froude numbers ---
     df = compute_kriebel(df, cb_method=cb_method, g=g)
 
-    # --- Wave period (empirical, s) ---
+    # --- T = 0.27 * SOG (knots→s): divergent wave period ---
+    # From deep-water Kelvin wake dispersion: T = 2π·V·cos(θ)/g, where
+    # θ = arcsin(1/√3) ≈ 35.26°, cos(θ) ≈ 0.8165, and 1 knot = 0.5144 m/s
+    # gives coefficient 2π × 0.8165 × 0.5144 / 9.81 ≈ 0.27. — Kirkegaard et al. (1998)
     df["T"] = 0.27 * df["sog"]
 
-    # --- Wave energy ---
+    # --- Emax = ρg²H²T²/(16π): maximum wave energy per unit crest width (J/m) ---
+    # Energy of one wave crest = E_density × L₀, where E_density = ρgH²/8
+    # (energy per unit surface area) and L₀ = gT²/(2π) (deep-water wavelength).
+    # Using H_Kriebel approximates the energy of the maximum crest. — linear wave theory
     df["Emax"] = (rho * g ** 2 * df["H_Kriebel"] ** 2 * df["T"] ** 2) / (16.0 * np.pi)
+
+    # --- Etot = 10.8 * Emax^0.82: total wake group energy (J/m) ---
+    # Empirical power-law fit relating total wake energy to the maximum crest
+    # energy; accounts for all waves in the wake group. — Sorensen (1997)
     df["Etot"] = 10.8 * df["Emax"] ** 0.82
 
-    # --- Wake spreading angle theta (deg) ---
-    # Approaches arcsin(1/sqrt(3)) ~= 35.26 deg in deep water (Fd -> 0)
-    df["Theta"] = 35.27 * (1.0 - np.exp(12.0 * (df["FroudeD"] - 1.0)))
+    # --- Theta: angle of diverging waves relative to vessel heading (deg) ---
+    # Deep-water Kelvin limit → arcsin(1/√3) ≈ 35.26°; shrinks to 0° as Fd→1
+    # (critical depth speed). Empirical curve fit to Havelock (1908) finite-depth
+    # theory. — Kriebel & Seelig (2005); Havelock (1908)
+    _theta_deep = np.degrees(np.arcsin(1.0 / np.sqrt(3.0)))
+    df["Theta"] = _theta_deep * (1.0 - np.exp(12.0 * (df["FroudeD"] - 1.0)))
 
-    # --- Wave celerity component and characteristic period ---
+    # --- Cel = V·cos(θ): divergent wave celerity (m/s) ---
+    # Vessel speed component in the wave propagation direction; the Kelvin
+    # stationarity condition fixes the wave pattern relative to the ship.
     df["Cel"] = df["SOGms"] * np.cos(np.radians(df["Theta"]))
+
+    # --- Tc = 2π·Cel/g: depth-adjusted divergent wave period (s) ---
+    # From deep-water dispersion T = 2πc/g; generalises T = 0.27×SOG
+    # to finite depth where θ (and therefore Cel) varies with Fd.
     df["Tc"] = (_TWO_PI * df["Cel"]) / g
 
     # --- Wake propagation directions: COG +/- theta ---
@@ -89,7 +111,9 @@ def compute_wave_params(
         (df["BLratio"] <= max_bl_ratio) &
         (df["WaterDepth"] > 0)
     )
-    return df[mask].reset_index(drop=True)
+    result = df[mask].reset_index(drop=True)
+    spinner.done(rows=len(result))
+    return result
 
 
 def export_gis(df: pd.DataFrame) -> pd.DataFrame:

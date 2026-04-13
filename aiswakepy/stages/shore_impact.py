@@ -11,7 +11,6 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
-from rich.progress import track
 from shapely.geometry import LineString
 
 from aiswakepy.geo.coastline import (
@@ -59,20 +58,21 @@ def compute_shore_impact(
     # Vectorize ray endpoint computation for both sides at once
     lons = df_wave["longitude"].to_numpy()
     lats = df_wave["latitude"].to_numpy()
+    dist = np.full(len(lons), max_propagation_m)
     port_lon2, port_lat2 = forward_point(
-        lons, lats, df_wave["WakeDirPort"].to_numpy(), max_propagation_m
+        lons, lats, df_wave["WakeDirPort"].to_numpy(), dist
     )
     stbd_lon2, stbd_lat2 = forward_point(
-        lons, lats, df_wave["WakeDirStarboard"].to_numpy(), max_propagation_m
+        lons, lats, df_wave["WakeDirStarboard"].to_numpy(), dist
     )
 
+    from aiswakepy._progress import Spinner
+    total = len(df_wave)
+    spinner = Spinner(total=total, desc="Shore impact")
+
     records = []
-    for i, row in track(
-        enumerate(df_wave.itertuples(index=False)),
-        total=len(df_wave),
-        description="Shore impact",
-        transient=True,
-    ):
+    for i, row in enumerate(df_wave.itertuples(index=False)):
+        spinner.update(i + 1)
         for side, end_lon, end_lat in [
             ("port", float(port_lon2[i]), float(port_lat2[i])),
             ("stbd", float(stbd_lon2[i]), float(stbd_lat2[i])),
@@ -122,6 +122,8 @@ def compute_shore_impact(
                 "SOG": row.sog,
                 "Side": side,
             })
+
+    spinner.done(total)
 
     if not records:
         return pd.DataFrame(columns=[

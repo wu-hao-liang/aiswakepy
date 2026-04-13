@@ -73,13 +73,21 @@ def load_bathymetry(path: str | Path) -> BathymetryMesh:
 # Tidal water level
 # ---------------------------------------------------------------------------
 
-def load_tide(dfs0_path: str | Path) -> pd.Series:
+def load_tide(dfs0_path: str | Path, item: str | None = None) -> pd.Series:
     """Read a .dfs0 tidal prediction file and return a time-indexed Series.
+
+    Parameters
+    ----------
+    dfs0_path : path to the .dfs0 file.
+    item      : item name to read. If None, the first item (index 0) is used.
 
     Values are water level in metres relative to Chart Datum (CD).
     """
-    da = mikeio.read(str(dfs0_path), items=0)
-    series = da.to_pandas().iloc[:, 0]
+    if item is not None:
+        ds = mikeio.read(str(dfs0_path), items=item)
+    else:
+        ds = mikeio.read(str(dfs0_path))
+    series = ds[0].to_pandas()
     series.index = pd.to_datetime(series.index, utc=False)
     return series
 

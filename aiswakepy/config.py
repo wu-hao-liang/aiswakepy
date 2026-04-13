@@ -12,9 +12,11 @@ from pydantic import BaseModel, field_validator, model_validator
 class AisConfig(BaseModel):
     raw_csv: str
     min_speed_knots: float = 0.5
-    interp_spacing_m: float = 20.0
-    traj_gap_s: float = 600.0
-    interp_trigger_m: float = 100.0
+    traj_gap_s: float = 180.0
+    max_velocity_knots: float = 12.0
+    max_acceleration_ms2: float = 0.2
+    interp_interval_s: float = 30.0
+    study_area_shp: str | None = None
 
 
 class VesselConfig(BaseModel):
@@ -26,6 +28,7 @@ class VesselConfig(BaseModel):
 class BathymetryConfig(BaseModel):
     source: str
     tide_dfs0: str | None = None
+    tide_item: str | None = None
     underkeel_margin_m: float = 1.0
 
 
@@ -61,7 +64,14 @@ class OutputConfig(BaseModel):
     plot_wave_height_map: bool = True
     plot_period_map: bool = True
     plot_vessel_diagrams: bool = False
-    plot_top_n_per_bin: int = 10
+    plot_max_points: int = 100_000
+    # Configurable output filenames (relative to directory)
+    wave_height_map_name: str = "WaveHeightMap.png"
+    wave_period_map_name: str = "WavePeriodMap.png"
+    wave_params_name: str = "wave_params.parquet"
+    shore_impact_name: str = "shore_impact.csv"
+    # Stage CSV backups: saved as {ais_stem}_{stage}.csv in output directory
+    save_stage_csv: bool = True
 
 
 class ShipwakeConfig(BaseModel):

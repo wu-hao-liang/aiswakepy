@@ -7,6 +7,7 @@ clearance.
 
 from __future__ import annotations
 
+import warnings
 from pathlib import Path
 
 import numpy as np
@@ -19,6 +20,7 @@ def assign_depth(
     df: pd.DataFrame,
     bathy_path: str | Path,
     tide_dfs0_path: str | Path | None = None,
+    tide_item: str | None = None,
     underkeel_margin_m: float = 1.0,
     _bathy: BathymetryMesh | None = None,
 ) -> pd.DataFrame:
@@ -29,6 +31,7 @@ def assign_depth(
     df:               Filtered AIS DataFrame (output of filter_ais).
     bathy_path:       Path to .mesh or .dfsu bathymetry file.
     tide_dfs0_path:   Optional path to .dfs0 tidal prediction file.
+    tide_item:        Item name to read from the .dfs0 file.
     underkeel_margin_m: Minimum required clearance above draught (m).
     _bathy:           Pre-loaded BathymetryMesh (for testing / caching).
 
@@ -37,6 +40,9 @@ def assign_depth(
     DataFrame with added ``WaterDepth`` column; rows with NaN depth or
     insufficient under-keel clearance are removed.
     """
+    from aiswakepy._progress import Spinner
+    spinner = Spinner(desc="assign depth and filter by draught")
+
     df = df.copy()
 
     bathy = _bathy if _bathy is not None else load_bathymetry(bathy_path)
@@ -47,7 +53,20 @@ def assign_depth(
 
     # Add tidal level if provided
     if tide_dfs0_path is not None:
-        tide_series = load_tide(tide_dfs0_path)
+        tide_series = load_tide(tide_dfs0_path, item=tide_item)
+
+        # Verify AIS time range is covered by the tide series
+        ais_t_min = pd.Timestamp(df["obstime"].min())
+        ais_t_max = pd.Timestamp(df["obstime"].max())
+        tide_t_min = tide_series.index.min()
+        tide_t_max = tide_series.index.max()
+        if ais_t_min < tide_t_min or ais_t_max > tide_t_max:
+            warnings.warn(
+                f"AIS time range [{ais_t_min:%Y-%m-%d %H:%M} – {ais_t_max:%Y-%m-%d %H:%M}] "
+                f"extends beyond tide series [{tide_t_min:%Y-%m-%d %H:%M} – {tide_t_max:%Y-%m-%d %H:%M}]. "
+                f"Records outside this range will be dropped."
+            )
+
         tide_levels = snap_to_tide(df["obstime"], tide_series)
         # Only add tide where both depth and tide are valid
         valid_tide = ~np.isnan(tide_levels)
@@ -63,4 +82,6 @@ def assign_depth(
     # Under-keel clearance filter
     df = df[df["WaterDepth"] >= df["draught"] + underkeel_margin_m]
 
-    return df.reset_index(drop=True)
+    result = df.reset_index(drop=True)
+    spinner.done(rows=len(result))
+    return result

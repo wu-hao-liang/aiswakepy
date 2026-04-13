@@ -125,7 +125,7 @@ def test_assign_depth_with_tide():
     # Patch load_tide to return our synthetic series
     import aiswakepy.stages.depth as depth_mod
     original = depth_mod.load_tide
-    depth_mod.load_tide = lambda _: tide
+    depth_mod.load_tide = lambda _, item=None: tide
     try:
         result = assign_depth(df, bathy_path="dummy.mesh",
                               tide_dfs0_path="dummy.dfs0", _bathy=stub)
@@ -148,7 +148,7 @@ def test_assign_depth_tide_outside_range_drops_rows():
 
     import aiswakepy.stages.depth as depth_mod
     original = depth_mod.load_tide
-    depth_mod.load_tide = lambda _: tide
+    depth_mod.load_tide = lambda _, item=None: tide
     try:
         result = assign_depth(df, bathy_path="dummy.mesh",
                               tide_dfs0_path="dummy.dfs0", _bathy=stub)

@@ -2,9 +2,11 @@
   "ais": {
     "raw_csv": "examples/ais/AIS_2563.csv",
     "min_speed_knots": 0.5,
-    "interp_spacing_m": 20,
-    "traj_gap_s": 600,
-    "interp_trigger_m": 100
+    "traj_gap_s": 180,
+    "max_velocity_knots": 12.0,
+    "max_acceleration_ms2": 0.2,
+    "interp_interval_s": 30.0,
+    "study_area_shp": null
   },
   "vessel": {
     "cb_method": "L_Le",
@@ -14,6 +16,7 @@
   "bathymetry": {
     "source": "examples/bathymetry/61803960_WestCoast_HD_25m_mCD_Prod_v20260220.mesh",
     "tide_dfs0": "examples/tide/Predicted Water Level (CD)_2024_WestCoast_6min.dfs0",
+    "tide_item": "Predicted tidal elevation",
     "underkeel_margin_m": 1.0
   },
   "coastline": {
@@ -37,6 +40,11 @@
     "save_parquet": true,
     "plot_wave_height_map": true,
     "plot_period_map": true,
-    "plot_vessel_diagrams": false
+    "plot_vessel_diagrams": false,
+    "wave_height_map_name": "WaveHeightMap.png",
+    "wave_period_map_name": "WavePeriodMap.png",
+    "wave_params_name": "wave_params.parquet",
+    "shore_impact_name": "shore_impact.csv",
+    "save_stage_csv": true
   }
 }

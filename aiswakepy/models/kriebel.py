@@ -67,28 +67,41 @@ def compute_kriebel(
     df["SOGms"] = df["sog"] * _KNOTS_TO_MS
     df["LengthWL"] = df["length"] * 0.8
 
-    # --- Depth-adjustment coefficient Alpha = 2.35 * (1 - Cb) ---
+    # --- Alpha = 2.35 * (1 - Cb): finite-depth adjustment exponent ---
+    # Scales the shallow-water amplification of the modified Froude number
+    # via the hull block coefficient. — Kriebel & Seelig (2005)
     df["Alpha"] = 2.35 * (1.0 - df["block_coeff"])
 
-    # --- Shape factor Beta = 1 + 8 * tanh(0.45 * (L/Le - 2))^3 ---
+    # --- Beta = 1 + 8 * tanh(0.45 * (L/Le - 2))^3: hull shape factor ---
+    # Derived from bow entry length Le (half-angle of entrance).
+    # β→1 for fine bows (L/Le≈2), β→9 for blunt bows. — Kriebel & Seelig (2005)
     ratio = df["LengthWL"] / df["bow_entry_m"]
     df["Beta"] = 1.0 + 8.0 * np.tanh(0.45 * (ratio - 2.0)) ** 3
 
-    # --- Modified Froude number Fm = (V / sqrt(g*L)) * exp(alpha * d / h) ---
+    # --- FroudeM = (V/√(g·L)) * exp(α·d/h): modified Froude number Fr* ---
+    # Adjusts the length-based Froude number for finite water depth via the
+    # draught/depth ratio. — Kriebel & Seelig (2005)
     df["FroudeM"] = (
         df["SOGms"] / np.sqrt(g * df["LengthWL"])
     ) * np.exp(df["Alpha"] * df["draught"] / df["WaterDepth"])
 
-    # --- Depth Froude number Fd = V / sqrt(g * h) ---
+    # --- FroudeD = V/√(g·h): depth Froude number ---
     df["FroudeD"] = df["SOGms"] / np.sqrt(g * df["WaterDepth"])
 
-    # --- BF = Beta * (Fm - 0.1)^2 ---
+    # --- BF = β * (Fr* − 0.1)²: dimensionless wave height at y/L = 1 ---
+    # Represents the normalised wave height at one vessel-length lateral distance.
+    # Filter BF > 0.4: no data in Kriebel's 16-source dataset exceeds this limit.
+    # — Kriebel & Seelig (2005)
     df["BF"] = df["Beta"] * (df["FroudeM"] - 0.1) ** 2
 
-    # --- GH/V^2 = BF * (B / 2L)^(-1/3) ---
+    # --- GHV2 = g·H/V² = BF * (y/L)^(-1/3): dimensionless wave height ---
+    # Core Kriebel output. Evaluated at normalised lateral distance y/L = B/(2L)
+    # from the sailing line (y = B/2 at the hull, L = vessel length).
+    # — Kriebel & Seelig (2005)
     df["GHV2"] = df["BF"] * (df["width"] / (2.0 * df["length"])) ** (-1.0 / 3.0)
 
-    # --- Wave height at origin: H = GHV2 / g * V^2 ---
+    # --- H_Kriebel = GHV2 * V²/g: dimensional maximum wave height at the hull ---
+    # Recovers H from the dimensionless ratio: H = (g·H/V²) × V²/g.
     df["H_Kriebel"] = df["GHV2"] / g * df["SOGms"] ** 2
 
     return df
