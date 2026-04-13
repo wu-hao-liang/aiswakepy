@@ -101,8 +101,8 @@ def snap_to_tide(
     Returns an array of tidal water levels (m) aligned to obstimes.
     Timestamps outside the tide series range return NaN.
     """
-    t_obs = pd.to_datetime(obstimes, utc=False)
     tide_idx = tide_series.index
+    t_obs = pd.to_datetime(obstimes, utc=False).astype(tide_idx.dtype)
 
     levels = np.full(len(t_obs), np.nan)
     t_min, t_max = tide_idx[0], tide_idx[-1]
