@@ -1,0 +1,69 @@
+"""Blaauw et al. (1985) empirical ship-wake model.
+
+Reference
+---------
+Blaauw, H.G., de Groot, M.T., Knaap, F.C.M. and Pilarczyk, K.W. (1985).
+Design of Bank Protection of Inland Waterways. Proceedings of the Conference
+on Flexible Armoured Revetments incorporating Geotextiles, London.
+
+Description
+-----------
+Developed for large vessels in deep water. Similar structure to PIANC but
+uses a different Froude exponent and hull-type coefficient A.
+
+    Hmax = A * h * (y/h)^(-1/3) * Fd^2.67
+
+where:
+    h  — water depth (m)
+    y  — lateral distance from sailing line to point of interest (m)
+    Fd — depth Froude number = V / sqrt(g * h)
+    A  — hull-type coefficient:
+            0.80  loaded vessel
+            0.35  vessel with moderate load
+            0.25  lightly loaded vessel
+"""
+
+from __future__ import annotations
+
+import numpy as np
+import pandas as pd
+
+# Standard A coefficients by loading condition
+A_LOADED   = 0.80
+A_MODERATE = 0.35
+A_LIGHT    = 0.25
+
+
+def compute_blaauw(
+    df: pd.DataFrame,
+    dist_m: np.ndarray | float,
+    g: float = 9.78,
+    A: float = A_LOADED,
+) -> pd.Series:
+    """Apply the Blaauw et al. (1985) formula to each AIS fix.
+
+    Parameters
+    ----------
+    df:     DataFrame with ``SOGms``, ``WaterDepth`` columns.
+    dist_m: Lateral distance from sailing line to point of interest (m).
+            Scalar or 1-D array aligned with df rows.
+    g:      Gravitational acceleration (m/s²). Default 9.78 (Singapore).
+    A:      Hull-type coefficient. Use ``A_LOADED`` (0.80), ``A_MODERATE``
+            (0.35), or ``A_LIGHT`` (0.25). Default: ``A_LOADED``.
+
+    Returns
+    -------
+    pd.Series of Hmax values (m).  NaN where applicability filter fails:
+        - depth Froude Fd = V/sqrt(g*h) >= 0.7
+    """
+    v = df["SOGms"].to_numpy(dtype=float)
+    h = df["WaterDepth"].to_numpy(dtype=float)
+    y = np.asarray(dist_m, dtype=float) * np.ones(len(df))
+
+    fd = v / np.sqrt(g * h)
+    hmax = A * h * (y / h) ** (-1.0 / 3.0) * fd ** 2.67
+
+    invalid = (fd >= 0.7) | (h <= 0) | (y <= 0)
+    hmax[invalid] = np.nan
+
+    return pd.Series(hmax, index=df.index, name="H_Blaauw")
