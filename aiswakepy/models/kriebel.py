@@ -22,15 +22,15 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
-from aiswakepy.vessel.block_coeff import get_vessel_params_df
-
 _KNOTS_TO_MS = 0.5144444
 
 
 def compute_kriebel(
     df: pd.DataFrame,
-    cb_method: str = "L_Le",
     g: float = 9.78,
+    min_froude_m: float = 0.1,
+    max_froude_m: float = 0.5,
+    max_bf: float = 0.4,
 ) -> pd.DataFrame:
     """Apply the Kriebel & Seelig (2005) empirical formula to each AIS fix.
 
@@ -50,18 +50,22 @@ def compute_kriebel(
 
     Parameters
     ----------
-    df:        AIS DataFrame with ``WaterDepth`` column (output of assign_depth).
-    cb_method: Block coefficient method: ``"L_Le"``, ``"B_Le"``, or ``"table"``.
-    g:         Local gravitational acceleration (m/s^2). Default 9.78 (Singapore).
+    df:            AIS DataFrame with ``WaterDepth``, ``block_coeff``, and
+                   ``bow_entry_m`` columns (vessel params added by wave_params stage).
+    g:             Local gravitational acceleration (m/s^2). Default 9.78 (Singapore).
+    min_froude_m:  Lower bound for modified Froude number (default 0.1).
+    max_froude_m:  Upper bound for modified Froude number (default 0.5).
+    max_bf:        Upper bound for BF shape factor (default 0.4).
+                   No data in Kriebel's 16-source dataset exceeds BF = 0.4.
 
     Returns
     -------
-    Copy of *df* with the columns above added.
+    Copy of *df* with the columns above added.  ``H_Kriebel`` is set to NaN
+    where the applicability limits are exceeded:
+        - FroudeM < min_froude_m or FroudeM > max_froude_m
+        - BF > max_bf
     """
     df = df.copy()
-
-    # --- Vessel params (block_coeff + bow_entry_m) ---
-    df = get_vessel_params_df(df, method=cb_method)
 
     # --- Speed and length conversions ---
     df["SOGms"] = df["sog"] * _KNOTS_TO_MS
@@ -103,5 +107,13 @@ def compute_kriebel(
     # --- H_Kriebel = GHV2 * V²/g: dimensional maximum wave height at the hull ---
     # Recovers H from the dimensionless ratio: H = (g·H/V²) × V²/g.
     df["H_Kriebel"] = df["GHV2"] / g * df["SOGms"] ** 2
+
+    # --- Applicability filter: NaN where outside Kriebel (2005) valid range ---
+    invalid = (
+        (df["FroudeM"] < min_froude_m) |
+        (df["FroudeM"] > max_froude_m) |
+        (df["BF"] > max_bf)
+    )
+    df.loc[invalid, "H_Kriebel"] = np.nan
 
     return df

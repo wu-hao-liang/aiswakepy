@@ -39,6 +39,7 @@ def compute_blaauw(
     dist_m: np.ndarray | float,
     g: float = 9.78,
     A: float = A_LOADED,
+    max_fd: float = 0.7,
 ) -> pd.Series:
     """Apply the Blaauw et al. (1985) formula to each AIS fix.
 
@@ -50,11 +51,11 @@ def compute_blaauw(
     g:      Gravitational acceleration (m/s²). Default 9.78 (Singapore).
     A:      Hull-type coefficient. Use ``A_LOADED`` (0.80), ``A_MODERATE``
             (0.35), or ``A_LIGHT`` (0.25). Default: ``A_LOADED``.
+    max_fd: Maximum depth Froude number (default 0.7). Formula valid for Fd < max_fd.
 
     Returns
     -------
-    pd.Series of Hmax values (m).  NaN where applicability filter fails:
-        - depth Froude Fd = V/sqrt(g*h) >= 0.7
+    pd.Series of Hmax values (m).  NaN where depth Froude Fd >= max_fd.
     """
     v = df["SOGms"].to_numpy(dtype=float)
     h = df["WaterDepth"].to_numpy(dtype=float)
@@ -63,7 +64,7 @@ def compute_blaauw(
     fd = v / np.sqrt(g * h)
     hmax = A * h * (y / h) ** (-1.0 / 3.0) * fd ** 2.67
 
-    invalid = (fd >= 0.7) | (h <= 0) | (y <= 0)
+    invalid = (fd >= max_fd)
     hmax[invalid] = np.nan
 
     return pd.Series(hmax, index=df.index, name="H_Blaauw")

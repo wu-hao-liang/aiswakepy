@@ -58,7 +58,7 @@ def compute_sorensen(
 
     Returns
     -------
-    pd.Series of Hmax values (m).  NaN where displacement <= 0.
+    pd.Series of Hmax values (m).
     """
     v = df["SOGms"].to_numpy(dtype=float)
     l = df["length"].to_numpy(dtype=float)
@@ -92,8 +92,5 @@ def compute_sorensen(
     dist_adim_safe = np.where(dist_adim > 0, dist_adim, np.nan)
 
     hmax = alpha * dist_adim_safe ** n
-
-    invalid = (w <= 0) | (y <= 0) | (h <= 0)
-    hmax[invalid] = np.nan
 
     return pd.Series(hmax, index=df.index, name="H_Sorensen")

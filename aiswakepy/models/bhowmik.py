@@ -38,15 +38,12 @@ def compute_bhowmik(
 
     Returns
     -------
-    pd.Series of Hmax values (m).  NaN where draught <= 0.
+    pd.Series of Hmax values (m).
     """
     v = df["SOGms"].to_numpy(dtype=float)
     d = df["draught"].to_numpy(dtype=float)
 
     fr_d = v / np.sqrt(g * d)
     hmax = 0.133 * fr_d * d
-
-    invalid = (d <= 0)
-    hmax[invalid] = np.nan
 
     return pd.Series(hmax, index=df.index, name="H_Bhowmik")

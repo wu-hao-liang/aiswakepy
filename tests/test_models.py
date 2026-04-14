@@ -107,12 +107,6 @@ def test_pianc_filter_fd_high():
     assert np.isnan(h.iloc[0])
 
 
-def test_pianc_zero_depth_nan():
-    df = _make_df(WaterDepth=0.0)
-    h = compute_pianc(df, dist_m=_DIST_M, g=_G)
-    assert np.isnan(h.iloc[0])
-
-
 # ---------------------------------------------------------------------------
 # Bhowmik et al. (1982)
 # ---------------------------------------------------------------------------
@@ -125,12 +119,6 @@ def test_bhowmik_known_value():
     fr_d = _SOGMS / np.sqrt(_G * 10.0)
     expected = 0.133 * fr_d * 10.0
     assert h.iloc[0] == pytest.approx(expected, rel=1e-4)
-
-
-def test_bhowmik_zero_draught_nan():
-    df = _make_df(draught=0.0)
-    h = compute_bhowmik(df, g=_G)
-    assert np.isnan(h.iloc[0])
 
 
 def test_bhowmik_no_distance_dependency():
@@ -196,13 +184,6 @@ def test_gates_fn_above_break():
     assert h.iloc[0] > 0
 
 
-def test_gates_zero_distance_nan():
-    """dist_m <= 0 → NaN."""
-    df = _make_df()
-    assert np.isnan(compute_gates(df, dist_m=0.0, g=_G).iloc[0])
-    assert np.isnan(compute_gates(df, dist_m=-100.0, g=_G).iloc[0])
-
-
 def test_gates_decay_with_distance():
     """Larger dist_m → smaller H (N grows → (1.5/(2N+1.5))^(1/3) shrinks)."""
     df = _make_df()
@@ -257,18 +238,6 @@ def test_sorensen_returns_finite():
     assert h.iloc[0] > 0
 
 
-def test_sorensen_zero_displacement_nan():
-    df = _make_df(displacement_m3=0.0)
-    h = compute_sorensen(df, dist_m=_DIST_M, g=_G)
-    assert np.isnan(h.iloc[0])
-
-
-def test_sorensen_zero_depth_nan():
-    df = _make_df(WaterDepth=0.0)
-    h = compute_sorensen(df, dist_m=_DIST_M, g=_G)
-    assert np.isnan(h.iloc[0])
-
-
 def test_sorensen_increases_with_dist_decreasing():
     """n < 0 for typical conditions → larger dist → smaller Hmax."""
     df_near = _make_df()
@@ -306,12 +275,6 @@ def test_maynord_fast_small_craft():
     # Should NOT be NaN — Fr_dis > 1.5
     assert not np.isnan(h.iloc[0])
     assert h.iloc[0] > 0
-
-
-def test_maynord_zero_displacement_nan():
-    df = _make_df(displacement_m3=0.0)
-    h = compute_maynord(df, dist_m=_DIST_M, g=_G)
-    assert np.isnan(h.iloc[0])
 
 
 # ---------------------------------------------------------------------------

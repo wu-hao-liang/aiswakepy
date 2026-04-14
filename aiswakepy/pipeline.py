@@ -106,11 +106,12 @@ def run_pipeline(
             cb_method=config.vessel.cb_method,
             g=config.wave.gravity,
             rho=config.wave.rho_water,
+            max_sog_knots=config.wave.max_sog_knots,
+            max_bl_ratio=config.wave.max_bl_ratio,
+            # Kriebel-specific limits forwarded via formula_kwargs
             min_froude_m=config.wave.min_froude_m,
             max_froude_m=config.wave.max_froude_m,
             max_bf=config.wave.max_bf,
-            max_sog_knots=config.wave.max_sog_knots,
-            max_bl_ratio=config.wave.max_bl_ratio,
         )
         print(
             f"  \u2192 {len(results['df_wave'])} wake events "

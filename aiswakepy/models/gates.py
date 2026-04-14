@@ -76,6 +76,7 @@ def compute_gates(
     df: pd.DataFrame,
     dist_m: "np.ndarray | float",
     g: float = 9.78,
+    max_fr: float = 0.7,
 ) -> pd.Series:
     """Apply the Gates & Herbich (1977) formula to each AIS fix.
 
@@ -85,14 +86,11 @@ def compute_gates(
     dist_m: Lateral (perpendicular) distance from sailing line to the
             observation point (m). Scalar or 1-D array aligned with df rows.
     g:      Gravitational acceleration (m/s²). Default 9.78 (Singapore).
+    max_fr: Maximum length Froude number (default 0.7). Formula valid for Fr < max_fr.
 
     Returns
     -------
-    pd.Series of H (m).  NaN where applicability filter fails:
-        - length Froude Fr = V/sqrt(g*L) >= 0.7
-        - Le <= 0
-        - dist_m <= 0
-        - V <= 0
+    pd.Series of H (m).  NaN where length Froude Fr >= max_fr.
     """
     v   = df["SOGms"].to_numpy(dtype=float)
     l   = df["length"].to_numpy(dtype=float)
@@ -128,7 +126,7 @@ def compute_gates(
     h = h_ft * 0.3048
 
     # ── Applicability filter ──────────────────────────────────────────────────
-    invalid = (fr >= 0.7) | (le <= 0) | (y <= 0) | (v <= 0)
+    invalid = (fr >= max_fr)
     h[invalid] = np.nan
 
     return pd.Series(h, index=df.index, name="H_Gates")

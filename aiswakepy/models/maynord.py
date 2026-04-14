@@ -34,6 +34,9 @@ def compute_maynord(
     dist_m: np.ndarray | float,
     g: float = 9.78,
     C: float = 0.82,
+    min_fr_dis: float = 1.5,
+    min_fr: float = 0.6,
+    min_depth_ratio: float = 0.35,
 ) -> pd.Series:
     """Apply the Maynord (2005) formula to each AIS fix.
 
@@ -45,11 +48,15 @@ def compute_maynord(
             Scalar or 1-D array aligned with df rows.
     g:      Gravitational acceleration (m/s²). Default 9.78 (Singapore).
     C:      Empirical coefficient. Default 0.82.
+    min_fr_dis: Minimum displacement Froude number (default 1.5).
+    min_fr:     Minimum length Froude number (default 0.6).
+    min_depth_ratio: Minimum depth/length ratio (default 0.35).
+                     Formula valid if ANY of: Fr_dis >= min_fr_dis OR Fr >= min_fr OR depth/L >= min_depth_ratio.
 
     Returns
     -------
-    pd.Series of Hmax values (m).  NaN where applicability filter fails
-    (Fr_dis < 1.5 AND Fr < 0.6 AND depth/L < 0.35) or displacement <= 0.
+    pd.Series of Hmax values (m).  NaN where ALL applicability conditions fail:
+    Fr_dis < min_fr_dis AND Fr < min_fr AND depth/L < min_depth_ratio.
     """
     v = df["SOGms"].to_numpy(dtype=float)
     l = df["length"].to_numpy(dtype=float)
@@ -66,8 +73,7 @@ def compute_maynord(
 
     # Remove where ALL three applicability conditions fail simultaneously
     # (formula developed for high-speed craft; not valid for slow large ships)
-    not_applicable = (fr_dis < 1.5) & (fr < 0.6) & (depth_l < 0.35)
-    invalid = not_applicable | (w <= 0) | (y <= 0)
-    hmax[invalid] = np.nan
+    not_applicable = (fr_dis < min_fr_dis) & (fr < min_fr) & (depth_l < min_depth_ratio)
+    hmax[not_applicable] = np.nan
 
     return pd.Series(hmax, index=df.index, name="H_Maynord")

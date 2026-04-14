@@ -31,6 +31,8 @@ def compute_pianc(
     dist_m: np.ndarray | float,
     g: float = 9.78,
     A: float = 1.0,
+    max_fr: float = 0.7,
+    max_fd: float = 0.7,
 ) -> pd.Series:
     """Apply the PIANC (1987) formula to each AIS fix.
 
@@ -41,12 +43,12 @@ def compute_pianc(
             Scalar or 1-D array aligned with df rows.
     g:      Gravitational acceleration (m/s²). Default 9.78 (Singapore).
     A:      Hull-type coefficient. Default 1.0.
+    max_fr: Maximum length Froude number (default 0.7). Formula valid for Fr < max_fr.
+    max_fd: Maximum depth Froude number (default 0.7). Formula valid for Fd < max_fd.
 
     Returns
     -------
-    pd.Series of Hmax values (m).  NaN where applicability filters fail:
-        - length Froude Fr = V/sqrt(g*L) >= 0.7
-        - depth  Froude Fd = V/sqrt(g*h) >= 0.7
+    pd.Series of Hmax values (m).  NaN where Fr >= max_fr or Fd >= max_fd.
     """
     v = df["SOGms"].to_numpy(dtype=float)
     h = df["WaterDepth"].to_numpy(dtype=float)
@@ -59,7 +61,7 @@ def compute_pianc(
     hmax = A * h * (y / h) ** (-1.0 / 3.0) * fd ** 4
 
     # Applicability filters — set to NaN outside valid range
-    invalid = (fr >= 0.7) | (fd >= 0.7) | (h <= 0) | (y <= 0)
+    invalid = (fr >= max_fr) | (fd >= max_fd)
     hmax[invalid] = np.nan
 
     return pd.Series(hmax, index=df.index, name="H_PIANC")
