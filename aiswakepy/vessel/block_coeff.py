@@ -195,4 +195,15 @@ def get_vessel_params_df(
     out = df.copy()
     out["block_coeff"] = cbs
     out["bow_entry_m"] = les
+    # Volumetric displacement W = B * d * L * 0.95 * Cb (m³)
+    # Only computed when draught is available (AIS pipeline always has it;
+    # some unit tests create minimal DataFrames without draught).
+    if "draught" in out.columns:
+        out["displacement_m3"] = (
+            out["width"].to_numpy(dtype=float)
+            * out["draught"].to_numpy(dtype=float)
+            * out["length"].to_numpy(dtype=float)
+            * 0.95
+            * cbs
+        )
     return out

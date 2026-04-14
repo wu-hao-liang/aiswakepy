@@ -12,11 +12,15 @@ Description
 -----------
 Imperial-unit formulation. Distance-dependent wave height via cusp number N.
 
-Kw coefficient (piecewise linear in Froude number Fn = V/sqrt(g_NPL * L)):
+Kw coefficient (piecewise linear in Froude number Fr = V/sqrt(g * L)):
 
-    Fn_break = 0.9191 / sqrt(g_NPL_ft)            g_NPL = 9.81 m/s²
-    Kw = 1.133                                      if Fn >= Fn_break
-    Kw = _KW_SLOPE * Fn + _KW_INTERCEPT            otherwise
+    Fr_break = 0.27344   (dimensionless; derived from Taylor quotient
+                          threshold Tq = 0.9191 kt/√ft at NPL Teddington,
+                          where velocity is in knots per Saunders (1957),
+                          Hydrodynamics in Ship Design, vol. 2, p. 244 §52.5,
+                          g_Teddington = 9.81 m/s²)
+    Kw = 1.133                                      if Fr >= Fr_break
+    Kw = _KW_SLOPE * Fr + _KW_INTERCEPT            otherwise
          (fitted to Fig 52.F digitised data)
 
 Cusp-line distance: the perpendicular distance y from the sailing line to
@@ -48,20 +52,24 @@ import numpy as np
 import pandas as pd
 
 # ── Kw regression constants ───────────────────────────────────────────────────
-# g used in original NPL experiments for Froude-number scaling
-_G_NPL = 9.81          # m/s²
 _FT = 3.28084          # m → ft conversion
 
-# Fn break point: Tq = V_ft/sqrt(L_ft) = 0.9191 (Gates threshold)
-# Fn = Tq / sqrt(g_ft),  g_ft = 9.81 * 3.28084 = 32.185 ft/s²
-_FN_BREAK = 0.9191 / np.sqrt(_G_NPL * _FT)  # ≈ 0.16201
+# Fr break point: dimensionless Froude number threshold derived from the
+# Taylor quotient Tq = V_kt/sqrt(L_ft) = 0.9191 measured at NPL Teddington,
+# where the x-axis of Fig 52.F uses velocity in KNOTS (Saunders 1957,
+# Hydrodynamics in Ship Design, vol. 2, p. 244 §52.5; g_Teddington = 9.81 m/s²).
+# Conversion: Fr = Tq_kt × 0.514444 / sqrt(0.3048 × g_Teddington) = Tq_kt × 0.29751
+# Precomputed as a dimensionless constant; local g is used at runtime.
+_FR_BREAK = 0.27344    # = 0.9191 × 0.29751
 
-# Linear fit: Kw = _KW_SLOPE * Fn + _KW_INTERCEPT  for Fn < _FN_BREAK
-# Anchored at (_FN_BREAK, 1.133); least-squares fit to Fig 52.F data:
-#   Tq:  0.62   0.68   0.78   0.82   0.88   (0.9191 → 1.133)
-#   Kw:  2.85   2.55   2.20   1.60   1.85
-_KW_SLOPE = -34.395
-_KW_INTERCEPT = 6.705
+# Linear fit: Kw = _KW_SLOPE * Fr + _KW_INTERCEPT  for Fr < _FR_BREAK
+# Anchored at (_FR_BREAK, 1.133); anchored least-squares fit to Fig 52.F data
+# (Tq in kt/√ft converted to Fr via factor 0.29751):
+#   Tq (kt/√ft):  0.6843  0.7626  0.7797  0.8443  0.8740  (0.9191 → 1.133)
+#   Fr:           0.2036  0.2269  0.2320  0.2512  0.2600
+#   Kw:           2.8839  2.3980  2.1438  1.7313  1.4473
+_KW_SLOPE = -25.49
+_KW_INTERCEPT = 8.104
 
 
 def compute_gates(
@@ -92,12 +100,12 @@ def compute_gates(
     le  = df["bow_entry_m"].to_numpy(dtype=float)
     y   = np.asarray(dist_m, dtype=float) * np.ones(len(df))
 
-    # ── Kw via Froude number (g_NPL = 9.81 m/s², NPL Teddington standard) ──
-    fn = v / np.sqrt(_G_NPL * l)
+    # ── Froude number (local g) — used for both Kw lookup and validity filter ─
+    fr = v / np.sqrt(g * l)
     kw = np.where(
-        fn >= _FN_BREAK,
+        fr >= _FR_BREAK,
         1.133,
-        _KW_SLOPE * fn + _KW_INTERCEPT,
+        _KW_SLOPE * fr + _KW_INTERCEPT,
     )
 
     # ── Imperial units for wave height and cusp formula ──────────────────────
@@ -120,7 +128,6 @@ def compute_gates(
     h = h_ft * 0.3048
 
     # ── Applicability filter ──────────────────────────────────────────────────
-    fr = v / np.sqrt(g * l)
     invalid = (fr >= 0.7) | (le <= 0) | (y <= 0) | (v <= 0)
     h[invalid] = np.nan
 

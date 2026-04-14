@@ -145,22 +145,22 @@ def test_bhowmik_no_distance_dependency():
 # Gates & Herbich (1977)
 # ---------------------------------------------------------------------------
 # Standard tanker: SOGms=4.1155, L=200m, B=30m, Le=30m, dist_m=500m
-# Fn = 4.1155/sqrt(9.81*200) = 0.09291  <  FN_BREAK(≈0.162)
-# Kw = _KW_SLOPE*Fn + _KW_INTERCEPT
+# Fr = 4.1155/sqrt(9.78*200) = 0.09306  <  FR_BREAK(≈0.273)
+# Kw = _KW_SLOPE*Fr + _KW_INTERCEPT
 # N  = (y_ft*3*g_ft*sqrt(3)/(2*V_ft²*π) - 1.5) / 2
 # H_ft = (1.5/(2N+1.5))^(1/3) * Kw*(B/Le) * V_ft²/(2*g_ft)
 # H_m  = H_ft * 0.3048
 
-from aiswakepy.models.gates import _KW_SLOPE, _KW_INTERCEPT, _FN_BREAK, _FT
+from aiswakepy.models.gates import _KW_SLOPE, _KW_INTERCEPT, _FR_BREAK, _FT
 
 
 def test_gates_known_value():
     df = _make_df()
     h = compute_gates(df, dist_m=_DIST_M, g=_G)
 
-    # Kw
-    fn = _SOGMS / np.sqrt(9.81 * 200.0)
-    kw = _KW_SLOPE * fn + _KW_INTERCEPT   # fn < FN_BREAK
+    # Kw (local g)
+    fr = _SOGMS / np.sqrt(_G * 200.0)
+    kw = _KW_SLOPE * fr + _KW_INTERCEPT   # fr < FR_BREAK
 
     # Imperial conversions
     v_ft = _SOGMS * _FT
@@ -185,10 +185,10 @@ def test_gates_filter_fr_high():
 
 
 def test_gates_fn_above_break():
-    """Fn >= FN_BREAK → Kw = 1.133 (constant branch)."""
-    # Need Fn = V/sqrt(9.81*L) >= FN_BREAK ≈ 0.162
-    # With L=10m: need V >= 0.162 * sqrt(9.81*10) = 1.606 m/s
-    # Use SOGms=3.5, L=10m → Fn=3.5/sqrt(98.1)=0.354 > FN_BREAK
+    """Fr >= FR_BREAK → Kw = 1.133 (constant branch)."""
+    # Need Fr = V/sqrt(g*L) >= FR_BREAK ≈ 0.273
+    # With L=10m, g=9.78: need V >= 0.273 * sqrt(9.78*10) = 2.703 m/s
+    # Use SOGms=3.5, L=10m → Fr=3.5/sqrt(97.8)=0.354 > FR_BREAK
     df = _make_df(SOGms=3.5, length=10.0, width=3.0, bow_entry_m=3.0)
     h = compute_gates(df, dist_m=_DIST_M, g=_G)
     # Fr = 3.5/sqrt(9.78*10) ≈ 0.354 < 0.7 → not filtered
