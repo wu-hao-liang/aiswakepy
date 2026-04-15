@@ -10,8 +10,8 @@ import pandas as pd
 
 from aiswakepy.config import ShipwakeConfig, load_config
 
-Stage = Literal["filter", "depth", "wave", "impact", "viz"]
-ALL_STAGES: list[Stage] = ["filter", "depth", "wave", "impact", "viz"]
+Stage = Literal["filter", "depth", "vessel", "wave_impact", "viz"]
+ALL_STAGES: list[Stage] = ["filter", "depth", "vessel", "wave_impact", "viz"]
 
 
 def run_pipeline(
@@ -28,7 +28,7 @@ def run_pipeline(
     Returns
     -------
     dict with keys for each completed stage:
-        ``df_filtered``, ``df_depth``, ``df_wave``, ``df_impact``.
+        ``df_filtered``, ``df_depth``, ``df_vessel``, ``df_wave_impact``.
     """
     if not isinstance(config, ShipwakeConfig):
         config = load_config(config)
@@ -87,63 +87,62 @@ def run_pipeline(
         )
         _save_stage_csv(results["df_depth"], "02_depth")
 
-    if "wave" in stages:
-        from aiswakepy.stages.wave_params import compute_wave_params
+    if "vessel" in stages:
+        from aiswakepy.stages.vessel import compute_vessel_params
         w = config.wave
         print(
-            f"Stage 3/4: Wave parameters...\n"
-            f"  filters: Fm=[{w.min_froude_m}, {w.max_froude_m}]"
-            f"  BF\u2264{w.max_bf}"
-            f"  SOG\u2264{w.max_sog_knots}kn"
+            f"Stage 3/4: Vessel parameters...\n"
+            f"  filters: SOG\u2264{w.max_sog_knots}kn"
             f"  B/L\u2264{w.max_bl_ratio}"
         )
         t0 = time.perf_counter()
         df_in = results.get("df_depth")
         if df_in is None:
-            raise RuntimeError("Stage 'wave' requires 'depth' to have run first")
-        results["df_wave"] = compute_wave_params(
+            raise RuntimeError("Stage 'vessel' requires 'depth' to have run first")
+        results["df_vessel"] = compute_vessel_params(
             df=df_in,
             cb_method=config.vessel.cb_method,
             g=config.wave.gravity,
-            rho=config.wave.rho_water,
             max_sog_knots=config.wave.max_sog_knots,
             max_bl_ratio=config.wave.max_bl_ratio,
-            # Kriebel-specific limits forwarded via formula_kwargs
+        )
+        print(
+            f"  \u2192 {len(results['df_vessel'])} vessel events "
+            f"({time.perf_counter() - t0:.1f}s)"
+        )
+        _save_stage_csv(results["df_vessel"], "03_vessel")
+
+    if "wave_impact" in stages:
+        from aiswakepy.stages.wave_impact import compute_wave_impact
+        print("Stage 4/4: Wave impact...")
+        t0 = time.perf_counter()
+        df_in = results.get("df_vessel")
+        if df_in is None:
+            raise RuntimeError("Stage 'wave_impact' requires 'vessel' to have run first")
+        results["df_wave_impact"] = compute_wave_impact(
+            df_vessel=df_in,
+            coastline_shp=config.coastline.shapefile,
+            formula="kriebel",
+            max_propagation_m=config.impact.max_propagation_m,
+            wake_cutoff_m=config.impact.wake_cutoff_m,
+            g=config.wave.gravity,
+            rho=config.wave.rho_water,
+            # Kriebel-specific validity limits
             min_froude_m=config.wave.min_froude_m,
             max_froude_m=config.wave.max_froude_m,
             max_bf=config.wave.max_bf,
         )
         print(
-            f"  \u2192 {len(results['df_wave'])} wake events "
+            f"  \u2192 {len(results['df_wave_impact'])} shore impact events "
             f"({time.perf_counter() - t0:.1f}s)"
         )
-        _save_stage_csv(results["df_wave"], "03_wave")
+        _save_stage_csv(results["df_wave_impact"], "04_wave_impact")
 
-    if "impact" in stages:
-        from aiswakepy.stages.shore_impact import compute_shore_impact
-        print("Stage 4/4: Shore impact...")
-        t0 = time.perf_counter()
-        df_in = results.get("df_wave")
-        if df_in is None:
-            raise RuntimeError("Stage 'impact' requires 'wave' to have run first")
-        results["df_impact"] = compute_shore_impact(
-            df_wave=df_in,
-            coastline_shp=config.coastline.shapefile,
-            max_propagation_m=config.impact.max_propagation_m,
-            wake_cutoff_m=config.impact.wake_cutoff_m,
-            g=config.wave.gravity,
-        )
-        print(
-            f"  \u2192 {len(results['df_impact'])} shore impact events "
-            f"({time.perf_counter() - t0:.1f}s)"
-        )
-        _save_stage_csv(results["df_impact"], "04_impact")
-
-    if "viz" in stages and "df_impact" in results:
+    if "viz" in stages and "df_wave_impact" in results:
         from aiswakepy.viz.wave_map import plot_wave_height_map, plot_wave_period_map
         print("Visualisation...")
         t0 = time.perf_counter()
-        df_impact = results["df_impact"]
+        df_impact = results["df_wave_impact"]
 
         if config.output.plot_wave_height_map:
             plot_wave_height_map(
@@ -157,8 +156,8 @@ def run_pipeline(
                 out_dir / config.output.wave_period_map_name,
                 max_points=config.output.plot_max_points,
             )
-        if config.output.save_parquet and "df_wave" in results:
-            results["df_wave"].to_parquet(
+        if config.output.save_parquet and "df_vessel" in results:
+            results["df_vessel"].to_parquet(
                 out_dir / config.output.wave_params_name, index=False
             )
         df_impact.to_csv(out_dir / config.output.shore_impact_name, index=False)

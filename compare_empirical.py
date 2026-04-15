@@ -74,7 +74,7 @@ from aiswakepy.models.blaauw   import compute_blaauw, A_LOADED, A_MODERATE, A_LI
 from aiswakepy.models.sorensen import compute_sorensen
 from aiswakepy.models.maynord  import compute_maynord
 from aiswakepy.vessel.block_coeff import get_vessel_params_df
-from aiswakepy.stages.shore_impact import compute_point_impact
+from aiswakepy.stages.wave_impact import compute_point_impact
 
 
 # ---------------------------------------------------------------------------
@@ -299,25 +299,26 @@ def run_comparison(
 
     if events.empty:
         print("No wake events reached the gauge — check that the AIS data contains "
-              "segment_id, Theta, WakeDirPort, WakeDirStarboard, Tc, BF, LengthWL columns.")
+              "segment_id, Theta, WakeDirPort, WakeDirStarboard, Tc, SOGms, LengthWL columns.")
         return events
 
     # --- Compute all empirical wave heights at the lateral distance ---
     print("Computing empirical wave heights...")
-    dist_perp = events["DistPerp_m"].to_numpy(dtype=float)
+    # All formula functions read dist_perp as a DataFrame column
+    events["dist_perp"] = events["DistPerp_m"]
 
     # Kriebel (already in WaveHeight column from compute_point_impact, kept for completeness)
-    if all(c in events.columns for c in ["WaveHeight"]):
+    if "WaveHeight" in events.columns:
         events["H_Kriebel_dist"] = events["WaveHeight"]
 
-    events["H_PIANC"]    = compute_pianc(events, dist_perp, g=g).values
+    events["H_PIANC"]    = compute_pianc(events, g=g).values
     events["H_Bhowmik"]  = compute_bhowmik(events, g=g).values
-    events["H_Gates"]    = compute_gates(events, dist_perp, g=g).values
-    events["H_Blaauw1"]  = compute_blaauw(events, dist_perp, g=g, A=A_LOADED).values
-    events["H_Blaauw2"]  = compute_blaauw(events, dist_perp, g=g, A=A_MODERATE).values
-    events["H_Blaauw3"]  = compute_blaauw(events, dist_perp, g=g, A=A_LIGHT).values
-    events["H_Sorensen"] = compute_sorensen(events, dist_perp, g=g).values
-    events["H_Maynord"]  = compute_maynord(events, dist_perp, g=g).values
+    events["H_Gates"]    = compute_gates(events, g=g).values
+    events["H_Blaauw1"]  = compute_blaauw(events, g=g, A=A_LOADED).values
+    events["H_Blaauw2"]  = compute_blaauw(events, g=g, A=A_MODERATE).values
+    events["H_Blaauw3"]  = compute_blaauw(events, g=g, A=A_LIGHT).values
+    events["H_Sorensen"] = compute_sorensen(events, g=g).values
+    events["H_Maynord"]  = compute_maynord(events, g=g).values
 
     # --- Load OSSI measurements ---
     print(f"Loading OSSI measurements from {Path(ossi_path).name}...")

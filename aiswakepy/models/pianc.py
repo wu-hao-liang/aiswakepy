@@ -28,7 +28,6 @@ import pandas as pd
 
 def compute_pianc(
     df: pd.DataFrame,
-    dist_m: np.ndarray | float,
     g: float = 9.78,
     A: float = 1.0,
     max_fr: float = 0.7,
@@ -38,9 +37,8 @@ def compute_pianc(
 
     Parameters
     ----------
-    df:     DataFrame with ``SOGms``, ``WaterDepth``, ``length`` columns.
-    dist_m: Lateral distance from sailing line to point of interest (m).
-            Scalar or 1-D array aligned with df rows.
+    df:     DataFrame with ``SOGms``, ``WaterDepth``, ``length``,
+            ``dist_perp`` columns.
     g:      Gravitational acceleration (m/s²). Default 9.78 (Singapore).
     A:      Hull-type coefficient. Default 1.0.
     max_fr: Maximum length Froude number (default 0.7). Formula valid for Fr < max_fr.
@@ -52,7 +50,7 @@ def compute_pianc(
     """
     v = df["SOGms"].to_numpy(dtype=float)
     h = df["WaterDepth"].to_numpy(dtype=float)
-    y = np.asarray(dist_m, dtype=float) * np.ones(len(df))
+    y = df["dist_perp"].to_numpy(dtype=float)
     l = df["length"].to_numpy(dtype=float)
 
     fd = v / np.sqrt(g * h)

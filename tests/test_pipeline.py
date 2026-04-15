@@ -1,4 +1,4 @@
-"""Integration tests for shipwake.pipeline — Step 10."""
+"""Integration tests for aiswakepy.pipeline."""
 
 import io
 import json
@@ -65,7 +65,6 @@ def _make_config(tmp_path: Path, ais_path: Path, shp_path: Path) -> dict:
 
 def test_pipeline_filter_only(tmp_path):
     """Run only the filter stage."""
-    # Polygon is east of vessel positions so points are NOT masked as land
     poly = Polygon([(103.87, 1.27), (103.95, 1.27), (103.95, 1.32), (103.87, 1.32)])
     shp = _write_shp(tmp_path, poly)
     ais = _write_ais_csv(tmp_path)
@@ -76,9 +75,8 @@ def test_pipeline_filter_only(tmp_path):
     assert len(results["df_filtered"]) > 0
 
 
-def test_pipeline_filter_wave_with_stub(tmp_path):
-    """Run filter + depth (stubbed) + wave stages."""
-    # Polygon to the east so wake rays can hit it
+def test_pipeline_filter_vessel_with_stub(tmp_path):
+    """Run filter + depth (stubbed) + vessel stages."""
     poly = Polygon([(103.86, 1.27), (103.95, 1.27), (103.95, 1.32), (103.86, 1.32)])
     shp = _write_shp(tmp_path, poly)
     ais = _write_ais_csv(tmp_path)
@@ -90,12 +88,12 @@ def test_pipeline_filter_wave_with_stub(tmp_path):
     original = depth_mod.load_bathymetry
     depth_mod.load_bathymetry = lambda _: stub
     try:
-        results = run_pipeline(cfg, stages=["filter", "depth", "wave"])
+        results = run_pipeline(cfg, stages=["filter", "depth", "vessel"])
     finally:
         depth_mod.load_bathymetry = original
 
-    assert "df_wave" in results
-    assert len(results["df_wave"]) > 0
+    assert "df_vessel" in results
+    assert len(results["df_vessel"]) > 0
 
 
 def test_pipeline_full_with_stub(tmp_path):
@@ -111,12 +109,11 @@ def test_pipeline_full_with_stub(tmp_path):
     original = depth_mod.load_bathymetry
     depth_mod.load_bathymetry = lambda _: stub
     try:
-        results = run_pipeline(cfg, stages=["filter", "depth", "wave", "impact", "viz"])
+        results = run_pipeline(cfg, stages=["filter", "depth", "vessel", "wave_impact", "viz"])
     finally:
         depth_mod.load_bathymetry = original
 
-    assert "df_impact" in results
-    # Output dir created
+    assert "df_wave_impact" in results
     out_dir = Path(cfg["output"]["directory"])
     assert out_dir.exists()
     assert (out_dir / "shore_impact.csv").exists()

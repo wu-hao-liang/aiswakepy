@@ -36,7 +36,6 @@ A_LIGHT    = 0.25
 
 def compute_blaauw(
     df: pd.DataFrame,
-    dist_m: np.ndarray | float,
     g: float = 9.78,
     A: float = A_LOADED,
     max_fd: float = 0.7,
@@ -45,9 +44,7 @@ def compute_blaauw(
 
     Parameters
     ----------
-    df:     DataFrame with ``SOGms``, ``WaterDepth`` columns.
-    dist_m: Lateral distance from sailing line to point of interest (m).
-            Scalar or 1-D array aligned with df rows.
+    df:     DataFrame with ``SOGms``, ``WaterDepth``, ``dist_perp`` columns.
     g:      Gravitational acceleration (m/s²). Default 9.78 (Singapore).
     A:      Hull-type coefficient. Use ``A_LOADED`` (0.80), ``A_MODERATE``
             (0.35), or ``A_LIGHT`` (0.25). Default: ``A_LOADED``.
@@ -59,7 +56,7 @@ def compute_blaauw(
     """
     v = df["SOGms"].to_numpy(dtype=float)
     h = df["WaterDepth"].to_numpy(dtype=float)
-    y = np.asarray(dist_m, dtype=float) * np.ones(len(df))
+    y = df["dist_perp"].to_numpy(dtype=float)
 
     fd = v / np.sqrt(g * h)
     hmax = A * h * (y / h) ** (-1.0 / 3.0) * fd ** 2.67

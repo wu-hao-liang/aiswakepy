@@ -28,7 +28,7 @@ cusp N is
 
     y_ft = 2 * V_ft² * (2N+1.5) * π / (3 * g_ft * sqrt(3))
 
-Solving for N given the observation lateral distance dist_m:
+Solving for N given the observation lateral distance dist_perp:
 
     term   = y_ft * 3 * g_ft * sqrt(3) / (2 * V_ft² * π)
     N      = (term - 1.5) / 2,  clamped to [0, ∞)
@@ -43,7 +43,7 @@ where:
     Le   — bow entry length (m)
     V    — vessel speed (m/s)
     g    — gravitational acceleration (m/s²)
-    dist_m — lateral (perpendicular) distance from sailing line (m)
+    dist_perp — lateral (perpendicular) distance from sailing line (m)
 """
 
 from __future__ import annotations
@@ -74,7 +74,6 @@ _KW_INTERCEPT = 8.104
 
 def compute_gates(
     df: pd.DataFrame,
-    dist_m: "np.ndarray | float",
     g: float = 9.78,
     max_fr: float = 0.7,
 ) -> pd.Series:
@@ -82,9 +81,8 @@ def compute_gates(
 
     Parameters
     ----------
-    df:     DataFrame with ``SOGms``, ``length``, ``width``, ``bow_entry_m``.
-    dist_m: Lateral (perpendicular) distance from sailing line to the
-            observation point (m). Scalar or 1-D array aligned with df rows.
+    df:     DataFrame with ``SOGms``, ``length``, ``width``, ``bow_entry_m``,
+            ``dist_perp`` columns.
     g:      Gravitational acceleration (m/s²). Default 9.78 (Singapore).
     max_fr: Maximum length Froude number (default 0.7). Formula valid for Fr < max_fr.
 
@@ -96,7 +94,7 @@ def compute_gates(
     l   = df["length"].to_numpy(dtype=float)
     b   = df["width"].to_numpy(dtype=float)
     le  = df["bow_entry_m"].to_numpy(dtype=float)
-    y   = np.asarray(dist_m, dtype=float) * np.ones(len(df))
+    y   = df["dist_perp"].to_numpy(dtype=float)
 
     # ── Froude number (local g) — used for both Kw lookup and validity filter ─
     fr = v / np.sqrt(g * l)

@@ -31,7 +31,6 @@ import pandas as pd
 
 def compute_maynord(
     df: pd.DataFrame,
-    dist_m: np.ndarray | float,
     g: float = 9.78,
     C: float = 0.82,
     min_fr_dis: float = 1.5,
@@ -43,9 +42,7 @@ def compute_maynord(
     Parameters
     ----------
     df:     DataFrame with ``SOGms``, ``length``, ``WaterDepth``,
-            ``displacement_m3`` columns.
-    dist_m: Lateral distance from sailing line to point of interest (m).
-            Scalar or 1-D array aligned with df rows.
+            ``displacement_m3``, ``dist_perp`` columns.
     g:      Gravitational acceleration (m/s²). Default 9.78 (Singapore).
     C:      Empirical coefficient. Default 0.82.
     min_fr_dis: Minimum displacement Froude number (default 1.5).
@@ -62,7 +59,7 @@ def compute_maynord(
     l = df["length"].to_numpy(dtype=float)
     h = df["WaterDepth"].to_numpy(dtype=float)
     w = df["displacement_m3"].to_numpy(dtype=float)
-    y = np.asarray(dist_m, dtype=float) * np.ones(len(df))
+    y = df["dist_perp"].to_numpy(dtype=float)
 
     w_cbrt = w ** (1.0 / 3.0)
     fr_dis = v / np.sqrt(g * w_cbrt)
