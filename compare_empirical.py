@@ -33,10 +33,9 @@ Arguments
                   width, draught, length, block_coeff.
 --ossi          : Excel (.xlsx) file with pre-extracted ship-wake events.
                   Sheet "SHIPWAKE" with columns:
-                    col B (index 1): timestamp
+                    col B (index 1): timestamp (MATLAB datenum or datetime)
                     col C (index 2): Hmax (m)
                     col E (index 4): T (s)
-                  Time can be Excel serial date (float) or datetime.
 --gauge-lon     : Longitude of OSSI gauge (decimal degrees).
 --gauge-lat     : Latitude of OSSI gauge (decimal degrees).
 --out           : Output directory for plots and CSV (default: output/comparison/).
@@ -56,23 +55,17 @@ Outputs
 from __future__ import annotations
 
 import argparse
-import sys
 from pathlib import Path
 
-import numpy as np
 import pandas as pd
-import matplotlib.pyplot as plt
-import matplotlib.dates as mdates
 
-# ---------------------------------------------------------------------------
-# Model imports
-# ---------------------------------------------------------------------------
-from aiswakepy.models.pianc    import compute_pianc
-from aiswakepy.models.bhowmik  import compute_bhowmik
-from aiswakepy.models.gates    import compute_gates
-from aiswakepy.models.blaauw   import compute_blaauw
-from aiswakepy.models.sorensen import compute_sorensen
-from aiswakepy.models.maynord  import compute_maynord
+from aiswakepy.comparison       import load_ossi, match_events, timeseries_plot, scatter_plot
+from aiswakepy.models.pianc     import compute_pianc
+from aiswakepy.models.bhowmik   import compute_bhowmik
+from aiswakepy.models.gates     import compute_gates
+from aiswakepy.models.blaauw    import compute_blaauw
+from aiswakepy.models.sorensen  import compute_sorensen
+from aiswakepy.models.maynord   import compute_maynord
 from aiswakepy.vessel.block_coeff import get_vessel_params_df
 from aiswakepy.stages.wave_impact import compute_point_impact
 
@@ -93,8 +86,7 @@ def _load_ais(path: str | Path) -> pd.DataFrame:
 
 def _ensure_vessel_cols(df: pd.DataFrame, cb_method: str) -> pd.DataFrame:
     """Add block_coeff, bow_entry_m, displacement_m3 if missing."""
-    need_params = "block_coeff" not in df.columns or "bow_entry_m" not in df.columns
-    if need_params:
+    if "block_coeff" not in df.columns or "bow_entry_m" not in df.columns:
         df = get_vessel_params_df(df, method=cb_method)
     if "displacement_m3" not in df.columns:
         df["displacement_m3"] = (
@@ -105,153 +97,6 @@ def _ensure_vessel_cols(df: pd.DataFrame, cb_method: str) -> pd.DataFrame:
             * df["block_coeff"].to_numpy(dtype=float)
         )
     return df
-
-
-
-def _matlab_datenum_to_datetime(dn: float) -> pd.Timestamp:
-    """Convert MATLAB datenum (days since January 0, year 0000) to Timestamp.
-
-    MATLAB datenum(2000,1,1) = 730486; Python ordinal for 2000-01-01 = 730120.
-    The fixed offset is 366, so Python_ordinal = matlab_dn - 366.
-    Example: 738946.652582176 → 2023-03-01 15:39.
-    """
-    return pd.Timestamp.fromordinal(int(dn) - 366) + pd.Timedelta(days=dn % 1)
-
-
-def _load_ossi(path: str | Path) -> pd.DataFrame:
-    """Load OSSI wave gauge events from Excel.
-
-    Expected sheet: 'SHIPWAKE'
-    Column B (index 1): time (Excel serial or datetime)
-    Column C (index 2): Hmax (m)
-    Column E (index 4): T (s)
-    """
-    path = Path(path)
-    raw = pd.read_excel(path, sheet_name="SHIPWAKE", header=None)
-
-    time_col = raw.iloc[:, 1]
-    hmax_col = raw.iloc[:, 2].to_numpy(dtype=float)
-    t_col    = raw.iloc[:, 4].to_numpy(dtype=float)
-
-    # Parse time: could be datetime (pandas Timestamp) or Excel serial float
-    if pd.api.types.is_float_dtype(time_col) or pd.api.types.is_integer_dtype(time_col):
-        times = pd.to_datetime(
-            [_matlab_datenum_to_datetime(v) for v in time_col.to_numpy(dtype=float)]
-        )
-    else:
-        times = pd.to_datetime(time_col)
-
-    ossi = pd.DataFrame({"time": times, "Hmax": hmax_col, "T": t_col})
-    ossi = ossi.dropna(subset=["time", "Hmax"]).reset_index(drop=True)
-    return ossi
-
-
-def _match_events(
-    ais_times: pd.Series,
-    ossi: pd.DataFrame,
-    window_min: float = 0.5,
-) -> np.ndarray:
-    """For each AIS timestamp find the unique OSSI event within ±window_min.
-
-    Returns array of OSSI Hmax values aligned to ais_times.
-    NaN where no unique match is found (0 or >1 OSSI events in window).
-    """
-    window_td = pd.Timedelta(minutes=window_min)
-    ossi_times = ossi["time"].to_numpy()
-    ossi_hmax  = ossi["Hmax"].to_numpy(dtype=float)
-
-    matched = np.full(len(ais_times), np.nan)
-
-    for i, t in enumerate(ais_times):
-        in_win = (ossi["time"] >= t - window_td) & (ossi["time"] <= t + window_td)
-        indices = np.where(in_win.to_numpy())[0]
-        if len(indices) == 1:
-            matched[i] = ossi_hmax[indices[0]]
-        # 0 or >1 → NaN (no unique match)
-
-    return matched
-
-
-# ---------------------------------------------------------------------------
-# Plotting
-# ---------------------------------------------------------------------------
-
-_COLOURS = {
-    "Kriebel":   "olive",
-    "PIANC":     "blue",
-    "Sorensen":  "green",
-    "Maynord":   "magenta",
-    "Bhowmik":   "#006857",   # dark green
-    "Gates":     "#C8C8C8",   # gray
-    "Blaauw":    "#D95319",   # orange
-    "OSSI":      "black",
-}
-
-
-def _timeseries_plot(
-    df: pd.DataFrame,
-    ossi: pd.DataFrame,
-    pred_cols: dict[str, str],
-    title: str,
-    out_path: Path,
-) -> None:
-    """Scatter time-series of all formulae + measurements."""
-    fig, ax = plt.subplots(figsize=(16, 5))
-
-    ax.scatter(ossi["time"], ossi["Hmax"], s=10, c=_COLOURS["OSSI"],
-               label="Measurements", zorder=5)
-
-    for label, col in pred_cols.items():
-        if col in df.columns:
-            ax.scatter(df["obstime_adj"], df[col], s=10,
-                       c=_COLOURS.get(label, None), label=label)
-
-    ax.xaxis.set_major_formatter(mdates.DateFormatter("%d-%b %H:%M"))
-    ax.xaxis.set_major_locator(mdates.AutoDateLocator())
-    fig.autofmt_xdate()
-    ax.set_ylabel("$H_{max}$ (m)")
-    ax.set_xlabel("Time")
-    ax.set_title(title)
-    ax.legend(loc="upper right", fontsize=7, ncol=2)
-    ax.grid(True, alpha=0.3)
-    fig.tight_layout()
-    fig.savefig(out_path, dpi=150)
-    plt.close(fig)
-    print(f"  saved {out_path.name}")
-
-
-def _scatter_plot(
-    df: pd.DataFrame,
-    pred_cols: dict[str, str],
-    out_path: Path,
-) -> None:
-    """Predicted vs measured Hmax scatter with 1:1 line."""
-    fig, ax = plt.subplots(figsize=(7, 7))
-
-    has_data = False
-    for label, col in pred_cols.items():
-        if col not in df.columns:
-            continue
-        valid = df[["Hmax_measured", col]].dropna()
-        if valid.empty:
-            continue
-        ax.scatter(valid["Hmax_measured"], valid[col], s=20,
-                   c=_COLOURS.get(label, None), label=label, alpha=0.7)
-        has_data = True
-
-    if has_data:
-        lim = ax.get_xlim()[1]
-        ax.plot([0, lim], [0, lim], "--k", lw=1, label="1:1")
-
-    ax.set_xlabel("$H_{max}$ measurement (m)")
-    ax.set_ylabel("$H_{max}$ empirical (m)")
-    ax.set_title("Empirical formulae vs measurements")
-    ax.legend(fontsize=8)
-    ax.grid(True, alpha=0.3)
-    fig.tight_layout()
-    fig.savefig(out_path, dpi=150)
-    plt.close(fig)
-    print(f"  saved {out_path.name}")
 
 
 # ---------------------------------------------------------------------------
@@ -286,16 +131,14 @@ def run_comparison(
     df = _load_ais(ais_path)
     print(f"  {len(df)} AIS records")
 
-    # --- Ensure vessel params and displacement ---
     df = _ensure_vessel_cols(df, cb_method)
 
-    # --- Optional: remove zero-draught records ---
     if clean_draft and "draught" in df.columns:
         n_before = len(df)
         df = df[df["draught"] > 0].reset_index(drop=True)
         print(f"  {n_before - len(df)} records removed (draught = 0)")
 
-    # --- Find wake arrivals at the gauge via ray-segment intersection ---
+    # --- Find wake arrivals at the gauge ---
     print(f"Finding wake arrivals at gauge ({gauge_lon:.6f}, {gauge_lat:.6f})...")
     events = compute_point_impact(df, gauge_lon, gauge_lat, g=g)
     print(f"  {len(events)} wake-arrival events found")
@@ -305,12 +148,10 @@ def run_comparison(
               "segment_id, Theta, WakeDirPort, WakeDirStarboard, Tc, SOGms, LengthWL columns.")
         return events
 
-    # --- Compute all empirical wave heights at the lateral distance ---
+    # --- Compute all empirical wave heights ---
     print("Computing empirical wave heights...")
-    # All formula functions read dist_perp as a DataFrame column
     events["dist_perp"] = events["DistPerp_m"]
 
-    # Kriebel (already computed by compute_point_impact as WaveHeight)
     if "WaveHeight" in events.columns:
         events["H_Kriebel"] = events["WaveHeight"]
 
@@ -323,16 +164,15 @@ def run_comparison(
 
     # --- Load OSSI measurements ---
     print(f"Loading OSSI measurements from {Path(ossi_path).name}...")
-    ossi = _load_ossi(ossi_path)
+    ossi = load_ossi(ossi_path)
     print(f"  {len(ossi)} wave events")
 
-    # --- Match wake arrivals ↔ OSSI measurements using group-velocity arrival time ---
+    # --- Match wake arrivals ↔ OSSI ---
     print(f"Matching events (±{event_window_min} min window)...")
-    events["Hmax_measured"] = _match_events(events["ArrivalTime"], ossi, event_window_min)
+    events["Hmax_measured"] = match_events(events["ArrivalTime"], ossi, event_window_min)
     n_matched = events["Hmax_measured"].notna().sum()
     print(f"  {n_matched} matched wake↔OSSI pairs")
 
-    # Column map: legend label → DataFrame column
     pred_cols = {
         "Kriebel":  "H_Kriebel",
         "PIANC":    "H_PIANC",
@@ -343,23 +183,20 @@ def run_comparison(
         "Blaauw":   "H_Blaauw",
     }
 
-    # Rename ArrivalTime to obstime_adj for compatibility with existing plot functions
-    events["obstime_adj"] = events["ArrivalTime"]
-
     # --- Plots ---
     print("Producing plots...")
-    _timeseries_plot(
+    timeseries_plot(
         events, ossi, pred_cols,
         title="All formulae and measurements vs time (arrival at gauge)",
         out_path=out_dir / "timeseries_all.png",
     )
-    _timeseries_plot(
+    timeseries_plot(
         events[events["Hmax_measured"].notna()].reset_index(drop=True),
         ossi, pred_cols,
         title=f"Matched events (±{event_window_min} min window) vs time",
         out_path=out_dir / "timeseries_matched.png",
     )
-    _scatter_plot(events, pred_cols, out_dir / "scatter_predicted_vs_measured.png")
+    scatter_plot(events, pred_cols, out_dir / "scatter_predicted_vs_measured.png")
 
     # --- Save matched events CSV ---
     matched_cols = [
