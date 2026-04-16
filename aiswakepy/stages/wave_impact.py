@@ -87,7 +87,7 @@ def compute_point_impact(
     df_vessel:       Vessel-parameters DataFrame (output of
                      ``compute_vessel_params``).  Must contain columns:
                      longitude, latitude, obstime, WakeDirPort,
-                     WakeDirStarboard, Theta, Tc, SOGms, LengthWL,
+                     WakeDirStarboard, Theta, Tc, SOGms,
                      cog, segment_id, mmsi, width, length, FroudeD.
     point_lon:       Longitude of the measurement point (decimal degrees).
     point_lat:       Latitude of the measurement point (decimal degrees).
@@ -174,7 +174,6 @@ def compute_point_impact(
                 lat_s = _lerp(lat0, lat1, t_star)
                 theta_s = _lerp(float(r0.Theta), float(r1.Theta), t_star)
                 sogms_s = _lerp(float(r0.SOGms), float(r1.SOGms), t_star)
-                lwl_s   = _lerp(float(r0.LengthWL), float(r1.LengthWL), t_star)
                 tc_s    = _lerp(float(r0.Tc), float(r1.Tc), t_star)
                 frd_s   = _lerp(float(r0.FroudeD), float(r1.FroudeD), t_star)
                 sog_s   = _lerp(float(r0.sog), float(r1.sog), t_star)
@@ -185,7 +184,7 @@ def compute_point_impact(
                 theta_rad = math.radians(theta_s)
                 dist_perp = prop_dist * math.sin(theta_rad)
 
-                if lwl_s <= 0.0 or dist_perp <= 0.0:
+                if dist_perp <= 0.0:
                     continue
 
                 hit_records.append({
@@ -206,7 +205,6 @@ def compute_point_impact(
                 # Collect vessel columns needed by formula
                 hit_vessel_data.append({
                     "SOGms":          sogms_s,
-                    "LengthWL":       lwl_s,
                     "FroudeD":        frd_s,
                     "WaterDepth":     _lerp(_gcol(r0, "WaterDepth"), _gcol(r1, "WaterDepth"), t_star),
                     "length":         float(r0.length),

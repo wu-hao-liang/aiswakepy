@@ -28,10 +28,8 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
-# Standard A coefficients by loading condition
-A_LOADED   = 0.80
-A_MODERATE = 0.35
-A_LIGHT    = 0.25
+# Hull-type coefficient for loaded vessel (only variant used)
+A_LOADED = 0.80
 
 
 def compute_blaauw(
@@ -44,10 +42,9 @@ def compute_blaauw(
 
     Parameters
     ----------
-    df:     DataFrame with ``SOGms``, ``WaterDepth``, ``dist_perp`` columns.
+    df:     DataFrame with ``SOGms``, ``WaterDepth``, ``dist_perp``, ``width`` columns.
     g:      Gravitational acceleration (m/s²). Default 9.78 (Singapore).
-    A:      Hull-type coefficient. Use ``A_LOADED`` (0.80), ``A_MODERATE``
-            (0.35), or ``A_LIGHT`` (0.25). Default: ``A_LOADED``.
+    A:      Hull-type coefficient. Default: ``A_LOADED`` (0.80).
     max_fd: Maximum depth Froude number (default 0.7). Formula valid for Fd < max_fd.
 
     Returns
@@ -55,11 +52,12 @@ def compute_blaauw(
     pd.Series of Hmax values (m).  NaN where depth Froude Fd >= max_fd.
     """
     v = df["SOGms"].to_numpy(dtype=float)
-    h = df["WaterDepth"].to_numpy(dtype=float)
+    depth = df["WaterDepth"].to_numpy(dtype=float)
     y = df["dist_perp"].to_numpy(dtype=float)
+    b = df["width"].to_numpy(dtype=float)
 
-    fd = v / np.sqrt(g * h)
-    hmax = A * h * (y / h) ** (-1.0 / 3.0) * fd ** 2.67
+    fd = v / np.sqrt(g * depth)
+    hmax = A * depth * ((y - b / 2) / depth) ** (-1.0 / 3.0) * fd ** 2.67
 
     invalid = (fd >= max_fd)
     hmax[invalid] = np.nan

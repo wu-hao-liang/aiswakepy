@@ -32,7 +32,7 @@ _GIS_COLS = [
     "WakeDirPort", "WakeDirStarboard",
     "obstime", "FroudeD", "SOGms",
     "width", "length", "Tc", "WaterDepth",
-    "LengthWL", "Theta", "BLratio",
+    "Theta", "BLratio",
 ]
 
 
@@ -67,7 +67,6 @@ def compute_vessel_params(
     -------------
     block_coeff, bow_entry_m, displacement_m3   — vessel params
     SOGms    — speed (m/s)
-    LengthWL — waterline length = 0.8 * LOA (m)
     FroudeD  — depth Froude number V / sqrt(g * h)
     T        — divergent wave period 0.27 * SOG_knots (s)
     Theta    — Kelvin wake half-angle (deg)
@@ -86,9 +85,6 @@ def compute_vessel_params(
 
     # SOGms: speed over ground in m/s
     df["SOGms"] = df["sog"] * _KNOTS_TO_MS
-
-    # LengthWL: waterline length = 0.8 * LOA
-    df["LengthWL"] = df["length"] * 0.8
 
     # FroudeD = V / sqrt(g * h): depth Froude number
     df["FroudeD"] = df["SOGms"] / np.sqrt(g * df["WaterDepth"])

@@ -20,7 +20,7 @@ import pytest
 from aiswakepy.models.pianc import compute_pianc
 from aiswakepy.models.bhowmik import compute_bhowmik
 from aiswakepy.models.gates import compute_gates
-from aiswakepy.models.blaauw import compute_blaauw, A_LOADED, A_MODERATE, A_LIGHT
+from aiswakepy.models.blaauw import compute_blaauw, A_LOADED
 from aiswakepy.models.sorensen import compute_sorensen
 from aiswakepy.models.maynord import compute_maynord
 from aiswakepy.vessel.block_coeff import get_vessel_params_df
@@ -92,7 +92,7 @@ def test_pianc_known_value():
     df = _make_df()
     h = compute_pianc(df, g=_G)
     fd = _SOGMS / np.sqrt(_G * 15.0)
-    expected = 1.0 * 15.0 * (_DIST_M / 15.0) ** (-1.0 / 3.0) * fd ** 4
+    expected = 1.0 * 15.0 * ((_DIST_M - 30.0 / 2) / 15.0) ** (-1.0 / 3.0) * fd ** 4
     assert h.iloc[0] == pytest.approx(expected, rel=1e-4)
 
 
@@ -207,17 +207,15 @@ def test_blaauw_loaded_known_value():
     df = _make_df()
     h = compute_blaauw(df, g=_G, A=A_LOADED)
     fd = _SOGMS / np.sqrt(_G * 15.0)
-    expected = A_LOADED * 15.0 * (_DIST_M / 15.0) ** (-1.0 / 3.0) * fd ** 2.67
+    expected = A_LOADED * 15.0 * ((_DIST_M - 30.0 / 2) / 15.0) ** (-1.0 / 3.0) * fd ** 2.67
     assert h.iloc[0] == pytest.approx(expected, rel=1e-4)
 
 
-def test_blaauw_three_variants_ordered():
-    """A_LOADED > A_MODERATE > A_LIGHT → Hmax decreases in same order."""
+def test_blaauw_positive_result():
+    """A_LOADED (0.80) produces a positive Hmax."""
     df = _make_df()
-    h1 = compute_blaauw(df, g=_G, A=A_LOADED).iloc[0]
-    h2 = compute_blaauw(df, g=_G, A=A_MODERATE).iloc[0]
-    h3 = compute_blaauw(df, g=_G, A=A_LIGHT).iloc[0]
-    assert h1 > h2 > h3 > 0
+    h = compute_blaauw(df, g=_G, A=A_LOADED).iloc[0]
+    assert h > 0
 
 
 def test_blaauw_filter_fd_high():

@@ -70,7 +70,7 @@ import matplotlib.dates as mdates
 from aiswakepy.models.pianc    import compute_pianc
 from aiswakepy.models.bhowmik  import compute_bhowmik
 from aiswakepy.models.gates    import compute_gates
-from aiswakepy.models.blaauw   import compute_blaauw, A_LOADED, A_MODERATE, A_LIGHT
+from aiswakepy.models.blaauw   import compute_blaauw
 from aiswakepy.models.sorensen import compute_sorensen
 from aiswakepy.models.maynord  import compute_maynord
 from aiswakepy.vessel.block_coeff import get_vessel_params_df
@@ -178,9 +178,7 @@ _COLOURS = {
     "Maynord":   "magenta",
     "Bhowmik":   "#006857",   # dark green
     "Gates":     "#C8C8C8",   # gray
-    "Blaauw1":   "#D95319",   # orange
-    "Blaauw2":   "#BF00BF",   # purple
-    "Blaauw3":   "#BFBF00",   # olive-yellow
+    "Blaauw":    "#D95319",   # orange
     "OSSI":      "black",
 }
 
@@ -307,16 +305,14 @@ def run_comparison(
     # All formula functions read dist_perp as a DataFrame column
     events["dist_perp"] = events["DistPerp_m"]
 
-    # Kriebel (already in WaveHeight column from compute_point_impact, kept for completeness)
+    # Kriebel (already computed by compute_point_impact as WaveHeight)
     if "WaveHeight" in events.columns:
-        events["H_Kriebel_dist"] = events["WaveHeight"]
+        events["H_Kriebel"] = events["WaveHeight"]
 
     events["H_PIANC"]    = compute_pianc(events, g=g).values
     events["H_Bhowmik"]  = compute_bhowmik(events, g=g).values
     events["H_Gates"]    = compute_gates(events, g=g).values
-    events["H_Blaauw1"]  = compute_blaauw(events, g=g, A=A_LOADED).values
-    events["H_Blaauw2"]  = compute_blaauw(events, g=g, A=A_MODERATE).values
-    events["H_Blaauw3"]  = compute_blaauw(events, g=g, A=A_LIGHT).values
+    events["H_Blaauw"]   = compute_blaauw(events, g=g).values
     events["H_Sorensen"] = compute_sorensen(events, g=g).values
     events["H_Maynord"]  = compute_maynord(events, g=g).values
 
@@ -333,15 +329,13 @@ def run_comparison(
 
     # Column map: legend label → DataFrame column
     pred_cols = {
-        "Kriebel":  "H_Kriebel_dist",
+        "Kriebel":  "H_Kriebel",
         "PIANC":    "H_PIANC",
         "Sorensen": "H_Sorensen",
         "Maynord":  "H_Maynord",
         "Bhowmik":  "H_Bhowmik",
         "Gates":    "H_Gates",
-        "Blaauw1":  "H_Blaauw1",
-        "Blaauw2":  "H_Blaauw2",
-        "Blaauw3":  "H_Blaauw3",
+        "Blaauw":   "H_Blaauw",
     }
 
     # Rename ArrivalTime to obstime_adj for compatibility with existing plot functions

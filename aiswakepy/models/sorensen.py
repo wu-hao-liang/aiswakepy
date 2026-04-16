@@ -66,7 +66,7 @@ def compute_sorensen(
     l = df["length"].to_numpy(dtype=float)
     depth = df["WaterDepth"].to_numpy(dtype=float)
     w = df["displacement_m3"].to_numpy(dtype=float)
-    dist_perp = df["dist_perp"].to_numpy(dtype=float)
+    y = df["dist_perp"].to_numpy(dtype=float)
 
     fr = v / np.sqrt(g * l)
 
@@ -87,7 +87,7 @@ def compute_sorensen(
     log_alpha = a + b * ln_depth_adim + c * ln_depth_adim ** 2
     alpha = np.exp(log_alpha)
 
-    dist_adim = dist_perp / w_cbrt
+    dist_adim = y / w_cbrt
     h_adim = alpha * dist_adim ** n
     hmax = h_adim * w_cbrt
 

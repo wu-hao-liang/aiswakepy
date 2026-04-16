@@ -35,7 +35,6 @@ def _make_vessel_row(**kwargs) -> pd.DataFrame:
         sog=8.0,
         cog=90.0,
         SOGms=8.0 * 0.5144444,
-        LengthWL=160.0,
         FroudeD=0.3397,
         # Kriebel intermediates — computed by compute_kriebel internally
         # (not required in vessel stage output, but kept here for completeness)

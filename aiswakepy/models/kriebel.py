@@ -10,19 +10,18 @@ Description
 -----------
 Computes H_Kriebel at a given lateral distance from the sailing line.
 
-Reads ``SOGms``, ``LengthWL``, ``FroudeD`` from the DataFrame (computed
-upstream by ``compute_vessel_params``).  If ``dist_perp`` is present in the
-DataFrame, it is used as the lateral distance; otherwise the function falls
-back to the hull-origin reference distance y = B/2 (i.e. y/L = B/(2·L)).
+Reads ``SOGms``, ``length``, ``FroudeD`` from the DataFrame (computed
+upstream by ``compute_vessel_params``). The ``dist_perp`` column must be
+present in the DataFrame and is used as the lateral distance.
 
 Formula-specific intermediates (``Alpha``, ``Beta``, ``FroudeM``, ``BF``,
 ``GHV2``) are computed internally and are not added to the DataFrame.
 
     Alpha  = 2.35 * (1 - Cb)
-    Beta   = 1 + 8 * tanh(0.45 * (L_WL/Le - 2))^3
-    FroudeM = (V / sqrt(g * L_WL)) * exp(Alpha * d / h)
+    Beta   = 1 + 8 * tanh(0.45 * (L/Le - 2))^3
+    FroudeM = (V / sqrt(g * L)) * exp(Alpha * d / h)
     BF     = Beta * (FroudeM - 0.1)^2
-    GHV2   = BF * (y / L_WL)^(-1/3)
+    GHV2   = BF * (y / L)^(-1/3)
     H      = GHV2 / g * V^2
 """
 
@@ -38,34 +37,35 @@ def compute_kriebel(
     min_froude_m: float = 0.1,
     max_froude_m: float = 0.5,
     max_bf: float = 0.4,
+    max_froude_d: float = 1.0,
 ) -> pd.Series:
     """Apply the Kriebel & Seelig (2005) empirical formula to each AIS fix.
 
     Parameters
     ----------
-    df:            DataFrame with ``SOGms``, ``LengthWL``, ``FroudeD``,
+    df:            DataFrame with ``SOGms``, ``length``, ``FroudeD``,
                    ``block_coeff``, ``bow_entry_m``, ``draught``,
-                   ``WaterDepth``, ``width``, ``length`` columns (all
-                   produced by ``compute_vessel_params``).
-                   If ``dist_perp`` is present it is used as the lateral
-                   distance; otherwise the hull-origin reference B/2 is used.
+                   ``WaterDepth``, ``width``, ``dist_perp`` columns (all
+                   produced by ``compute_vessel_params`` or ``compute_wave_impact``).
     g:             Local gravitational acceleration (m/s²). Default 9.78.
     min_froude_m:  Lower bound for modified Froude number (default 0.1).
     max_froude_m:  Upper bound for modified Froude number (default 0.5).
     max_bf:        Upper bound for BF shape factor (default 0.4).
+    max_froude_d:  Maximum depth Froude number (default 1.0).
 
     Returns
     -------
     pd.Series of H_Kriebel values (m).  NaN where applicability limits are
-    exceeded (FroudeM out of range or BF > max_bf).
+    exceeded (FroudeM out of range, BF > max_bf, or FroudeD >= max_froude_d).
     """
-    sogms   = df["SOGms"].to_numpy(dtype=float)
-    lwl     = df["LengthWL"].to_numpy(dtype=float)
+    v       = df["SOGms"].to_numpy(dtype=float)
+    l       = df["length"].to_numpy(dtype=float)
     cb      = df["block_coeff"].to_numpy(dtype=float)
     le      = df["bow_entry_m"].to_numpy(dtype=float)
     draught = df["draught"].to_numpy(dtype=float)
-    h_depth = df["WaterDepth"].to_numpy(dtype=float)
-    width   = df["width"].to_numpy(dtype=float)
+    depth   = df["WaterDepth"].to_numpy(dtype=float)
+    b       = df["width"].to_numpy(dtype=float)
+    froude_d = df["FroudeD"].to_numpy(dtype=float)
 
     # --- Alpha = 2.35 * (1 - Cb): finite-depth adjustment exponent ---
     # Scales the shallow-water amplification of the modified Froude number
@@ -75,13 +75,13 @@ def compute_kriebel(
     # --- Beta = 1 + 8 * tanh(0.45 * (L/Le - 2))^3: hull shape factor ---
     # Derived from bow entry length Le (half-angle of entrance).
     # β→1 for fine bows (L/Le≈2), β→9 for blunt bows. — Kriebel & Seelig (2005)
-    ratio = lwl / le
+    ratio = l / le
     beta = 1.0 + 8.0 * np.tanh(0.45 * (ratio - 2.0)) ** 3
 
     # --- FroudeM = (V/√(g·L)) * exp(α·d/h): modified Froude number Fr* ---
     # Adjusts the length-based Froude number for finite water depth via the
     # draught/depth ratio. — Kriebel & Seelig (2005)
-    froude_m = (sogms / np.sqrt(g * lwl)) * np.exp(alpha * draught / h_depth)
+    froude_m = (v / np.sqrt(g * l)) * np.exp(alpha * draught / depth)
 
     # --- BF = β * (Fr* − 0.1)²: dimensionless wave height at y/L = 1 ---
     # Represents the normalised wave height at one vessel-length lateral distance.
@@ -89,22 +89,20 @@ def compute_kriebel(
     # — Kriebel & Seelig (2005)
     bf = beta * (froude_m - 0.1) ** 2
 
-    # --- Lateral distance: dist_perp from df, or hull-origin reference B/2 ---
-    if "dist_perp" in df.columns:
-        y = df["dist_perp"].to_numpy(dtype=float)
-    else:
-        y = width / 2.0   # hull-origin: y = B/2
+    # --- Lateral distance: dist_perp from df ---
+    y = df["dist_perp"].to_numpy(dtype=float)
 
-    # --- H = BF * (y / L_WL)^(-1/3) * V² / g ---
+    # --- H = BF * (y / L)^(-1/3) * V² / g ---
     # GHV2 = g·H/V² = BF * (y/L)^(-1/3); H recovered as GHV2 * V²/g.
     # — Kriebel & Seelig (2005)
-    h = bf * (y / lwl) ** (-1.0 / 3.0) / g * sogms ** 2
+    h = bf * (y / l) ** (-1.0 / 3.0) / g * v ** 2
 
     # --- Applicability filter: NaN where outside Kriebel (2005) valid range ---
     invalid = (
         (froude_m < min_froude_m) |
         (froude_m > max_froude_m) |
-        (bf > max_bf)
+        (bf > max_bf) |
+        (froude_d >= max_froude_d)
     )
     h = h.copy()
     h[invalid] = np.nan

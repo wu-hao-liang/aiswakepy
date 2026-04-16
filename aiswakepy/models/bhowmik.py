@@ -41,9 +41,9 @@ def compute_bhowmik(
     pd.Series of Hmax values (m).
     """
     v = df["SOGms"].to_numpy(dtype=float)
-    d = df["draught"].to_numpy(dtype=float)
+    draught = df["draught"].to_numpy(dtype=float)
 
-    fr_d = v / np.sqrt(g * d)
-    hmax = 0.133 * fr_d * d
+    fr_d = v / np.sqrt(g * draught)
+    hmax = 0.133 * fr_d * draught
 
     return pd.Series(hmax, index=df.index, name="H_Bhowmik")

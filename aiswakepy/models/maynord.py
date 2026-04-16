@@ -33,8 +33,8 @@ def compute_maynord(
     df: pd.DataFrame,
     g: float = 9.78,
     C: float = 0.82,
-    min_fr_dis: float = 1.5,
-    min_fr: float = 0.6,
+    min_fr_dis: float = 1.3,
+    min_fr: float = 0.4,
     min_depth_ratio: float = 0.35,
 ) -> pd.Series:
     """Apply the Maynord (2005) formula to each AIS fix.
@@ -45,8 +45,8 @@ def compute_maynord(
             ``displacement_m3``, ``dist_perp`` columns.
     g:      Gravitational acceleration (m/s²). Default 9.78 (Singapore).
     C:      Empirical coefficient. Default 0.82.
-    min_fr_dis: Minimum displacement Froude number (default 1.5).
-    min_fr:     Minimum length Froude number (default 0.6).
+    min_fr_dis: Minimum displacement Froude number (default 1.3).
+    min_fr:     Minimum length Froude number (default 0.4).
     min_depth_ratio: Minimum depth/length ratio (default 0.35).
                      Formula valid if ANY of: Fr_dis >= min_fr_dis OR Fr >= min_fr OR depth/L >= min_depth_ratio.
 
@@ -57,14 +57,14 @@ def compute_maynord(
     """
     v = df["SOGms"].to_numpy(dtype=float)
     l = df["length"].to_numpy(dtype=float)
-    h = df["WaterDepth"].to_numpy(dtype=float)
+    depth = df["WaterDepth"].to_numpy(dtype=float)
     w = df["displacement_m3"].to_numpy(dtype=float)
     y = df["dist_perp"].to_numpy(dtype=float)
 
     w_cbrt = w ** (1.0 / 3.0)
     fr_dis = v / np.sqrt(g * w_cbrt)
     fr = v / np.sqrt(g * l)
-    depth_l = h / l
+    depth_l = depth / l
 
     hmax = C * fr_dis ** (-0.58) * (y / w_cbrt) ** (-0.42) * w_cbrt
 
