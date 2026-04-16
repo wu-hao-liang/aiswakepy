@@ -45,8 +45,8 @@ def compute_kriebel(
     ----------
     df:            DataFrame with ``SOGms``, ``length``, ``FroudeD``,
                    ``block_coeff``, ``bow_entry_m``, ``draught``,
-                   ``WaterDepth``, ``width``, ``dist_perp`` columns (all
-                   produced by ``compute_vessel_params`` or ``compute_wave_impact``).
+                   ``WaterDepth``, ``dist_perp`` columns (all produced by
+                   ``compute_vessel_params`` or ``compute_wave_impact``).
     g:             Local gravitational acceleration (m/s²). Default 9.78.
     min_froude_m:  Lower bound for modified Froude number (default 0.1).
     max_froude_m:  Upper bound for modified Froude number (default 0.5).
@@ -63,8 +63,7 @@ def compute_kriebel(
     cb      = df["block_coeff"].to_numpy(dtype=float)
     le      = df["bow_entry_m"].to_numpy(dtype=float)
     draught = df["draught"].to_numpy(dtype=float)
-    depth   = df["WaterDepth"].to_numpy(dtype=float)
-    b       = df["width"].to_numpy(dtype=float)
+    depth    = df["WaterDepth"].to_numpy(dtype=float)
     froude_d = df["FroudeD"].to_numpy(dtype=float)
 
     # --- Alpha = 2.35 * (1 - Cb): finite-depth adjustment exponent ---
@@ -104,7 +103,6 @@ def compute_kriebel(
         (bf > max_bf) |
         (froude_d >= max_froude_d)
     )
-    h = h.copy()
     h[invalid] = np.nan
 
     return pd.Series(h, index=df.index, name="H_Kriebel")
