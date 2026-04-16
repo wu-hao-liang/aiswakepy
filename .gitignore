@@ -32,6 +32,8 @@ examples/tide/
 examples/ais/
 examples/coastline/
 examples/matlab_reference/
+data/
+ref/
 
 # Pipeline outputs
 output/
