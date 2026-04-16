@@ -10,8 +10,8 @@ Description
 -----------
 Simple draught-Froude scaling. No lateral-distance dependency.
 
-    Fr_d  = V / sqrt(g * d)
-    Hmax  = 0.133 * Fr_d * d
+    Froude_Draft = V / sqrt(g * d)
+    Hmax         = 0.133 * Froude_Draft * d
 
 where:
     V — vessel speed (m/s)
@@ -43,7 +43,7 @@ def compute_bhowmik(
     v = df["SOGms"].to_numpy(dtype=float)
     draught = df["draught"].to_numpy(dtype=float)
 
-    fr_d = v / np.sqrt(g * draught)
-    hmax = 0.133 * fr_d * draught
+    Froude_Draft = v / np.sqrt(g * draught)
+    hmax = 0.133 * Froude_Draft * draught
 
     return pd.Series(hmax, index=df.index, name="H_Bhowmik")

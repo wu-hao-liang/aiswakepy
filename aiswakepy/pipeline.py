@@ -128,8 +128,8 @@ def run_pipeline(
             g=config.wave.gravity,
             rho=config.wave.rho_water,
             # Kriebel-specific validity limits
-            min_froude_m=config.wave.min_froude_m,
-            max_froude_m=config.wave.max_froude_m,
+            min_Froude_M=config.wave.min_Froude_M,
+            max_Froude_M=config.wave.max_Froude_M,
             max_bf=config.wave.max_bf,
         )
         print(

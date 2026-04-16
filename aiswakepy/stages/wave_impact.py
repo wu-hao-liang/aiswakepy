@@ -88,7 +88,7 @@ def compute_point_impact(
                      ``compute_vessel_params``).  Must contain columns:
                      longitude, latitude, obstime, WakeDirPort,
                      WakeDirStarboard, Theta, Tc, SOGms,
-                     cog, segment_id, mmsi, width, length, FroudeD.
+                     cog, segment_id, mmsi, width, length, Froude_D.
     point_lon:       Longitude of the measurement point (decimal degrees).
     point_lat:       Latitude of the measurement point (decimal degrees).
     formula:         Empirical wake model to use (default ``"kriebel"``).
@@ -109,7 +109,7 @@ def compute_point_impact(
     _OUT_COLS = [
         "MMSI", "PointLongitude", "PointLatitude", "WaveHeight", "WavePeriod",
         "PropDist_m", "DistPerp_m", "DateTime", "ArrivalTime",
-        "FroudeD", "VesselWidth", "VesselLength", "SOG", "Side", "segment_id",
+        "Froude_D", "VesselWidth", "VesselLength", "SOG", "Side", "segment_id",
         "SOGms", "WaterDepth", "length", "width", "draught",
         "block_coeff", "bow_entry_m", "displacement_m3",
     ]
@@ -175,7 +175,7 @@ def compute_point_impact(
                 theta_s = _lerp(float(r0.Theta), float(r1.Theta), t_star)
                 sogms_s = _lerp(float(r0.SOGms), float(r1.SOGms), t_star)
                 tc_s    = _lerp(float(r0.Tc), float(r1.Tc), t_star)
-                frd_s   = _lerp(float(r0.FroudeD), float(r1.FroudeD), t_star)
+                frd_s   = _lerp(float(r0.Froude_D), float(r1.Froude_D), t_star)
                 sog_s   = _lerp(float(r0.sog), float(r1.sog), t_star)
                 obs_s   = r0.obstime + pd.Timedelta(seconds=t_star * dt_span)
 
@@ -195,7 +195,7 @@ def compute_point_impact(
                     "PropDist_m": prop_dist,
                     "DistPerp_m": dist_perp,
                     "DateTime": obs_s,
-                    "FroudeD": frd_s,
+                    "Froude_D": frd_s,
                     "VesselWidth": float(r0.width),
                     "VesselLength": float(r0.length),
                     "SOG": sog_s,
@@ -205,7 +205,7 @@ def compute_point_impact(
                 # Collect vessel columns needed by formula
                 hit_vessel_data.append({
                     "SOGms":          sogms_s,
-                    "FroudeD":        frd_s,
+                    "Froude_D":        frd_s,
                     "WaterDepth":     _lerp(_gcol(r0, "WaterDepth"), _gcol(r1, "WaterDepth"), t_star),
                     "length":         float(r0.length),
                     "width":          float(r0.width),
@@ -295,7 +295,7 @@ def compute_wave_impact(
     -------
     DataFrame with one row per shoreline intersection (port and/or starboard).
     Columns: MMSI, ShLongitude, ShLatitude, WaveHeight, WavePeriod,
-             DistLoc_km, DateTime, FroudeD, VesselWidth, VesselLength,
+             DistLoc_km, DateTime, Froude_D, VesselWidth, VesselLength,
              SOG, Side.
     """
     if formula not in _FORMULA_REGISTRY:
@@ -306,7 +306,7 @@ def compute_wave_impact(
 
     _OUT_COLS = [
         "MMSI", "ShLongitude", "ShLatitude", "WaveHeight", "WavePeriod",
-        "DistLoc_km", "DateTime", "FroudeD", "VesselWidth", "VesselLength",
+        "DistLoc_km", "DateTime", "Froude_D", "VesselWidth", "VesselLength",
         "SOG", "Side",
     ]
 
@@ -365,7 +365,7 @@ def compute_wave_impact(
                 "WavePeriod":    row.Tc,
                 "DistLoc_km":    dist_perp / 1000.0,
                 "DateTime":      row.obstime,
-                "FroudeD":       row.FroudeD,
+                "Froude_D":       row.Froude_D,
                 "VesselWidth":   row.width,
                 "VesselLength":  row.length,
                 "SOG":           row.sog,

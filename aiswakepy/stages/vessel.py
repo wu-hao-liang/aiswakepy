@@ -30,7 +30,7 @@ _TWO_PI = 2.0 * np.pi
 _GIS_COLS = [
     "mmsi", "longitude", "latitude",
     "WakeDirPort", "WakeDirStarboard",
-    "obstime", "FroudeD", "SOGms",
+    "obstime", "Froude_D", "SOGms",
     "width", "length", "Tc", "WaterDepth",
     "Theta", "BLratio",
 ]
@@ -67,7 +67,7 @@ def compute_vessel_params(
     -------------
     block_coeff, bow_entry_m, displacement_m3   — vessel params
     SOGms    — speed (m/s)
-    FroudeD  — depth Froude number V / sqrt(g * h)
+    Froude_D  — depth Froude number V / sqrt(g * h)
     T        — divergent wave period 0.27 * SOG_knots (s)
     Theta    — Kelvin wake half-angle (deg)
     Cel      — divergent wave celerity V * cos(Theta) (m/s)
@@ -86,8 +86,8 @@ def compute_vessel_params(
     # SOGms: speed over ground in m/s
     df["SOGms"] = df["sog"] * _KNOTS_TO_MS
 
-    # FroudeD = V / sqrt(g * h): depth Froude number
-    df["FroudeD"] = df["SOGms"] / np.sqrt(g * df["WaterDepth"])
+    # Froude_D = V / sqrt(g * h): depth Froude number
+    df["Froude_D"] = df["SOGms"] / np.sqrt(g * df["WaterDepth"])
 
     # --- T = 0.27 * SOG (knots→s): divergent wave period ---
     # From deep-water Kelvin wake dispersion: T = 2π·V·cos(θ)/g, where
@@ -100,7 +100,7 @@ def compute_vessel_params(
     # (critical depth speed). Empirical curve fit to Havelock (1908) finite-depth
     # theory. — Kriebel & Seelig (2005); Havelock (1908)
     _theta_deep = np.degrees(np.arcsin(1.0 / np.sqrt(3.0)))
-    df["Theta"] = _theta_deep * (1.0 - np.exp(12.0 * (df["FroudeD"] - 1.0)))
+    df["Theta"] = _theta_deep * (1.0 - np.exp(12.0 * (df["Froude_D"] - 1.0)))
 
     # --- Cel = V·cos(θ): divergent wave celerity (m/s) ---
     df["Cel"] = df["SOGms"] * np.cos(np.radians(df["Theta"]))

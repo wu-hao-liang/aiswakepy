@@ -37,8 +37,8 @@ class CoastlineConfig(BaseModel):
 
 
 class WaveConfig(BaseModel):
-    max_froude_m: float = 0.5
-    min_froude_m: float = 0.1
+    max_Froude_M: float = 0.5
+    min_Froude_M: float = 0.1
     max_bf: float = 0.4
     max_sog_knots: float = 12.0
     max_bl_ratio: float = 0.3

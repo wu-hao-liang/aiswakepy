@@ -11,12 +11,12 @@ Description
 Developed for vessels in inland waterways. Relates Hmax to water depth,
 lateral distance, and the depth Froude number.
 
-    Hmax = A * h * (y/h)^(-1/3) * Fd^4
+    Hmax = A * h * (y/h)^(-1/3) * Froude_D^4
 
 where:
     h  — water depth (m)
     y  — lateral distance from sailing line to point of interest (m)
-    Fd — depth Froude number = V / sqrt(g * h)
+    Froude_D — depth Froude number = V / sqrt(g * h)
     A  — hull-type coefficient (1.0 for tugs, patrol boats, loaded inland boats)
 """
 
@@ -30,32 +30,32 @@ def compute_pianc(
     df: pd.DataFrame,
     g: float = 9.78,
     A: float = 1.0,
-    max_fd: float = 0.7,
+    max_Froude_D: float = 0.7,
 ) -> pd.Series:
     """Apply the PIANC (1987) formula to each AIS fix.
 
     Parameters
     ----------
-    df:     DataFrame with ``SOGms``, ``WaterDepth``, ``dist_perp``, ``width`` columns.
-    g:      Gravitational acceleration (m/s²). Default 9.78 (Singapore).
-    A:      Hull-type coefficient. Default 1.0.
-    max_fd: Maximum depth Froude number (default 0.7). Formula valid for Fd < max_fd.
+    df:           DataFrame with ``SOGms``, ``WaterDepth``, ``dist_perp``, ``width`` columns.
+    g:            Gravitational acceleration (m/s²). Default 9.78 (Singapore).
+    A:            Hull-type coefficient. Default 1.0.
+    max_Froude_D: Maximum depth Froude number (default 0.7). Formula valid for Froude_D < max_Froude_D.
 
     Returns
     -------
-    pd.Series of Hmax values (m).  NaN where Fd >= max_fd.
+    pd.Series of Hmax values (m).  NaN where Froude_D >= max_Froude_D.
     """
     v = df["SOGms"].to_numpy(dtype=float)
     depth = df["WaterDepth"].to_numpy(dtype=float)
     y = df["dist_perp"].to_numpy(dtype=float)
     b = df["width"].to_numpy(dtype=float)
 
-    fd = v / np.sqrt(g * depth)
+    Froude_D = v / np.sqrt(g * depth)
 
-    hmax = A * depth * ((y - b / 2) / depth) ** (-1.0 / 3.0) * fd ** 4
+    hmax = A * depth * ((y - b / 2) / depth) ** (-1.0 / 3.0) * Froude_D ** 4
 
     # Applicability filters — set to NaN outside valid range
-    invalid = fd >= max_fd
+    invalid = Froude_D >= max_Froude_D
     hmax[invalid] = np.nan
 
     return pd.Series(hmax, index=df.index, name="H_PIANC")

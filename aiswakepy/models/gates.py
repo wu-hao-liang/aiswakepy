@@ -75,20 +75,20 @@ _KW_INTERCEPT = 8.104
 def compute_gates(
     df: pd.DataFrame,
     g: float = 9.78,
-    max_fr: float = 0.7,
+    max_Froude_L: float = 0.7,
 ) -> pd.Series:
     """Apply the Gates & Herbich (1977) formula to each AIS fix.
 
     Parameters
     ----------
-    df:     DataFrame with ``SOGms``, ``length``, ``width``, ``bow_entry_m``,
-            ``dist_perp`` columns.
-    g:      Gravitational acceleration (m/s²). Default 9.78 (Singapore).
-    max_fr: Maximum length Froude number (default 0.7). Formula valid for Fr < max_fr.
+    df:           DataFrame with ``SOGms``, ``length``, ``width``, ``bow_entry_m``,
+                  ``dist_perp`` columns.
+    g:            Gravitational acceleration (m/s²). Default 9.78 (Singapore).
+    max_Froude_L: Maximum length Froude number (default 0.7). Formula valid for Froude_L < max_Froude_L.
 
     Returns
     -------
-    pd.Series of H (m).  NaN where length Froude Fr >= max_fr.
+    pd.Series of H (m).  NaN where Froude_L >= max_Froude_L.
     """
     v   = df["SOGms"].to_numpy(dtype=float)
     l   = df["length"].to_numpy(dtype=float)
@@ -97,11 +97,11 @@ def compute_gates(
     y   = df["dist_perp"].to_numpy(dtype=float)
 
     # ── Froude number (local g) — used for both Kw lookup and validity filter ─
-    fr = v / np.sqrt(g * l)
+    Froude_L = v / np.sqrt(g * l)
     kw = np.where(
-        fr >= _FR_BREAK,
+        Froude_L >= _FR_BREAK,
         1.133,
-        _KW_SLOPE * fr + _KW_INTERCEPT,
+        _KW_SLOPE * Froude_L + _KW_INTERCEPT,
     )
 
     # ── Imperial units for wave height and cusp formula ──────────────────────
@@ -124,7 +124,7 @@ def compute_gates(
     h = h_ft * 0.3048
 
     # ── Applicability filter ──────────────────────────────────────────────────
-    invalid = (fr >= max_fr)
+    invalid = (Froude_L >= max_Froude_L)
     h[invalid] = np.nan
 
     return pd.Series(h, index=df.index, name="H_Gates")

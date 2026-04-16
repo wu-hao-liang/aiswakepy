@@ -8,7 +8,7 @@ Shared test fixture:
     SOGms = 8 * 0.5144444 = 4.1155 m/s
     block_coeff = 0.80 (B_Le tanker), bow_entry_m = 30/1.0 = 30.0
     displacement_m3 = 30 * 10 * 200 * 0.95 * 0.80 = 45600 m³
-    FroudeD = 4.1155 / sqrt(9.78*15) = 0.3397
+    Froude_D = 4.1155 / sqrt(9.78*15) = 0.3397
     Fr_length = 4.1155 / sqrt(9.78*200) = 0.09296
     dist_perp = 500.0 m  (default lateral distance for all formula tests)
 """
@@ -47,7 +47,7 @@ def _make_df(**overrides) -> pd.DataFrame:
         WaterDepth=15.0,
         SOGms=_SOGMS,
         sog=_SOG_KTS,
-        FroudeD=_SOGMS / np.sqrt(_G * 15.0),
+        Froude_D=_SOGMS / np.sqrt(_G * 15.0),
         # B_Le tanker: Cb=0.80, Le=30/1.0=30
         block_coeff=0.80,
         bow_entry_m=30.0,
@@ -83,7 +83,7 @@ def test_displacement_zero_draught():
 # ---------------------------------------------------------------------------
 # PIANC (1987)
 # ---------------------------------------------------------------------------
-# Fd = 4.1155/sqrt(9.78*15) ≈ 0.3397
+# Froude_D = 4.1155/sqrt(9.78*15) ≈ 0.3397
 # Hmax = 1.0 * 15 * (500/15)^(-1/3) * 0.3397^4
 #      = 15 * 33.33^(-1/3) * 0.01333
 #      = 15 * 0.3217 * 0.01333 ≈ 0.0644 m
@@ -91,22 +91,22 @@ def test_displacement_zero_draught():
 def test_pianc_known_value():
     df = _make_df()
     h = compute_pianc(df, g=_G)
-    fd = _SOGMS / np.sqrt(_G * 15.0)
-    expected = 1.0 * 15.0 * ((_DIST_M - 30.0 / 2) / 15.0) ** (-1.0 / 3.0) * fd ** 4
+    Froude_D = _SOGMS / np.sqrt(_G * 15.0)
+    expected = 1.0 * 15.0 * ((_DIST_M - 30.0 / 2) / 15.0) ** (-1.0 / 3.0) * Froude_D ** 4
     assert h.iloc[0] == pytest.approx(expected, rel=1e-4)
 
 
 def test_pianc_filter_fr_high():
-    """Fr >= 0.7 → NaN."""
+    """Froude_L >= 0.7 → NaN."""
     df = _make_df(SOGms=30.0, length=10.0)   # huge Fr
     h = compute_pianc(df, g=_G)
     assert np.isnan(h.iloc[0])
 
 
 def test_pianc_filter_fd_high():
-    """Fd >= 0.7 → NaN.
-    SOGms=5, depth=5: Fd=5/sqrt(9.78*5)=5/6.99≈0.715 ≥ 0.7
-    Fr=5/sqrt(9.78*1000)=0.016 < 0.7 (Fr filter does not trigger).
+    """Froude_D >= 0.7 → NaN.
+    SOGms=5, depth=5: Froude_D=5/sqrt(9.78*5)=5/6.99≈0.715 ≥ 0.7
+    Froude_L=5/sqrt(9.78*1000)=0.016 < 0.7 (Froude_L filter does not trigger).
     """
     df = _make_df(SOGms=5.0, WaterDepth=5.0, length=1000.0)
     h = compute_pianc(df, g=_G)
@@ -116,14 +116,14 @@ def test_pianc_filter_fd_high():
 # ---------------------------------------------------------------------------
 # Bhowmik et al. (1982)
 # ---------------------------------------------------------------------------
-# Fr_d = 4.1155 / sqrt(9.78*10) = 4.1155/9.8895 ≈ 0.4162
+# Froude_Draft = 4.1155 / sqrt(9.78*10) = 4.1155/9.8895 ≈ 0.4162
 # Hmax = 0.133 * 0.4162 * 10 ≈ 0.5535 m
 
 def test_bhowmik_known_value():
     df = _make_df()
     h = compute_bhowmik(df, g=_G)
-    fr_d = _SOGMS / np.sqrt(_G * 10.0)
-    expected = 0.133 * fr_d * 10.0
+    Froude_Draft = _SOGMS / np.sqrt(_G * 10.0)
+    expected = 0.133 * Froude_Draft * 10.0
     assert h.iloc[0] == pytest.approx(expected, rel=1e-4)
 
 
@@ -139,8 +139,8 @@ def test_bhowmik_no_distance_dependency():
 # Gates & Herbich (1977)
 # ---------------------------------------------------------------------------
 # Standard tanker: SOGms=4.1155, L=200m, B=30m, Le=30m, dist_perp=500m
-# Fr = 4.1155/sqrt(9.78*200) = 0.09306  <  FR_BREAK(≈0.273)
-# Kw = _KW_SLOPE*Fr + _KW_INTERCEPT
+# Froude_L = 4.1155/sqrt(9.78*200) = 0.09306  <  FR_BREAK(≈0.273)
+# Kw = _KW_SLOPE*Froude_L + _KW_INTERCEPT
 # N  = (y_ft*3*g_ft*sqrt(3)/(2*V_ft²*π) - 1.5) / 2
 # H_ft = (1.5/(2N+1.5))^(1/3) * Kw*(B/Le) * V_ft²/(2*g_ft)
 # H_m  = H_ft * 0.3048
@@ -153,8 +153,8 @@ def test_gates_known_value():
     h = compute_gates(df, g=_G)
 
     # Kw (local g)
-    fr = _SOGMS / np.sqrt(_G * 200.0)
-    kw = _KW_SLOPE * fr + _KW_INTERCEPT   # fr < FR_BREAK
+    Froude_L = _SOGMS / np.sqrt(_G * 200.0)
+    kw = _KW_SLOPE * Froude_L + _KW_INTERCEPT   # Froude_L < FR_BREAK
 
     # Imperial conversions
     v_ft = _SOGMS * _FT
@@ -172,14 +172,14 @@ def test_gates_known_value():
 
 
 def test_gates_filter_fr_high():
-    """Fr >= 0.7 → NaN."""
+    """Froude_L >= 0.7 → NaN."""
     df = _make_df(SOGms=25.0, length=10.0)
     h = compute_gates(df, g=_G)
     assert np.isnan(h.iloc[0])
 
 
 def test_gates_fn_above_break():
-    """Fr >= FR_BREAK → Kw = 1.133 (constant branch)."""
+    """Froude_L >= FR_BREAK → Kw = 1.133 (constant branch)."""
     df = _make_df(SOGms=3.5, length=10.0, width=3.0, bow_entry_m=3.0)
     h = compute_gates(df, g=_G)
     assert not np.isnan(h.iloc[0])
@@ -232,10 +232,12 @@ def test_blaauw_filter_fd_high():
 # ---------------------------------------------------------------------------
 
 def test_sorensen_returns_finite():
-    """Valid inputs → finite positive result (Fr in [0.2, 0.8])."""
-    # Sorensen valid for Fr in [0.2, 0.8]; test at Fr ≈ 0.4
-    # Fr = V / sqrt(g*L), so V = 0.4 * sqrt(9.78*200) ≈ 17.6 m/s ≈ 34.2 knots
-    df = _make_df(sog=34.2, SOGms=34.2 * _KNOTS_TO_MS)
+    """Valid inputs → finite positive result (Fd in [0.2, 0.8])."""
+    # Sorensen valid for depth Froude number Fd in [0.2, 0.8]; test at Fd ≈ 0.4
+    # Fd = V / sqrt(g*h), so V = 0.4 * sqrt(9.78*15) ≈ 4.85 m/s ≈ 9.41 knots
+    sogms_valid = 0.4 * np.sqrt(_G * 15.0)
+    sog_valid = sogms_valid / _KNOTS_TO_MS
+    df = _make_df(sog=sog_valid, SOGms=sogms_valid)
     h = compute_sorensen(df, g=_G)
     assert np.isfinite(h.iloc[0])
     assert h.iloc[0] > 0
@@ -243,8 +245,8 @@ def test_sorensen_returns_finite():
 
 def test_sorensen_increases_with_dist_decreasing():
     """n < 0 for typical conditions → larger dist_perp → smaller Hmax."""
-    sog_valid = 34.2
-    sogms_valid = sog_valid * _KNOTS_TO_MS
+    sogms_valid = 0.4 * np.sqrt(_G * 15.0)
+    sog_valid = sogms_valid / _KNOTS_TO_MS
     df_near = _make_df(sog=sog_valid, SOGms=sogms_valid, dist_perp=200.0)
     df_far  = _make_df(sog=sog_valid, SOGms=sogms_valid, dist_perp=1000.0)
     h_near = compute_sorensen(df_near, g=_G).iloc[0]
