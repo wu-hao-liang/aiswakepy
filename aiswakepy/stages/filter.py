@@ -54,6 +54,8 @@ def load_ais(csv_path: str | Path) -> pd.DataFrame:
 
     df = df[_REQUIRED_COLS].copy()
     df["obstime"] = pd.to_datetime(df["obstime"], utc=False, errors="coerce")
+    if df["obstime"].dt.tz is not None:
+        df["obstime"] = df["obstime"].dt.tz_localize(None)
     df = df.dropna(subset=["obstime", "longitude", "latitude"])
     spinner.done(rows=len(df))
     return df
