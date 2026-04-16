@@ -90,6 +90,24 @@ def test_wave_impact_columns(tmp_path):
         assert col in result.columns
 
 
+def test_wave_impact_output_columns_complete(tmp_path):
+    """Wave impact output includes all expected columns for its function."""
+    poly = Polygon([(103.86, 1.28), (103.90, 1.28), (103.90, 1.30), (103.86, 1.30)])
+    shp = _write_shp(tmp_path, poly)
+    df = _make_vessel_row(WakeDirPort=90.0, WakeDirStarboard=90.0)
+    result = compute_wave_impact(df, shp, max_propagation_m=5000.0, wake_cutoff_m=0.0)
+
+    # compute_wave_impact is designed for shore mapping (fewer columns needed)
+    # vessel parameters are used internally but not in output
+    expected_cols = [
+        "MMSI", "ShLongitude", "ShLatitude", "WaveHeight", "WavePeriod",
+        "DistLoc_km", "DateTime", "FroudeD", "VesselWidth", "VesselLength",
+        "SOG", "Side",
+    ]
+    for col in expected_cols:
+        assert col in result.columns, f"Missing expected column: {col}"
+
+
 def test_wave_impact_port_and_starboard(tmp_path):
     """Port and starboard rays both hit land → 2 output rows."""
     poly = Polygon([(103.86, 1.27), (103.92, 1.27), (103.92, 1.32), (103.86, 1.32)])
