@@ -225,6 +225,7 @@ def compute_point_impact(
 
     # Deep-water group velocity for travel-time computation
     tc_arr = np.array([r["WavePeriod"] for r in hit_records])
+    # Floor of 0.01 m/s guards against division-by-zero when Tc is 0 or near-zero.
     c_g = np.maximum(g * tc_arr / (4.0 * math.pi), 0.01)
     prop_dist_arr = np.array([r["PropDist_m"] for r in hit_records])
     travel_s = prop_dist_arr / c_g

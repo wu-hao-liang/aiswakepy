@@ -108,9 +108,14 @@ def _ensure_vessel_cols(df: pd.DataFrame, cb_method: str) -> pd.DataFrame:
 
 
 
-def _excel_serial_to_datetime(serial: float) -> pd.Timestamp:
-    """Convert MATLAB/Excel serial date (days since 1899-12-30) to Timestamp."""
-    return pd.Timestamp("1899-12-30") + pd.Timedelta(days=float(serial))
+def _matlab_datenum_to_datetime(dn: float) -> pd.Timestamp:
+    """Convert MATLAB datenum (days since January 0, year 0000) to Timestamp.
+
+    MATLAB datenum(2000,1,1) = 730486; Python ordinal for 2000-01-01 = 730120.
+    The fixed offset is 366, so Python_ordinal = matlab_dn - 366.
+    Example: 738946.652582176 → 2023-03-01 15:39.
+    """
+    return pd.Timestamp.fromordinal(int(dn) - 366) + pd.Timedelta(days=dn % 1)
 
 
 def _load_ossi(path: str | Path) -> pd.DataFrame:
@@ -131,7 +136,7 @@ def _load_ossi(path: str | Path) -> pd.DataFrame:
     # Parse time: could be datetime (pandas Timestamp) or Excel serial float
     if pd.api.types.is_float_dtype(time_col) or pd.api.types.is_integer_dtype(time_col):
         times = pd.to_datetime(
-            [_excel_serial_to_datetime(v) for v in time_col.to_numpy(dtype=float)]
+            [_matlab_datenum_to_datetime(v) for v in time_col.to_numpy(dtype=float)]
         )
     else:
         times = pd.to_datetime(time_col)

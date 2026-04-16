@@ -26,9 +26,13 @@ class BathymetryMesh:
         if suffix == ".mesh":
             msh = mikeio.Mesh(str(path))
             self._geometry = msh.geometry
-        elif suffix in (".dfsu", ".dfs2"):
+        elif suffix == ".dfsu":
             ds = mikeio.open(str(path))
             self._geometry = ds.geometry
+        elif suffix == ".dfs2":
+            # TODO: dfs2 uses a Grid2D geometry interface, which differs from dfsu.
+            # Implement when dfs2 bathymetry support is needed.
+            raise NotImplementedError("dfs2 bathymetry loading is not yet implemented")
         else:
             raise ValueError(f"Unsupported bathymetry file type: {suffix!r}")
 
