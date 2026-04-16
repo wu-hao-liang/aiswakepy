@@ -111,7 +111,7 @@ def compute_point_impact(
         "PropDist_m", "DistPerp_m", "DateTime", "ArrivalTime",
         "FroudeD", "VesselWidth", "VesselLength", "SOG", "Side", "segment_id",
         "SOGms", "WaterDepth", "length", "width", "draught",
-        "bow_entry_m", "displacement_m3",
+        "block_coeff", "bow_entry_m", "displacement_m3",
     ]
 
     if df_vessel.empty:
@@ -246,6 +246,7 @@ def compute_point_impact(
             "length":          vd["length"],
             "width":           vd["width"],
             "draught":         vd["draught"],
+            "block_coeff":     vd["block_coeff"],
             "bow_entry_m":     vd["bow_entry_m"],
             "displacement_m3": vd["displacement_m3"],
         })
