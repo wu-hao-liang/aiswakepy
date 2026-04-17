@@ -157,7 +157,7 @@ def segment_trajectories(df: pd.DataFrame, gap_s: float = 180.0) -> pd.DataFrame
 
 def clean_error_coords(
     df: pd.DataFrame,
-    max_velocity_knots: float = 12.0,
+    max_velocity_knots: float = 36.0,
 ) -> pd.DataFrame:
     """Remove GPS spike points using a Kinematic Consistency Check.
 
@@ -315,7 +315,7 @@ def clean_error_coords(
 
 def clean_error_speed(
     df: pd.DataFrame,
-    max_acceleration_ms2: float = 0.2,
+    max_acceleration_ms2: float = 10.0,
 ) -> pd.DataFrame:
     """Replace erroneous SOG/COG using an Acceleration Check.
 
@@ -653,8 +653,8 @@ def filter_ais(
     csv_path: str | Path,
     coastline_shp: str | Path,
     gap_s: float = 180.0,
-    max_velocity_knots: float = 12.0,
-    max_acceleration_ms2: float = 0.2,
+    max_velocity_knots: float = 36.0,
+    max_acceleration_ms2: float = 10.0,
     interval_s: float = 30.0,
     study_area_shp: str | Path | None = None,
 ) -> pd.DataFrame:

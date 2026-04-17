@@ -60,6 +60,7 @@ from pathlib import Path
 import pandas as pd
 
 from aiswakepy.comparison       import load_ossi, match_events, timeseries_plot, scatter_plot
+from aiswakepy.models.kriebel   import compute_kriebel
 from aiswakepy.models.pianc     import compute_pianc
 from aiswakepy.models.bhowmik   import compute_bhowmik
 from aiswakepy.models.gates     import compute_gates
@@ -150,11 +151,7 @@ def run_comparison(
 
     # --- Compute all empirical wave heights ---
     print("Computing empirical wave heights...")
-    events["dist_perp"] = events["DistPerp_m"]
-
-    if "WaveHeight" in events.columns:
-        events["H_Kriebel"] = events["WaveHeight"]
-
+    events["H_Kriebel"]  = compute_kriebel(events, g=g).values
     events["H_PIANC"]    = compute_pianc(events, g=g).values
     events["H_Bhowmik"]  = compute_bhowmik(events, g=g).values
     events["H_Gates"]    = compute_gates(events, g=g).values

@@ -69,19 +69,19 @@ def compute_point_impact(
     df_vessel: pd.DataFrame,
     point_lon: float,
     point_lat: float,
-    formula: str = "kriebel",
     g: float = 9.78,
     max_prop_m: float | None = None,
     bisect_tol_deg: float = 1e-3,
-    **formula_kwargs,
 ) -> pd.DataFrame:
-    """Find all wake arrivals at a fixed measurement point (e.g. an OSSI gauge).
+    """Find all geometric wake arrivals at a fixed measurement point.
 
     For each pair of consecutive AIS positions within a trajectory segment,
     solve for the exact position along the segment where the vessel's wake
-    direction points directly at the measurement point.  At that position the
-    perpendicular propagation distance from the sailing line is added as
-    ``dist_perp`` and the selected empirical formula computes the wave height.
+    direction points directly at the measurement point.  Returns the geometric
+    record (lateral distance, propagation distance, arrival time) plus the
+    vessel columns each empirical formula needs, so the caller can apply any
+    subset of formulae to every geometric hit.  The wake-height formula itself
+    is **not** applied here — that's the caller's job.
 
     Parameters
     ----------
@@ -92,7 +92,6 @@ def compute_point_impact(
                      cog, segment_id, mmsi, width, length, Froude_D.
     point_lon:       Longitude of the measurement point (decimal degrees).
     point_lat:       Latitude of the measurement point (decimal degrees).
-    formula:         Empirical wake model to use (default ``"kriebel"``).
     g:               Gravitational acceleration (m/s²). Default 9.78.
     max_prop_m:      Maximum propagation distance (m). Trajectory segment pairs
                      where both endpoints are farther than this from the point
@@ -100,21 +99,15 @@ def compute_point_impact(
                      when the segment heading is roughly aligned with the track.
                      ``None`` disables the filter (default).
     bisect_tol_deg:  Angular convergence tolerance for bisection (degrees).
-    **formula_kwargs: Extra keyword arguments forwarded to the formula function.
 
     Returns
     -------
-    DataFrame with one row per wake-arrival event.
+    DataFrame with one row per geometric wake-arrival event.  Includes
+    ``dist_perp`` so empirical formula functions can be called directly on it.
     """
-    if formula not in _FORMULA_REGISTRY:
-        raise ValueError(
-            f"Unknown formula {formula!r}. Supported: {list(_FORMULA_REGISTRY)}"
-        )
-    compute_fn, h_col = _FORMULA_REGISTRY[formula]
-
     _OUT_COLS = [
-        "MMSI", "PointLongitude", "PointLatitude", "WaveHeight", "WavePeriod",
-        "PropDist_m", "DistPerp_m", "DateTime", "ArrivalTime",
+        "MMSI", "PointLongitude", "PointLatitude", "WavePeriod",
+        "PropDist_m", "DistPerp_m", "dist_perp", "DateTime", "ArrivalTime",
         "Froude_D", "VesselWidth", "VesselLength", "SOG", "Side", "segment_id",
         "SOGms", "WaterDepth", "length", "width", "draught",
         "block_coeff", "bow_entry_m", "displacement_m3",
@@ -234,10 +227,6 @@ def compute_point_impact(
     if not hit_records:
         return pd.DataFrame(columns=_OUT_COLS)
 
-    # Batch compute wave heights with selected formula
-    hit_df = pd.DataFrame(hit_vessel_data)
-    h_series = compute_fn(hit_df, g=g, **formula_kwargs)
-
     # Deep-water group velocity for travel-time computation
     tc_arr = np.array([r["WavePeriod"] for r in hit_records])
     # Floor of 0.01 m/s guards against division-by-zero when Tc is 0 or near-zero.
@@ -246,15 +235,12 @@ def compute_point_impact(
     travel_s = prop_dist_arr / c_g
 
     records_out: list[dict] = []
-    for idx, (rec, h_val, trav) in enumerate(zip(hit_records, h_series, travel_s)):
-        if np.isnan(h_val) or h_val <= 0:
-            continue
+    for idx, (rec, trav) in enumerate(zip(hit_records, travel_s)):
         obs_s = rec["DateTime"]
         arrival = obs_s + pd.Timedelta(seconds=float(trav))
         vd = hit_vessel_data[idx]
         records_out.append({
             **rec,
-            "WaveHeight": h_val,
             "ArrivalTime": arrival,
             "SOGms":           vd["SOGms"],
             "WaterDepth":      vd["WaterDepth"],
@@ -264,6 +250,7 @@ def compute_point_impact(
             "block_coeff":     vd["block_coeff"],
             "bow_entry_m":     vd["bow_entry_m"],
             "displacement_m3": vd["displacement_m3"],
+            "dist_perp":       vd["dist_perp"],
         })
 
     if not records_out:

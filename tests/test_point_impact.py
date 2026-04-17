@@ -7,6 +7,13 @@ Tests verify that compute_point_impact preserves vessel parameters
 import pandas as pd
 import pytest
 
+from aiswakepy.models.bhowmik import compute_bhowmik
+from aiswakepy.models.blaauw import compute_blaauw
+from aiswakepy.models.gates import compute_gates
+from aiswakepy.models.kriebel import compute_kriebel
+from aiswakepy.models.maynord import compute_maynord
+from aiswakepy.models.pianc import compute_pianc
+from aiswakepy.models.sorensen import compute_sorensen
 from aiswakepy.stages.wave_impact import compute_point_impact
 
 
@@ -59,13 +66,13 @@ def _make_vessel_segment(**kwargs) -> pd.DataFrame:
 
 
 def test_point_impact_output_columns():
-    """compute_point_impact output includes all expected columns."""
+    """compute_point_impact output includes all expected geometric columns."""
     df_vessel = _make_vessel_segment()
-    result = compute_point_impact(df_vessel, 103.73, 1.27, formula="kriebel", g=_G)
+    result = compute_point_impact(df_vessel, 103.73, 1.27, g=_G)
 
     expected_cols = [
-        "MMSI", "PointLongitude", "PointLatitude", "WaveHeight", "WavePeriod",
-        "PropDist_m", "DistPerp_m", "DateTime", "ArrivalTime",
+        "MMSI", "PointLongitude", "PointLatitude", "WavePeriod",
+        "PropDist_m", "DistPerp_m", "dist_perp", "DateTime", "ArrivalTime",
         "Froude_D", "VesselWidth", "VesselLength", "SOG", "Side", "segment_id",
         "SOGms", "WaterDepth", "length", "width", "draught",
         "block_coeff", "bow_entry_m", "displacement_m3",
@@ -78,7 +85,7 @@ def test_point_impact_output_columns():
 def test_point_impact_preserves_block_coeff():
     """block_coeff from input is preserved in output."""
     df_vessel = _make_vessel_segment(block_coeff=0.75)
-    result = compute_point_impact(df_vessel, 103.73, 1.27, formula="kriebel", g=_G)
+    result = compute_point_impact(df_vessel, 103.73, 1.27, g=_G)
 
     if len(result) > 0:
         assert "block_coeff" in result.columns
@@ -89,7 +96,7 @@ def test_point_impact_preserves_bow_entry():
     """bow_entry_m from input is preserved in output."""
     bow_entry = 35.0
     df_vessel = _make_vessel_segment(bow_entry_m=bow_entry)
-    result = compute_point_impact(df_vessel, 103.73, 1.27, formula="kriebel", g=_G)
+    result = compute_point_impact(df_vessel, 103.73, 1.27, g=_G)
 
     if len(result) > 0:
         assert "bow_entry_m" in result.columns
@@ -100,7 +107,7 @@ def test_point_impact_preserves_displacement():
     """displacement_m3 from input is preserved in output."""
     disp = 5000.0
     df_vessel = _make_vessel_segment(displacement_m3=disp)
-    result = compute_point_impact(df_vessel, 103.73, 1.27, formula="kriebel", g=_G)
+    result = compute_point_impact(df_vessel, 103.73, 1.27, g=_G)
 
     if len(result) > 0:
         assert "displacement_m3" in result.columns
@@ -110,12 +117,12 @@ def test_point_impact_preserves_displacement():
 def test_point_impact_empty_input():
     """Empty input returns empty DataFrame with all expected columns."""
     df_vessel = _make_vessel_segment().iloc[:0]  # Empty
-    result = compute_point_impact(df_vessel, 103.73, 1.27, formula="kriebel", g=_G)
+    result = compute_point_impact(df_vessel, 103.73, 1.27, g=_G)
 
     assert len(result) == 0
     expected_cols = [
         "block_coeff", "bow_entry_m", "displacement_m3",
-        "MMSI", "PointLongitude", "PointLatitude", "WaveHeight",
+        "MMSI", "PointLongitude", "PointLatitude", "dist_perp",
     ]
     for col in expected_cols:
         assert col in result.columns, f"Missing column in empty output: {col}"
@@ -124,9 +131,8 @@ def test_point_impact_empty_input():
 def test_point_impact_finds_arrival():
     """compute_point_impact finds wake arrival at gauge point."""
     df_vessel = _make_vessel_segment()
-    result = compute_point_impact(df_vessel, 103.73, 1.27, formula="kriebel", g=_G)
+    result = compute_point_impact(df_vessel, 103.73, 1.27, g=_G)
 
-    # Should find at least one event at the gauge
     assert len(result) > 0, "No wake arrivals found at gauge point"
     assert "ArrivalTime" in result.columns
     assert result["ArrivalTime"].notna().any()
@@ -135,20 +141,40 @@ def test_point_impact_finds_arrival():
 def test_point_impact_segment_id_preserved():
     """segment_id from input is preserved in output."""
     df_vessel = _make_vessel_segment(segment_id=42)
-    result = compute_point_impact(df_vessel, 103.73, 1.27, formula="kriebel", g=_G)
+    result = compute_point_impact(df_vessel, 103.73, 1.27, g=_G)
 
     if len(result) > 0:
         assert "segment_id" in result.columns
         assert (result["segment_id"] == 42).all()
 
 
-def test_point_impact_formulas_have_required_columns():
-    """All formulae can access required columns in compute_point_impact output."""
+def test_point_impact_preserves_event_when_kriebel_invalid():
+    """Geometric arrival survives regardless of any formula's applicability.
+
+    Regression for a silent-drop bug: compute_point_impact used to apply the
+    Kriebel formula and drop rows whose H returned NaN, hiding events from
+    vessels outside Kriebel's validity range from every other formula.
+    """
+    df_vessel = _make_vessel_segment(length=40.0, SOGms=11.0, draught=2.0, WaterDepth=10.0)
+    result = compute_point_impact(df_vessel, 103.73, 1.27, g=_G)
+
+    assert len(result) > 0, "geometric arrival was dropped"
+    assert result["ArrivalTime"].notna().all()
+    assert result["PropDist_m"].notna().all()
+
+    # Kriebel applied to this row returns NaN (out of range); other formulae
+    # can still be applied by the caller and may produce finite values.
+    h_kriebel = compute_kriebel(result, g=_G)
+    assert h_kriebel.isna().all()
+
+
+def test_point_impact_output_feeds_every_formula():
+    """Output columns match what every empirical formula expects."""
     df_vessel = _make_vessel_segment()
+    result = compute_point_impact(df_vessel, 103.73, 1.27, g=_G)
 
-    for formula_name in ["kriebel", "pianc", "bhowmik", "gates", "blaauw", "sorensen", "maynord"]:
-        result = compute_point_impact(df_vessel, 103.73, 1.27, formula=formula_name, g=_G)
-
-        # Should have output without errors; formula functions need block_coeff, bow_entry_m, etc.
-        # If any column was missing, the formula would raise KeyError
-        assert "WaveHeight" in result.columns or len(result) == 0
+    assert len(result) > 0
+    for fn in (compute_kriebel, compute_pianc, compute_bhowmik, compute_gates,
+               compute_blaauw, compute_sorensen, compute_maynord):
+        h = fn(result, g=_G)
+        assert len(h) == len(result)

@@ -13,8 +13,8 @@ class AisConfig(BaseModel):
     raw_csv: str
     min_speed_knots: float = 0.5
     traj_gap_s: float = 180.0
-    max_velocity_knots: float = 12.0
-    max_acceleration_ms2: float = 0.2
+    max_velocity_knots: float = 36.0
+    max_acceleration_ms2: float = 10.0
     interp_interval_s: float = 30.0
     study_area_shp: str | None = None
 
