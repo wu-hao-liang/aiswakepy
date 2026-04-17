@@ -30,7 +30,7 @@ def _make_vessel_segment(**kwargs) -> pd.DataFrame:
         sog=8.0,
         cog=90.0,
         SOGms=8.0 * 0.5144444,
-        FroudeD=0.3397,
+        Froude_D=0.3397,
         block_coeff=0.86,
         bow_entry_m=200.0 / 7,
         displacement_m3=30.0 * 10.0 * 200.0 * 0.95 * 0.86,
@@ -66,7 +66,7 @@ def test_point_impact_output_columns():
     expected_cols = [
         "MMSI", "PointLongitude", "PointLatitude", "WaveHeight", "WavePeriod",
         "PropDist_m", "DistPerp_m", "DateTime", "ArrivalTime",
-        "FroudeD", "VesselWidth", "VesselLength", "SOG", "Side", "segment_id",
+        "Froude_D", "VesselWidth", "VesselLength", "SOG", "Side", "segment_id",
         "SOGms", "WaterDepth", "length", "width", "draught",
         "block_coeff", "bow_entry_m", "displacement_m3",
     ]

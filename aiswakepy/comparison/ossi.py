@@ -28,7 +28,7 @@ def load_ossi(path: str | Path) -> pd.DataFrame:
     Returns a DataFrame with columns: time, Hmax, T.
     """
     path = Path(path)
-    raw = pd.read_excel(path, sheet_name="SHIPWAKE", header=None)
+    raw = pd.read_excel(path, sheet_name="SHIPWAKE", header=0)
 
     time_col = raw.iloc[:, 1]
     hmax_col = raw.iloc[:, 2].to_numpy(dtype=float)

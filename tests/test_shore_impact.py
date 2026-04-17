@@ -35,7 +35,7 @@ def _make_vessel_row(**kwargs) -> pd.DataFrame:
         sog=8.0,
         cog=90.0,
         SOGms=8.0 * 0.5144444,
-        FroudeD=0.3397,
+        Froude_D=0.3397,
         # Kriebel intermediates — computed by compute_kriebel internally
         # (not required in vessel stage output, but kept here for completeness)
         block_coeff=0.86,
@@ -101,7 +101,7 @@ def test_wave_impact_output_columns_complete(tmp_path):
     # vessel parameters are used internally but not in output
     expected_cols = [
         "MMSI", "ShLongitude", "ShLatitude", "WaveHeight", "WavePeriod",
-        "DistLoc_km", "DateTime", "FroudeD", "VesselWidth", "VesselLength",
+        "DistLoc_km", "DateTime", "Froude_D", "VesselWidth", "VesselLength",
         "SOG", "Side",
     ]
     for col in expected_cols:

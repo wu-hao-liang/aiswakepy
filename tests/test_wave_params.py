@@ -35,7 +35,7 @@ def _make_row(**kwargs) -> pd.DataFrame:
 # L=200, B=30, d=10, SOG=8kts, depth=15m, type=tanker (L_Le method)
 # Cb=0.86, Le=200/7≈28.571
 # SOGms = 8*0.5144444 = 4.1155...
-# FroudeD = 4.1155 / sqrt(9.78*15) = 4.1155 / 12.116 ≈ 0.3397
+# Froude_D = 4.1155 / sqrt(9.78*15) = 4.1155 / 12.116 ≈ 0.3397
 # Theta = 35.27*(1-exp(12*(0.3397-1))) ≈ 35.257
 # WakeDirPort = 90 - 35.257 ≈ 54.74
 # WakeDirStarboard = 90 + 35.257 ≈ 125.26
@@ -50,7 +50,7 @@ def test_hand_calc_single_row():
     assert r["SOGms"]      == pytest.approx(8.0 * _KNOTS_TO_MS, rel=1e-4)
     assert r["block_coeff"] == pytest.approx(0.86, rel=1e-4)
     assert r["bow_entry_m"] == pytest.approx(200.0 / 7, rel=1e-4)
-    assert r["FroudeD"]    == pytest.approx(0.3397, rel=0.01)
+    assert r["Froude_D"]    == pytest.approx(0.3397, rel=0.01)
     assert r["Theta"]      == pytest.approx(35.26, abs=0.5)
 
 
@@ -104,7 +104,7 @@ def test_gis_export_columns():
     assert "WakeDirPort" in gis.columns
     assert "WakeDirStarboard" in gis.columns
     assert "SOGms" in gis.columns
-    assert "FroudeD" in gis.columns
+    assert "Froude_D" in gis.columns
     assert len(gis.columns) == 14
 
 

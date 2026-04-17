@@ -61,8 +61,8 @@ def timeseries_plot(
     ax.grid(True, alpha=0.3)
     fig.tight_layout()
     fig.savefig(out_path, dpi=150)
-    plt.close(fig)
     print(f"  saved {Path(out_path).name}")
+    return fig
 
 
 def scatter_plot(
@@ -105,5 +105,5 @@ def scatter_plot(
     ax.grid(True, alpha=0.3)
     fig.tight_layout()
     fig.savefig(out_path, dpi=150)
-    plt.close(fig)
     print(f"  saved {Path(out_path).name}")
+    return fig

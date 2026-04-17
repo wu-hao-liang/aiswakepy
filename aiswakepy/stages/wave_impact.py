@@ -71,6 +71,7 @@ def compute_point_impact(
     point_lat: float,
     formula: str = "kriebel",
     g: float = 9.78,
+    max_prop_m: float | None = None,
     bisect_tol_deg: float = 1e-3,
     **formula_kwargs,
 ) -> pd.DataFrame:
@@ -93,6 +94,11 @@ def compute_point_impact(
     point_lat:       Latitude of the measurement point (decimal degrees).
     formula:         Empirical wake model to use (default ``"kriebel"``).
     g:               Gravitational acceleration (m/s²). Default 9.78.
+    max_prop_m:      Maximum propagation distance (m). Trajectory segment pairs
+                     where both endpoints are farther than this from the point
+                     are skipped before the bisection search.  Good approximation
+                     when the segment heading is roughly aligned with the track.
+                     ``None`` disables the filter (default).
     bisect_tol_deg:  Angular convergence tolerance for bisection (degrees).
     **formula_kwargs: Extra keyword arguments forwarded to the formula function.
 
@@ -138,6 +144,15 @@ def compute_point_impact(
             lon0, lat0 = float(r0.longitude), float(r0.latitude)
             lon1, lat1 = float(r1.longitude), float(r1.latitude)
             dt_span = (r1.obstime - r0.obstime).total_seconds()
+
+            # Pre-filter: skip pairs where both endpoints exceed max_prop_m.
+            # Approximation — valid when the segment is short relative to the
+            # propagation distance (vessel heading ≈ segment heading).
+            if max_prop_m is not None:
+                d0 = float(geodetic_distance(lon0, lat0, point_lon, point_lat))
+                d1 = float(geodetic_distance(lon1, lat1, point_lon, point_lat))
+                if min(d0, d1) > max_prop_m:
+                    continue
 
             for side, wd0, wd1 in [
                 ("port", float(r0.WakeDirPort),       float(r1.WakeDirPort)),
