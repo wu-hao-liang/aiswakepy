@@ -45,24 +45,53 @@ def load_ossi(path: str | Path) -> pd.DataFrame:
     return ossi.dropna(subset=["time", "Hmax"]).reset_index(drop=True)
 
 
+def match_event_indices(
+    ais_times: pd.Series,
+    ossi: pd.DataFrame,
+    window_min: float = 0.5,
+) -> tuple[np.ndarray, np.ndarray]:
+    """For each AIS timestamp pick the nearest OSSI event within ±window_min.
+
+    Returns ``(idx, dt_min)`` aligned to ``ais_times``:
+      * ``idx``    — matched OSSI row index (int), or ``-1`` if none in window
+      * ``dt_min`` — absolute time difference in minutes, NaN if no match
+    """
+    window_td = pd.Timedelta(minutes=window_min)
+    ossi_time = ossi["time"].to_numpy()
+    n = len(ais_times)
+    idx_arr = np.full(n, -1, dtype=np.int64)
+    dt_min  = np.full(n, np.nan)
+
+    for i, t in enumerate(ais_times):
+        dt = np.abs(ossi_time - np.datetime64(t))
+        in_win = dt <= window_td.to_numpy()
+        if in_win.any():
+            idx = int(np.argmin(np.where(in_win, dt, np.iinfo(np.int64).max)))
+            idx_arr[i] = idx
+            dt_min[i]  = dt[idx] / np.timedelta64(1, "s") / 60.0
+
+    return idx_arr, dt_min
+
+
 def match_events(
     ais_times: pd.Series,
     ossi: pd.DataFrame,
     window_min: float = 0.5,
-) -> np.ndarray:
-    """For each AIS timestamp find the unique OSSI event within ±window_min.
+    return_dt: bool = False,
+) -> np.ndarray | tuple[np.ndarray, np.ndarray]:
+    """For each AIS timestamp pick the closest OSSI event within ±window_min.
 
     Returns an array of OSSI Hmax values aligned to ais_times.
-    NaN where no unique match is found (0 or >1 OSSI events in window).
+    NaN where no OSSI event falls in the window.
+
+    If ``return_dt`` is True, also returns the absolute time difference
+    (in minutes) between each AIS timestamp and its matched OSSI event;
+    NaN where no match was found.
     """
-    window_td = pd.Timedelta(minutes=window_min)
+    idx_arr, dt_min = match_event_indices(ais_times, ossi, window_min)
     ossi_hmax = ossi["Hmax"].to_numpy(dtype=float)
-    matched   = np.full(len(ais_times), np.nan)
+    matched = np.where(idx_arr >= 0, ossi_hmax[np.maximum(idx_arr, 0)], np.nan)
 
-    for i, t in enumerate(ais_times):
-        in_win  = (ossi["time"] >= t - window_td) & (ossi["time"] <= t + window_td)
-        indices = np.where(in_win.to_numpy())[0]
-        if len(indices) == 1:
-            matched[i] = ossi_hmax[indices[0]]
-
+    if return_dt:
+        return matched, dt_min
     return matched
