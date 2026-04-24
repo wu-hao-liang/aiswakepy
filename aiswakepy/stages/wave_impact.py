@@ -297,8 +297,12 @@ def compute_wave_impact(
     -------
     DataFrame with one row per shoreline intersection (port and/or starboard).
     Columns: MMSI, ShLongitude, ShLatitude, WaveHeight, WavePeriod,
-             DistLoc_km, DateTime, Froude_D, VesselWidth, VesselLength,
-             SOG, Side.
+             E_max, E_tot, DistLoc_km, DateTime, Froude_D, VesselWidth,
+             VesselLength, SOG, Side.
+
+    Wave energy columns use deep-water linear theory:
+        E_max = ρ g² H² T² / (16π)         [J/m]
+        E_tot = 10.8 · E_max^0.82          [J/m]  (empirical scaling)
     """
     if formula not in _FORMULA_REGISTRY:
         raise ValueError(
@@ -308,8 +312,8 @@ def compute_wave_impact(
 
     _OUT_COLS = [
         "MMSI", "ShLongitude", "ShLatitude", "WaveHeight", "WavePeriod",
-        "DistLoc_km", "DateTime", "Froude_D", "VesselWidth", "VesselLength",
-        "SOG", "Side",
+        "E_max", "E_tot", "DistLoc_km", "DateTime", "Froude_D", "VesselWidth",
+        "VesselLength", "SOG", "Side",
     ]
 
     if df_vessel.empty:
@@ -393,7 +397,15 @@ def compute_wave_impact(
     for rec, h_val in zip(hit_records, h_series):
         if np.isnan(h_val) or h_val < wake_cutoff_m:
             continue
-        records_out.append({**rec, "WaveHeight": h_val})
+        T_val = rec["WavePeriod"]
+        E_max = rho * g * g * h_val * h_val * T_val * T_val / (16.0 * math.pi)
+        E_tot = 10.8 * E_max ** 0.82
+        records_out.append({
+            **rec,
+            "WaveHeight": h_val,
+            "E_max": E_max,
+            "E_tot": E_tot,
+        })
 
     if not records_out:
         return pd.DataFrame(columns=_OUT_COLS)
