@@ -12,6 +12,12 @@ import numpy as np
 import pandas as pd
 from shapely.ops import linemerge, unary_union
 
+try:
+    import contextily as ctx
+    HAS_CONTEXTILY = True
+except ImportError:
+    HAS_CONTEXTILY = False
+
 
 def _downsample(
     df_impact: pd.DataFrame,
@@ -79,23 +85,47 @@ def _plot_impact_map(
     output_path: str | Path,
     title: str = "",
     max_points: int = 100_000,
+    vmax: float | None = None,
+    lon0: float | None = None,
+    lon1: float | None = None,
+    lat0: float | None = None,
+    lat1: float | None = None,
+    zoom: int | str = "auto",
+    show: bool = False,
 ) -> None:
-    """Internal helper for a colour-coded scatter map over coastline."""
+    """Internal helper for a colour-coded scatter map over coastline with optional basemap."""
     fig, ax = plt.subplots(figsize=(10, 8))
-
-    # Coastline
-    try:
-        coast = gpd.read_file(str(coastline_shp))
-        coast.plot(ax=ax, color="lightgray", edgecolor="black", linewidth=0.5)
-    except Exception:
-        pass
 
     if df_impact.empty:
         warnings.warn(f"No data to plot for {label}")
         ax.set_title(f"{title} (no data)")
         fig.savefig(str(output_path), dpi=150, bbox_inches="tight")
+        if show:
+            plt.show()
         plt.close(fig)
         return
+
+    # Determine axis extent — user-supplied bounds take priority
+    x0 = lon0 if lon0 is not None else df_impact["ShLongitude"].min() - 0.01
+    x1 = lon1 if lon1 is not None else df_impact["ShLongitude"].max() + 0.01
+    y0 = lat0 if lat0 is not None else df_impact["ShLatitude"].min() - 0.01
+    y1 = lat1 if lat1 is not None else df_impact["ShLatitude"].max() + 0.01
+    ax.set_xlim(x0, x1)
+    ax.set_ylim(y0, y1)
+
+    # Add satellite basemap if contextily is available
+    if HAS_CONTEXTILY:
+        try:
+            ctx.add_basemap(ax, source=ctx.providers.Esri.WorldImagery, zoom=zoom, crs="EPSG:4326", attribution="")
+        except Exception as e:
+            warnings.warn(f"Basemap unavailable: {e}")
+
+    # Coastline overlay
+    try:
+        coast = gpd.read_file(str(coastline_shp))
+        coast.plot(ax=ax, color="yellow", edgecolor="orange", linewidth=1.0, alpha=0.6, zorder=2)
+    except Exception:
+        pass
 
     df_plot = _downsample(df_impact, coastline_shp, max_points)
 
@@ -106,6 +136,7 @@ def _plot_impact_map(
         cmap=cmap,
         s=5,
         alpha=0.8,
+        vmax=vmax,
         zorder=3,
     )
     plt.colorbar(sc, ax=ax, label=label)
@@ -115,6 +146,8 @@ def _plot_impact_map(
 
     Path(output_path).parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(str(output_path), dpi=150, bbox_inches="tight")
+    if show:
+        plt.show()
     plt.close(fig)
 
 
@@ -123,16 +156,32 @@ def plot_wave_height_map(
     coastline_shp: str | Path,
     output_path: str | Path,
     max_points: int = 100_000,
+    lon0: float | None = None,
+    lon1: float | None = None,
+    lat0: float | None = None,
+    lat1: float | None = None,
+    zoom: int | str = "auto",
+    show: bool = False,
 ) -> None:
-    """Scatter map of shore impact points colour-coded by WaveHeight (m)."""
+    """Scatter map of shore impact points colour-coded by WaveHeight (m).
+
+    Uses Esri WorldImagery basemap (if contextily available) and rainbow colormap.
+    Colorbar max is fixed to 0.5 m for consistent scale across runs.
+    Pass lon0/lon1/lat0/lat1 to restrict the plot extent; zoom controls tile resolution.
+    Set show=True to display inline in Jupyter.
+    """
     _plot_impact_map(
         df_impact, coastline_shp,
         value_col="WaveHeight",
         label="Wave Height (m)",
-        cmap="YlOrRd",
+        cmap="rainbow",
         output_path=output_path,
         title="Ship-wake Shore Impact — Wave Height",
         max_points=max_points,
+        vmax=0.5,
+        lon0=lon0, lon1=lon1, lat0=lat0, lat1=lat1,
+        zoom=zoom,
+        show=show,
     )
 
 
@@ -141,14 +190,29 @@ def plot_wave_period_map(
     coastline_shp: str | Path,
     output_path: str | Path,
     max_points: int = 100_000,
+    lon0: float | None = None,
+    lon1: float | None = None,
+    lat0: float | None = None,
+    lat1: float | None = None,
+    zoom: int | str = "auto",
+    show: bool = False,
 ) -> None:
-    """Scatter map of shore impact points colour-coded by WavePeriod (s)."""
+    """Scatter map of shore impact points colour-coded by WavePeriod (s).
+
+    Uses Esri WorldImagery basemap (if contextily available) and rainbow colormap.
+    Colorbar auto-scales to the data range.
+    Pass lon0/lon1/lat0/lat1 to restrict the plot extent; zoom controls tile resolution.
+    Set show=True to display inline in Jupyter.
+    """
     _plot_impact_map(
         df_impact, coastline_shp,
         value_col="WavePeriod",
         label="Wave Period (s)",
-        cmap="Blues",
+        cmap="rainbow",
         output_path=output_path,
         title="Ship-wake Shore Impact — Wave Period",
         max_points=max_points,
+        lon0=lon0, lon1=lon1, lat0=lat0, lat1=lat1,
+        zoom=zoom,
+        show=show,
     )

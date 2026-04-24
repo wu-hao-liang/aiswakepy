@@ -1,5 +1,8 @@
 # aiswakepy — Claude Code Context
 
+## Environment
+Python virtual environment is built by uv. Always use `uv run python` for any Python execution.
+
 ## Project
 Python pipeline for AIS-based ship-wake wave height calculation (Kriebel & Seelig 2005 empirical model).
 
