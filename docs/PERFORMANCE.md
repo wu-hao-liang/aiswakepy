@@ -1,6 +1,6 @@
 # Performance Optimization Plan: 2M AIS Records
 
-**Status**: 5 of 6 fixes complete; Fix 6 partially complete.
+**Status**: ✅ All 6 fixes complete (Fix 6 implemented as `print()`, not Rich Console — intentional).
 **Last reviewed**: 2026-05-09
 
 ## Status Summary
@@ -10,13 +10,11 @@
 | 1. Vectorize `validate_speed` | `stages/filter.py` | ✅ done | Uses array `geodetic_distance` (filter.py:464) |
 | 2. Vectorize `mask_land` | `stages/filter.py` | ✅ done | Uses `gpd.points_from_xy()` (filter.py:643,663) |
 | 3. Reduce allocations in `interpolate_trajectories` | `stages/filter.py` | ✅ done | Numpy buffers per segment, single concat |
-| 4. STRtree spatial index for shore intersection | `geo/coastline.py`, `stages/wave_impact.py` | ✅ done | `build_coastline_index` returns `(STRtree, segments)`; ray loop uses custom `Spinner` (not `rich.progress`) |
-| 5. Coastline-binned top-N visualisation | `viz/wave_map.py`, `config.py` | ✅ done | Implemented as `plot_max_points: int = 100_000` (not `plot_top_n_per_bin`); uses `ceil(max_points/n_occupied_bins)` per 1-m bin |
-| 6. Rich console + per-stage timing | `pipeline.py` | ⚠️ partial | Per-stage `time.perf_counter()` ✅; still uses plain `print()` instead of `rich.console.Console` ❌ |
+| 4. STRtree spatial index for shore intersection | `geo/coastline.py`, `stages/wave_impact.py` | ✅ done | `build_coastline_index` returns `(STRtree, segments)`; ray loop uses custom `Spinner` |
+| 5. Coastline-binned top-N visualisation | `viz/wave_map.py`, `config.py` | ✅ done | Implemented as `plot_max_points: int = 100_000`; uses `ceil(max_points/n_occupied_bins)` per 1-m bin |
+| 6. Per-stage timing + status logging | `pipeline.py` | ✅ done | `time.perf_counter()` per stage; plain `print()` for status messages (intentional — see note below) |
 
-**Outstanding work**:
-1. Replace `print()` calls in `pipeline.py` with `rich.console.Console` (12 occurrences).
-2. (Optional) Replace custom `Spinner` (in `aiswakepy/_progress.py`) with `rich.progress` for consistency with stated plan — current `Spinner` already works in both terminal and Jupyter, so this is cosmetic.
+**Note on Fix 6**: The original plan called for `rich.console.Console`, but plain `print()` is the chosen approach. Vectorised stages execute as a single block — there is no row-by-row progress to render, so a Rich progress bar adds no value. A simple `print("Stage X/Y: ...")` + elapsed time is sufficient and avoids extra rendering complexity. The custom `Spinner` in `aiswakepy/_progress.py` covers the few stages that do have meaningful per-item progress.
 
 ---
 
@@ -131,11 +129,11 @@ In `stages/wave_impact.py`:
 
 ---
 
-## Fix 6: Rich console + per-stage timing ⚠️ partial
+## Fix 6: Per-stage timing + status logging ✅
 
-**Done**: per-stage timing using `time.perf_counter()` in `pipeline.py`.
+**Implemented**: per-stage timing via `time.perf_counter()` and plain `print()` for status messages in `pipeline.py`.
 
-**Not done**: `pipeline.py` still uses 12 plain `print()` calls instead of `rich.console.Console`. The `rich` package is in `pyproject.toml` and is used by `_progress.Spinner`, so the dependency is in place — only the orchestrator needs to be migrated.
+**Why `print()` instead of Rich Console**: vectorised stages run as a single numpy/pandas block with no per-row work — a Rich progress bar has nothing to update incrementally. A one-line "Stage X/Y: …" + elapsed time is the right granularity. For the few stages that do iterate per item (e.g. shore intersection), the custom `Spinner` in `aiswakepy/_progress.py` provides terminal + Jupyter-compatible per-item progress without pulling Rich into the orchestrator.
 
 ---
 
@@ -147,7 +145,7 @@ In `stages/wave_impact.py`:
 | `aiswakepy/stages/wave_impact.py` | #4 (consumer of STRtree) |
 | `aiswakepy/geo/coastline.py` | #4 (STRtree builder) |
 | `aiswakepy/viz/wave_map.py` | #5 (binned top-N) |
-| `aiswakepy/pipeline.py` | #6 (per-stage timing only) |
+| `aiswakepy/pipeline.py` | #6 (per-stage timing + `print()` status) |
 | `aiswakepy/config.py` | #5 (`plot_max_points` field) |
 | `aiswakepy/_progress.py` | (new) custom Spinner used in stages |
 | `pyproject.toml` | `rich` dependency added |

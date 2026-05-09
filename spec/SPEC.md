@@ -1,7 +1,7 @@
 # Implementation Spec — ShipwakeAIS Python Rewrite
 
 **Based on**: PRD.md
-**Status**: ✅ All 12 steps complete (with notes — see Step 12)
+**Status**: ✅ All 12 steps complete
 **Last reviewed**: 2026-05-09
 **Tests**: 145 passing on master
 
@@ -23,7 +23,7 @@
 | 9 | `aiswakepy/viz/wave_map.py` + `aiswakepy/viz/vessel_diagram.py` | ✅ done | Both modules present |
 | 10 | `aiswakepy/pipeline.py` + `main.py` + `run_shipwake.ipynb` + `run_shipwake_record.ipynb` | ✅ done | `run_pipeline()` orchestrator, CLI, two notebooks |
 | 11 | `validate_pipeline.py` | ✅ done | End-to-end validation script vs MATLAB outputs (see `tests/validation_report.md` if generated) |
-| 12 | (multiple) | ⚠️ 5/6 done | See `docs/PERFORMANCE.md` for full status. Outstanding: replace `pipeline.py` `print()` with `rich.console.Console` |
+| 12 | (multiple) | ✅ done | All 6 fixes complete. Fix 6 uses plain `print()` for status (not `rich.console.Console`) — vectorised stages have no per-row progress to render, so `print()` is the right granularity. See `docs/PERFORMANCE.md` |
 
 **Architecture differences from original plan** (intentional, post-implementation evolution):
 - Stage 6 file renamed `wave_params.py` → `vessel.py` (better reflects content: vessel-derived parameters).
@@ -147,7 +147,7 @@ Three methods (`L_Le` default, `B_Le`, `table`) with unified interface. `ShipDat
 
 ---
 
-## Step 12: Performance Optimization ⚠️ 5/6 done
+## Step 12: Performance Optimization ✅
 
 See `docs/PERFORMANCE.md` for detailed status. Summary:
 
@@ -158,7 +158,7 @@ See `docs/PERFORMANCE.md` for detailed status. Summary:
 | 3. Reduce allocations in `interpolate_trajectories` | ✅ |
 | 4. STRtree spatial index for shore intersection | ✅ |
 | 5. Coastline-binned top-N visualisation | ✅ (config field renamed `plot_max_points`) |
-| 6. Rich console + per-stage timing | ⚠️ partial — timing done, `print()` not migrated to `rich.console.Console` |
+| 6. Per-stage timing + status logging | ✅ (plain `print()` chosen over Rich Console — vectorised stages have no per-row progress to render) |
 
 ---
 

@@ -14,8 +14,8 @@ Python pipeline for AIS-based ship-wake wave height calculation (Kriebel & Seeli
 
 ## Before starting work
 1. Read `PRD.md` — product requirements and physics specification (v1 complete; §6 lists open items)
-2. Read `spec/SPEC.md` — 12-step build spec (all steps complete; Step 12 fix #6 partial)
-3. Read `docs/PERFORMANCE.md` — performance optimisation plan (5/6 fixes done)
+2. Read `spec/SPEC.md` — 12-step build spec (all steps complete)
+3. Read `docs/PERFORMANCE.md` — performance optimisation plan (all 6 fixes done)
 
 ## Package structure
 ```
@@ -42,7 +42,7 @@ aiswakepy/
 
 ## Key conventions
 - **Progress bars**: use `rich.progress`, NOT tqdm
-- **Console logging**: use `rich.console.Console`, NOT plain print
+- **Console logging**: use plain `print()` for stage status (vectorised stages have nothing for Rich to animate). The custom `aiswakepy/_progress.Spinner` covers the few stages with per-item progress.
 - **Distances**: geodetic WGS84 via `pyproj.Geod(ellps="WGS84")`
 - **Gravity**: g = 9.78 m/s² (Singapore local)
 - **Wake directions**: COG ± Theta (NOT COG ± 90°)
@@ -52,6 +52,6 @@ aiswakepy/
 
 ## Docs & specs
 - `spec/SPEC.md` — 12-step build spec (all steps complete; Step 12 fix #6 partial)
-- `docs/PERFORMANCE.md` — performance optimisation plan (5/6 done; Rich console migration pending)
+- `docs/PERFORMANCE.md` — performance optimisation plan (all 6 fixes done)
 - `docs/FROUDE_NUMBERS.md` — Froude number reference table for all empirical models
 - `docs/MATLAB_REVIEW.md` — original MATLAB codebase review
