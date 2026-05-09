@@ -59,6 +59,7 @@ def run_pipeline(
             max_velocity_knots=config.ais.max_velocity_knots,
             max_acceleration_ms2=config.ais.max_acceleration_ms2,
             interval_s=config.ais.interp_interval_s,
+            max_draught_to_width=config.ais.max_draught_to_width,
             study_area_shp=config.ais.study_area_shp,
         )
         print(

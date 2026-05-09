@@ -5,13 +5,14 @@ Pipeline:
  2. deduplicate             — drop exact (mmsi, obstime) duplicates
  3. uniformize_vessel_info  — set width/length/typecargo to mode per MMSI
  4. remove_zero_dimensions  — drop rows where width/length/draught <= 0
- 5. segment_trajectories    — time-gap-based segmentation (default 180 s)
- 6. clean_error_coords      — Kinematic Consistency Check: remove GPS spikes
- 7. clean_error_speed       — Acceleration Check: replace erroneous SOG/COG
- 8. validate_speed          — secondary cap: SOG = min(reported, geodetic-derived)
- 9. interpolate_trajectories — Cubic Hermite Spline at fixed time intervals
-10. filter_study_area       — optional: keep only points inside a polygon
-11. mask_land               — remove points inside coastline polygon
+ 5. remove_invalid_draught  — drop rows where draught > width (implausible)
+ 6. segment_trajectories    — time-gap-based segmentation (default 180 s)
+ 7. clean_error_coords      — Kinematic Consistency Check: remove GPS spikes
+ 8. clean_error_speed       — Acceleration Check: replace erroneous SOG/COG
+ 9. validate_speed          — secondary cap: SOG = min(reported, geodetic-derived)
+10. interpolate_trajectories — Cubic Hermite Spline at fixed time intervals
+11. filter_study_area       — optional: keep only points inside a polygon
+12. mask_land               — remove points inside coastline polygon
 """
 
 from __future__ import annotations
@@ -131,7 +132,30 @@ def remove_zero_dimensions(df: pd.DataFrame) -> pd.DataFrame:
 
 
 # ---------------------------------------------------------------------------
-# 5. Segment trajectories
+# 5. Invalid-draught removal
+# ---------------------------------------------------------------------------
+
+def remove_invalid_draught(
+    df: pd.DataFrame,
+    max_draught_to_width: float = 1.0,
+) -> pd.DataFrame:
+    """Drop rows where draught exceeds ``max_draught_to_width`` × width.
+
+    Real vessels have draught well below their beam (typical T/B ≲ 0.5).
+    Records with draught greater than the beam are almost always AIS
+    misreports (e.g. unit confusion or stuck-default values) and would
+    produce nonsensical wake predictions.
+    """
+    from aiswakepy._progress import Spinner
+    spinner = Spinner(desc="remove_invalid_draught")
+    mask = df["draught"] <= max_draught_to_width * df["width"]
+    result = df[mask].reset_index(drop=True)
+    spinner.done(rows=len(result))
+    return result
+
+
+# ---------------------------------------------------------------------------
+# 6. Segment trajectories
 # ---------------------------------------------------------------------------
 
 def segment_trajectories(df: pd.DataFrame, gap_s: float = 180.0) -> pd.DataFrame:
@@ -152,7 +176,7 @@ def segment_trajectories(df: pd.DataFrame, gap_s: float = 180.0) -> pd.DataFrame
 
 
 # ---------------------------------------------------------------------------
-# 6. Error coordinate cleaning — Kinematic Consistency Check
+# 7. Error coordinate cleaning — Kinematic Consistency Check
 # ---------------------------------------------------------------------------
 
 def clean_error_coords(
@@ -310,7 +334,7 @@ def clean_error_coords(
 
 
 # ---------------------------------------------------------------------------
-# 7. Error speed cleaning — Acceleration Check
+# 8. Error speed cleaning — Acceleration Check
 # ---------------------------------------------------------------------------
 
 def clean_error_speed(
@@ -410,7 +434,7 @@ def clean_error_speed(
 
 
 # ---------------------------------------------------------------------------
-# 8. Speed validation (secondary cap)
+# 9. Speed validation (secondary cap)
 # ---------------------------------------------------------------------------
 
 def validate_speed(df: pd.DataFrame) -> pd.DataFrame:
@@ -454,7 +478,7 @@ def validate_speed(df: pd.DataFrame) -> pd.DataFrame:
 
 
 # ---------------------------------------------------------------------------
-# 9. Interpolation — Cubic Hermite Spline (time-based)
+# 10. Interpolation — Cubic Hermite Spline (time-based)
 # ---------------------------------------------------------------------------
 
 def interpolate_trajectories(
@@ -597,7 +621,7 @@ def interpolate_trajectories(
 
 
 # ---------------------------------------------------------------------------
-# 10. Study-area polygon filter (optional)
+# 11. Study-area polygon filter (optional)
 # ---------------------------------------------------------------------------
 
 def filter_study_area(
@@ -626,7 +650,7 @@ def filter_study_area(
 
 
 # ---------------------------------------------------------------------------
-# 11. Land masking
+# 12. Land masking
 # ---------------------------------------------------------------------------
 
 def mask_land(df: pd.DataFrame, coastline_shp: str | Path) -> pd.DataFrame:
@@ -646,7 +670,7 @@ def mask_land(df: pd.DataFrame, coastline_shp: str | Path) -> pd.DataFrame:
 
 
 # ---------------------------------------------------------------------------
-# 12. Orchestrator
+# 13. Orchestrator
 # ---------------------------------------------------------------------------
 
 def filter_ais(
@@ -656,6 +680,7 @@ def filter_ais(
     max_velocity_knots: float = 36.0,
     max_acceleration_ms2: float = 10.0,
     interval_s: float = 30.0,
+    max_draught_to_width: float = 1.0,
     study_area_shp: str | Path | None = None,
 ) -> pd.DataFrame:
     """Run the full AIS filtering pipeline and return a cleaned DataFrame."""
@@ -663,6 +688,7 @@ def filter_ais(
     df = deduplicate(df)
     df = uniformize_vessel_info(df)
     df = remove_zero_dimensions(df)
+    df = remove_invalid_draught(df, max_draught_to_width=max_draught_to_width)
     df = segment_trajectories(df, gap_s=gap_s)
     df = clean_error_coords(df, max_velocity_knots=max_velocity_knots)
     df = clean_error_speed(df, max_acceleration_ms2=max_acceleration_ms2)

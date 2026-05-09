@@ -40,8 +40,8 @@ def compute_vessel_params(
     df: pd.DataFrame,
     cb_method: str = "L_Le",
     g: float = 9.78,
-    max_sog_knots: float = 12.0,
-    max_bl_ratio: float = 0.3,
+    max_sog_knots: float = 24.0,
+    max_bl_ratio: float = 1.0,
 ) -> pd.DataFrame:
     """Compute vessel and wake propagation parameters for each AIS fix.
 

@@ -89,7 +89,7 @@ def test_multiple_rows_mixed_filter():
     """SOG and BL filters applied; formula-validity filter is NOT in vessel stage."""
     rows = [
         _make_row(sog=8.0,  WaterDepth=15.0).iloc[0],   # valid
-        _make_row(sog=15.0, WaterDepth=15.0).iloc[0],   # SOG too high → filtered
+        _make_row(sog=25.0, WaterDepth=15.0).iloc[0],   # SOG too high → filtered
     ]
     df = pd.DataFrame(rows).reset_index(drop=True)
     result = compute_vessel_params(df)
