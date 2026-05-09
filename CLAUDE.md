@@ -55,3 +55,4 @@ aiswakepy/
 - `docs/PERFORMANCE.md` — performance optimisation plan (all 6 fixes done)
 - `docs/FROUDE_NUMBERS.md` — Froude number reference table for all empirical models
 - `docs/MATLAB_REVIEW.md` — original MATLAB codebase review
+- `docs/VIZ_DOWNSAMPLING.md` — coastline-binned top-N downsampling algorithm (used in shore-impact maps; reference for upcoming DASH app)
