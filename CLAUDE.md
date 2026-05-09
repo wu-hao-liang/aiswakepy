@@ -14,8 +14,8 @@ Python pipeline for AIS-based ship-wake wave height calculation (Kriebel & Seeli
 
 ## Before starting work
 1. Read `PRD.md` — product requirements and physics specification (v1 complete; §6 lists open items)
-2. Read `spec/SPEC_BUILD_PLAN.md` — 12-step build plan (Steps 0–11 all complete)
-3. Read `docs/PERFORMANCE_PLAN.md` — approved performance optimization plan (pending implementation)
+2. Read `spec/SPEC.md` — 12-step build spec (all steps complete; Step 12 fix #6 partial)
+3. Read `docs/PERFORMANCE.md` — performance optimisation plan (5/6 fixes done)
 
 ## Package structure
 ```
@@ -51,7 +51,7 @@ aiswakepy/
 - **Example data**: `examples/` directory (gitignored — large binary files)
 
 ## Docs & specs
-- `spec/SPEC_BUILD_PLAN.md` — completed 12-step build plan
-- `docs/PERFORMANCE_PLAN.md` — performance optimisation plan (pending)
+- `spec/SPEC.md` — 12-step build spec (all steps complete; Step 12 fix #6 partial)
+- `docs/PERFORMANCE.md` — performance optimisation plan (5/6 done; Rich console migration pending)
 - `docs/FROUDE_NUMBERS.md` — Froude number reference table for all empirical models
-- `docs/REVIEW.md` — original MATLAB codebase review
+- `docs/MATLAB_REVIEW.md` — original MATLAB codebase review

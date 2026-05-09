@@ -3,7 +3,7 @@
 
 **Date**: 2026-04-09
 **Status**: ✅ Completed — v1 pipeline fully implemented and tested (145 tests pass)
-**Implemented by**: Steps 0–11 of `spec/SPEC_BUILD_PLAN.md`
+**Implemented by**: Steps 0–11 of `spec/SPEC.md` (Step 12 perf optimisation 5/6 done)
 **New requirements**: to be added in a separate PRD v2 document
 
 ---
@@ -109,7 +109,7 @@ Validity limits: 0.1 ≤ F_m ≤ 0.5; β·(F_m−0.1)² ≤ 0.4.
 | Item | Priority |
 |------|----------|
 | AIS-constrained wake detection from gauge time series | High |
-| Performance optimisation for 2M AIS records | High — see `docs/PERFORMANCE_PLAN.md` |
+| Performance optimisation for 2M AIS records | High — see `docs/PERFORMANCE.md` (5/6 done) |
 | Multiple empirical formula comparison & calibration | Medium |
 | 2D spatial wave height grid with refraction/shoaling | Medium |
 | Multiple target polygons | Low |
