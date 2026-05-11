@@ -49,6 +49,7 @@ def _make_vessel_row(**kwargs) -> pd.DataFrame:
         length=200.0,
         draught=10.0,
         WaterDepth=15.0,
+        segment_id=1,
     )
     defaults.update(kwargs)
     return pd.DataFrame([defaults])
@@ -101,8 +102,9 @@ def test_wave_impact_output_columns_complete(tmp_path):
     # vessel parameters are used internally but not in output
     expected_cols = [
         "MMSI", "ShLongitude", "ShLatitude", "WaveHeight", "WavePeriod",
-        "DistLoc_km", "DateTime", "Froude_D", "VesselWidth", "VesselLength",
-        "SOG", "Side",
+        "DistLoc_km", "DateTime", "Froude_D",
+        "VesselLongitude", "VesselLatitude", "VesselCOG", "VesselDraught",
+        "VesselWidth", "VesselLength", "SOG", "Side", "segment_id",
     ]
     for col in expected_cols:
         assert col in result.columns, f"Missing expected column: {col}"

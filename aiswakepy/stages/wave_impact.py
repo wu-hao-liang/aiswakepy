@@ -312,8 +312,9 @@ def compute_wave_impact(
 
     _OUT_COLS = [
         "MMSI", "ShLongitude", "ShLatitude", "WaveHeight", "WavePeriod",
-        "E_max", "E_tot", "DistLoc_km", "DateTime", "Froude_D", "VesselWidth",
-        "VesselLength", "SOG", "Side",
+        "E_max", "E_tot", "DistLoc_km", "DateTime", "Froude_D",
+        "VesselLongitude", "VesselLatitude", "VesselCOG", "VesselDraught",
+        "VesselWidth", "VesselLength", "SOG", "Side", "segment_id",
     ]
 
     if df_vessel.empty:
@@ -365,17 +366,22 @@ def compute_wave_impact(
                 continue
 
             hit_records.append({
-                "MMSI":          int(row.mmsi),
-                "ShLongitude":   sh_lon,
-                "ShLatitude":    sh_lat,
-                "WavePeriod":    row.Tc,
-                "DistLoc_km":    dist_perp / 1000.0,
-                "DateTime":      row.obstime,
-                "Froude_D":       row.Froude_D,
-                "VesselWidth":   row.width,
-                "VesselLength":  row.length,
-                "SOG":           row.sog,
-                "Side":          side,
+                "MMSI":             int(row.mmsi),
+                "ShLongitude":      sh_lon,
+                "ShLatitude":       sh_lat,
+                "WavePeriod":       row.Tc,
+                "DistLoc_km":       dist_perp / 1000.0,
+                "DateTime":         row.obstime,
+                "Froude_D":         row.Froude_D,
+                "VesselLongitude":  row.longitude,
+                "VesselLatitude":   row.latitude,
+                "VesselCOG":        row.cog,
+                "VesselDraught":    row.draught,
+                "VesselWidth":      row.width,
+                "VesselLength":     row.length,
+                "SOG":              row.sog,
+                "Side":             side,
+                "segment_id":       int(row.segment_id),
             })
             hit_vessel_rows.append(i)
             hit_dist_perp.append(dist_perp)

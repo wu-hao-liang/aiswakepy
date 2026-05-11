@@ -17,6 +17,7 @@ ALL_STAGES: list[Stage] = ["filter", "depth", "vessel", "wave_impact", "viz"]
 def run_pipeline(
     config: str | dict | Path | ShipwakeConfig,
     stages: list[Stage] | None = None,
+    seed_results: dict | None = None,
 ) -> dict:
     """Run the aiswakepy pipeline.
 
@@ -24,6 +25,11 @@ def run_pipeline(
     ----------
     config: ShipwakeConfig, or any source accepted by load_config().
     stages: Subset of stages to run (default: all).
+    seed_results: Optional dict pre-populating ``results``. Use this to chain
+        multi-step runs without re-executing earlier stages \u2014 for example
+        running ``stages=['filter']`` first, then later running
+        ``stages=['depth','vessel','wave_impact']`` with
+        ``seed_results={'df_filtered': previous_df}``.
 
     Returns
     -------
@@ -46,7 +52,7 @@ def run_pipeline(
             df.to_csv(path, index=False)
             print(f"  \u2713 saved {path.name}")
 
-    results: dict = {}
+    results: dict = dict(seed_results) if seed_results else {}
 
     if "filter" in stages:
         from aiswakepy.stages.filter import filter_ais
