@@ -269,7 +269,8 @@ CB_METHODS = ['L_Le', 'B_Le', 'table']
 _pipeline_lock = threading.RLock()
 PIPELINE_STATE = {
     'running': False,
-    'log': [],            # committed lines (static)
+    'log': [],            # committed lines (one per print '\n')
+    'live': '',           # current in-progress spinner line (replaced on each '\r')
     'started_at': None,
     'finished_at': None,
     'error': None,
@@ -282,11 +283,16 @@ PIPELINE_STATE = {
 
 
 class _LineCapture(io.TextIOBase):
-    """sys.stdout shim: capture every line as static text in PIPELINE_STATE['log'].
+    """sys.stdout shim with proper carriage-return handling for in-place spinners.
 
-    Treats both \\r and \\n as line separators (no in-place spinner updates) — each
-    write that produces a line commits it. Simpler than \\r-aware in-place updates,
-    and immune to the deadlock + interpretation issues that approach suffered from.
+    Char-by-char state machine:
+      - '\\r' resets the in-progress buffer (cursor return — Spinner is about
+        to overwrite); does NOT commit to log.
+      - '\\n' commits the in-progress buffer as a single log line.
+      - any other char appends to the buffer.
+    The in-progress buffer is also surfaced as PIPELINE_STATE['live'] after
+    every write call, so the UI can render it as a single replaceable line
+    below the committed log — this is the "spinning in place" effect.
     """
 
     def __init__(self, original):
@@ -294,22 +300,21 @@ class _LineCapture(io.TextIOBase):
         self._buf = ''
 
     def write(self, s: str) -> int:
-        # Split incoming chunk on either CR or LF (universal newlines).
-        self._buf += s
-        # splitlines(keepends=False) handles \r, \n, \r\n.
-        parts = self._buf.splitlines()
-        # If the buffer ends with a line terminator, all parts are complete lines;
-        # otherwise the last part is still in progress and stays in the buffer.
-        if self._buf and self._buf[-1] in '\r\n':
-            complete = parts
-            self._buf = ''
-        else:
-            complete = parts[:-1]
-            self._buf = parts[-1] if parts else ''
-        new_lines = [ln for ln in complete if ln.strip()]
-        if new_lines:
-            with _pipeline_lock:
+        new_lines: list[str] = []
+        for ch in s:
+            if ch == '\r':
+                self._buf = ''
+            elif ch == '\n':
+                if self._buf.strip():
+                    new_lines.append(self._buf)
+                self._buf = ''
+            else:
+                self._buf += ch
+        live = self._buf if self._buf.strip() else ''
+        with _pipeline_lock:
+            if new_lines:
                 PIPELINE_STATE['log'].extend(new_lines)
+            PIPELINE_STATE['live'] = live
         try:
             self._orig.write(s)
             self._orig.flush()
@@ -337,6 +342,35 @@ def _pipeline_thread(config_dict: dict, stages: list[str], step_label: str) -> N
     try:
         cfg = load_config(config_dict)
         seed = {k: v for k, v in LAST_RESULTS.items() if k.startswith('df_')}
+
+        # ---- Filter freshness check ----
+        # If wave-side stages are requested but no df_filtered is in memory,
+        # try the on-disk cache; if that's stale (AIS file newer than the
+        # cached filter CSV) or missing, prepend 'filter' to the stage list.
+        wave_stages = {'depth', 'vessel', 'wave_impact'}
+        requesting_waves = bool(set(stages) & wave_stages)
+        if requesting_waves and 'df_filtered' not in seed:
+            ais_path = Path(cfg.ais.raw_csv)
+            ais_stem = ais_path.stem
+            filtered_path = Path(cfg.output.directory) / f'{ais_stem}_01_filtered.csv'
+            if filtered_path.exists() and (
+                filtered_path.stat().st_mtime > ais_path.stat().st_mtime
+            ):
+                print(f'Loading cached filter output: {filtered_path.name}')
+                df_cached = pd.read_csv(filtered_path)
+                if 'obstime' in df_cached.columns:
+                    df_cached['obstime'] = pd.to_datetime(df_cached['obstime'])
+                seed['df_filtered'] = df_cached
+                LAST_RESULTS['df_filtered'] = df_cached
+                print(f'  -> {len(df_cached):,} rows loaded from disk cache')
+            else:
+                if filtered_path.exists():
+                    print(f'Cached filter is older than AIS file - running filter first')
+                else:
+                    print(f'No cached filter found - running filter first')
+                if 'filter' not in stages:
+                    stages = ['filter'] + list(stages)
+
         results = run_pipeline(cfg, stages=stages, seed_results=seed)
         LAST_RESULTS.update(results)
 
@@ -379,19 +413,21 @@ def _pipeline_thread(config_dict: dict, stages: list[str], step_label: str) -> N
         sys.stdout = old_stdout
         with _pipeline_lock:
             PIPELINE_STATE['running'] = False
+            PIPELINE_STATE['live'] = ''
 
 
 # ---------------------------------------------------------------------------
 # Preview helpers
 # ---------------------------------------------------------------------------
-def _preview_ais_arrow(path: Path, max_points: int = PREVIEW_AIS_MAX_POINTS) -> bytes:
-    """Subsample an AIS CSV to ~max_points rows and return Arrow IPC of (lon,lat)."""
-    # First pass: count rows. For perf, just stride-read.
+def _preview_ais_arrow(path: Path) -> bytes:
+    """Return Arrow IPC of all (lon,lat) rows from the AIS CSV (no subsampling).
+
+    Note: large AIS files (millions of rows) produce tens of MB of Arrow IPC.
+    The client UI gates this behind an explicit 'Import' button so the user
+    chooses when to pay the cost.
+    """
     df = pd.read_csv(path, usecols=['longitude', 'latitude'])
-    n = len(df)
-    if n > max_points:
-        stride = max(1, n // max_points)
-        df = df.iloc[::stride].reset_index(drop=True)
+    df = df.dropna(subset=['longitude', 'latitude'])
     df = df.astype({'longitude': 'float32', 'latitude': 'float32'})
     return _ipc(pa.Table.from_pandas(df, preserve_index=False))
 
@@ -404,23 +440,77 @@ def _preview_ais_bbox(path: Path) -> tuple[float, float, float, float]:
 
 
 def _preview_coast_geojson(path: Path) -> dict:
-    """Load a shapefile and return a simplified GeoJSON FeatureCollection."""
-    import geopandas as gpd
-    gdf = gpd.read_file(str(path))
-    if gdf.crs is not None and gdf.crs.to_epsg() != 4326:
-        gdf = gdf.to_crs(epsg=4326)
-    # Simplify to keep payload small; tolerance ~10 m at WGS84.
-    gdf = gdf.copy()
-    gdf['geometry'] = gdf.geometry.simplify(0.0001, preserve_topology=True)
-    bbox = list(gdf.total_bounds)  # [minx, miny, maxx, maxy]
-    return {
-        'type': 'FeatureCollection',
-        'bbox': bbox,
-        'features': [
-            {'type': 'Feature', 'properties': {}, 'geometry': geom.__geo_interface__}
-            for geom in gdf.geometry if geom is not None and not geom.is_empty
-        ],
-    }
+    """Load a shapefile with fiona (no shapely, no simplification) and return
+    a GeoJSON FeatureCollection in WGS84. Reprojects with pyproj if the source
+    CRS is not already lon/lat.
+
+    Earlier versions used geopandas + shapely.simplify(0.0001) which collapsed
+    small rectangles into triangles (tolerance ~10 m, comparable to edge length).
+    """
+    import fiona
+    from pyproj import CRS, Transformer
+
+    with fiona.open(str(path)) as src:
+        src_crs = src.crs
+        transformer = None
+        try:
+            if src_crs:
+                src_obj = CRS.from_user_input(src_crs)
+                if src_obj.to_epsg() != 4326:
+                    transformer = Transformer.from_crs(src_obj, 'EPSG:4326', always_xy=True)
+        except Exception:
+            transformer = None
+
+        def reproject(coords):
+            """Recursively transform leaf [x, y] (or [x, y, z]) pairs to lists."""
+            if not coords:
+                return coords
+            if isinstance(coords[0], (int, float)):
+                x, y = transformer.transform(coords[0], coords[1])
+                return [x, y]
+            return [reproject(c) for c in coords]
+
+        def to_lists(c):
+            """Recursively coerce fiona's tuple-of-tuples into plain JSON-safe lists."""
+            if hasattr(c, '__iter__') and not isinstance(c, (str, bytes)):
+                return [to_lists(x) for x in c]
+            return c
+
+        features = []
+        for f in src:
+            geom = f.get('geometry')
+            if not geom:
+                continue
+            # fiona.Geometry isn't directly JSON-serialisable — always rebuild as a
+            # plain dict with nested lists so flask.jsonify accepts it.
+            g_type = geom['type']
+            g_coords = geom['coordinates']
+            if transformer is not None:
+                g_coords = reproject(g_coords)
+            else:
+                g_coords = to_lists(g_coords)
+            features.append({
+                'type': 'Feature', 'properties': {},
+                'geometry': {'type': g_type, 'coordinates': g_coords},
+            })
+
+    # Compute bbox by walking all coordinates ourselves.
+    def walk(coords):
+        if not coords:
+            return
+        if isinstance(coords[0], (int, float)):
+            yield coords
+        else:
+            for c in coords:
+                yield from walk(c)
+
+    xs, ys = [], []
+    for f in features:
+        for x, y, *_ in walk(f['geometry']['coordinates']):
+            xs.append(x); ys.append(y)
+    bbox = [min(xs), min(ys), max(xs), max(ys)] if xs else [0.0, 0.0, 0.0, 0.0]
+
+    return {'type': 'FeatureCollection', 'bbox': bbox, 'features': features}
 
 
 def _preview_tide(path: Path) -> dict:
@@ -528,6 +618,19 @@ INDEX_TEMPLATE = """<!DOCTYPE html>
                          margin: 8px 0 2px; font-weight: 600; }
         .row-with-preview { display: flex; gap: 6px; align-items: center; }
         .row-with-preview > :first-child { flex: 1; min-width: 0; }
+        .refresh-btn { flex: 0 0 auto !important; width: 26px !important;
+                       padding: 4px 0 !important; font-size: 13px !important;
+                       background: #ddd !important; color: #333 !important;
+                       border: 1px solid #bbb !important; }
+        .refresh-btn:hover { background: #c8c8c8 !important; }
+        .ais-actions { display: flex; gap: 6px; align-items: center;
+                       margin: 4px 0 0; }
+        .ais-actions > button { flex: 0 0 auto !important; }
+        .ais-actions .preview-box { flex: 1; }
+        .secondary-btn { background: #ddd !important; color: #333 !important;
+                         border: 1px solid #bbb !important;
+                         padding: 6px 10px !important; font-size: 11px !important; }
+        .secondary-btn:hover { background: #c8c8c8 !important; }
         .preview-box label { font-weight: normal !important; font-size: 10px !important;
                              color: #888; margin: 0 !important; white-space: nowrap; }
         .preview-info { font-size: 10px; color: #555; margin: 2px 0 0;
@@ -561,6 +664,14 @@ INDEX_TEMPLATE = """<!DOCTYPE html>
         #progress-fill { height: 100%; background: linear-gradient(90deg, #58c, #4ad);
                          width: 0%; transition: width 0.1s linear; }
         #progress-elapsed { font-size: 11px; color: #666; text-align: right; }
+        /* Small bottom-right pill for "Rendering..." / "Ready" between transfer and first paint */
+        #render-status { position: fixed; bottom: 20px; right: 20px;
+                         background: #4ad; color: white; padding: 8px 16px;
+                         border-radius: 4px; font: 12px monospace;
+                         box-shadow: 0 2px 8px rgba(0,0,0,0.25); z-index: 150;
+                         transition: opacity 0.3s; }
+        #render-status.done { background: #4a4; }
+        #render-status.fade { opacity: 0; }
     </style>
 </head>
 <body>
@@ -574,7 +685,9 @@ INDEX_TEMPLATE = """<!DOCTYPE html>
 </html>
 """
 
-app = Dash(__name__, suppress_callback_exceptions=True)
+# update_title=None disables Dash's default "Updating..." tab-title swap during callbacks.
+app = Dash(__name__, suppress_callback_exceptions=True, update_title=None)
+app.title = 'aiswakepy'
 app.index_string = INDEX_TEMPLATE
 
 
@@ -708,13 +821,20 @@ _default_tide = next((p for p in EXAMPLE_FILES['tide'] if '_6min' in p),
                      EXAMPLE_FILES['tide'][0] if EXAMPLE_FILES['tide'] else None)
 
 
-def _picker_with_preview(label: str, dropdown_id: str, preview_id: str,
-                         info_id: str, options: list, value, clearable=False):
+def _picker_with_refresh(label: str, dropdown_id: str, preview_id: str,
+                         info_id: str, refresh_id: str,
+                         options: list, value, clearable=False):
+    """Dropdown + small ↻ button + preview tickbox. The refresh button forces a
+    re-fetch even when the dropdown value didn't change (workaround for Dash's
+    no-callback-on-same-value behaviour)."""
     return html.Div([
         html.Label(label),
         html.Div([
             dcc.Dropdown(id=dropdown_id, options=_opt_list(options),
                          value=value, clearable=clearable),
+            html.Button('↻', id=refresh_id, n_clicks=0,
+                        title='Re-apply selection',
+                        className='refresh-btn'),
             html.Div(
                 dcc.Checklist(id=preview_id, options=[{'label': 'preview', 'value': '1'}],
                               value=[]),
@@ -736,14 +856,46 @@ app.layout = html.Div([
 
     html.Div([
         html.H4('Run pipeline'),
-        _picker_with_preview('AIS CSV', 'sel-ais', 'pv-ais', 'pv-ais-info',
-                             EXAMPLE_FILES['ais'], _default_ais),
-        _picker_with_preview('Bathymetry', 'sel-bathy', 'pv-bathy', 'pv-bathy-info',
+
+        # ---- AIS CSV: dropdown + Import + Preview tickbox + Filter button ----
+        html.Label('AIS CSV'),
+        dcc.Dropdown(id='sel-ais', options=_opt_list(EXAMPLE_FILES['ais']),
+                     value=_default_ais, clearable=False),
+        html.Div([
+            html.Button('Import', id='btn-import-ais', n_clicks=0,
+                        title='Load the selected AIS CSV onto the map',
+                        className='secondary-btn'),
+            html.Div(
+                dcc.Checklist(id='pv-ais',
+                              options=[{'label': 'preview', 'value': '1'}],
+                              value=[]),
+                className='preview-box',
+            ),
+            html.Button('Filter', id='btn-filter', n_clicks=0,
+                        title='Run Stage 1: AIS cleaning + interpolation',
+                        className='secondary-btn'),
+        ], className='ais-actions'),
+        html.Div(id='pv-ais-info', className='preview-info'),
+
+        # ---- Other inputs: dropdown + refresh + preview ----
+        _picker_with_refresh('Bathymetry', 'sel-bathy', 'pv-bathy',
+                             'pv-bathy-info', 'btn-pv-bathy-refresh',
                              EXAMPLE_FILES['bathymetry'], _default_bathy),
-        _picker_with_preview('Coastline', 'sel-coast', 'pv-coast', 'pv-coast-info',
+        _picker_with_refresh('Coastline', 'sel-coast', 'pv-coast',
+                             'pv-coast-info', 'btn-pv-coast-refresh',
                              EXAMPLE_FILES['coastline'], _default_coast),
-        _picker_with_preview('Tide DFS0 (optional)', 'sel-tide', 'pv-tide', 'pv-tide-info',
+        _picker_with_refresh('Tide DFS0 (optional)', 'sel-tide', 'pv-tide',
+                             'pv-tide-info', 'btn-pv-tide-refresh',
                              EXAMPLE_FILES['tide'], _default_tide, clearable=True),
+
+        html.Label('Interpolation method'),
+        dcc.Dropdown(id='sel-interp',
+                     options=[
+                         {'label': 'linear (straight-line)', 'value': 'linear'},
+                         {'label': 'hermite (cubic spline)', 'value': 'hermite'},
+                     ],
+                     value='linear', clearable=False),
+
         html.Label('Cb method (Le determination)'),
         dcc.Dropdown(id='sel-cb',
                      options=[{'label': m, 'value': m} for m in CB_METHODS],
@@ -752,10 +904,43 @@ app.layout = html.Div([
         dcc.Dropdown(id='sel-formula',
                      options=[{'label': f, 'value': f} for f in WAVE_FORMULAE],
                      value='kriebel', clearable=False),
+
         html.Div([
-            html.Button('1. Filter AIS',     id='btn-filter', n_clicks=0),
-            html.Button('2. Calculate waves', id='btn-waves',  n_clicks=0),
+            html.Button('Calculate waves', id='btn-waves', n_clicks=0,
+                        title='Run depth + vessel + wave_impact stages '
+                              '(auto-runs filter first if needed)'),
         ], className='row-buttons'),
+
+        # ---- Debug filter: isolate a single track segment for spike inspection ----
+        html.Hr(),
+        html.Div('Debug: isolate one track segment',
+                 style={'fontWeight': 'bold', 'fontSize': '11px', 'color': '#555'}),
+        html.Div([
+            html.Div([
+                html.Label('MMSI', style={'margin': '4px 0 2px'}),
+                dcc.Input(id='inp-debug-mmsi', type='number',
+                          placeholder='e.g. 372490000', debounce=True,
+                          style={'width': '100%', 'fontSize': '11px',
+                                 'padding': '4px', 'boxSizing': 'border-box'}),
+            ], style={'flex': 1}),
+            html.Div([
+                html.Label('segment', style={'margin': '4px 0 2px'}),
+                dcc.Input(id='inp-debug-seg', type='number',
+                          placeholder='e.g. 5730', debounce=True,
+                          style={'width': '100%', 'fontSize': '11px',
+                                 'padding': '4px', 'boxSizing': 'border-box'}),
+            ], style={'flex': 1, 'marginLeft': '6px'}),
+        ], style={'display': 'flex'}),
+        html.Div([
+            html.Button('Isolate', id='btn-debug-apply', n_clicks=0,
+                        className='secondary-btn',
+                        title='Hide all other tracks; show this segment + each AIS point'),
+            html.Button('Show all', id='btn-debug-clear', n_clicks=0,
+                        className='secondary-btn',
+                        title='Restore the full track view'),
+        ], className='row-buttons'),
+        html.Div(id='debug-info', className='preview-info'),
+
         html.Hr(),
         html.Div('Progress', style={'fontWeight': 'bold'}),
         html.Pre(id='progress-log', children='(idle)'),
@@ -769,20 +954,25 @@ app.layout = html.Div([
     dcc.Store(id='_init'),
     dcc.Store(id='_wave_version', data=0),
     dcc.Store(id='_track_version', data=0),
-    # Preview state Stores: each carries {visible: bool, path: str|None}
+    dcc.Store(id='_ais_import', data={'path': None, 'nonce': 0}),
+    # Preview state Stores: {visible, path, nonce}; nonce bumps on refresh-btn click
     dcc.Store(id='_pv_ais',   data={'visible': False, 'path': None}),
-    dcc.Store(id='_pv_bathy', data={'visible': False, 'path': None}),
-    dcc.Store(id='_pv_coast', data={'visible': False, 'path': None}),
-    dcc.Store(id='_pv_tide',  data={'visible': False, 'path': None}),
+    dcc.Store(id='_pv_bathy', data={'visible': False, 'path': None, 'nonce': 0}),
+    dcc.Store(id='_pv_coast', data={'visible': False, 'path': None, 'nonce': 0}),
+    dcc.Store(id='_pv_tide',  data={'visible': False, 'path': None, 'nonce': 0}),
+    dcc.Store(id='_debug_filter', data={'mmsi': None, 'segment_id': None, 'nonce': 0}),
 ])
 
 
 # ---------------------------------------------------------------------------
 # Server-side callbacks: run buttons + polling
 # ---------------------------------------------------------------------------
-def _build_config(ais, bathy, coast, tide, formula, cb_method) -> dict:
+def _build_config(ais, bathy, coast, tide, formula, cb_method, interp_method='linear') -> dict:
+    ais_cfg = {'raw_csv': ais}
+    if interp_method:
+        ais_cfg['interp_method'] = interp_method
     cfg = {
-        'ais': {'raw_csv': ais},
+        'ais': ais_cfg,
         'vessel': {'cb_method': cb_method} if cb_method else {},
         'bathymetry': {'source': bathy},
         'coastline': {'shapefile': coast},
@@ -800,7 +990,8 @@ def _kick(config_dict, stages, label):
         if PIPELINE_STATE['running']:
             return False
         PIPELINE_STATE.update({
-            'running': True, 'log': [], 'started_at': time.time(),
+            'running': True, 'log': [], 'live': '',
+            'started_at': time.time(),
             'finished_at': None, 'error': None,
         })
     threading.Thread(target=_pipeline_thread,
@@ -816,12 +1007,13 @@ def _kick(config_dict, stages, label):
     State('sel-ais', 'value'), State('sel-bathy', 'value'),
     State('sel-coast', 'value'), State('sel-tide', 'value'),
     State('sel-formula', 'value'), State('sel-cb', 'value'),
+    State('sel-interp', 'value'),
     prevent_initial_call=True,
 )
-def kick_filter(n, ais, bathy, coast, tide, formula, cb):
+def kick_filter(n, ais, bathy, coast, tide, formula, cb, interp):
     if not n or not ais or not coast:
         return no_update, no_update, no_update
-    cfg = _build_config(ais, bathy, coast, tide, formula, cb)
+    cfg = _build_config(ais, bathy, coast, tide, formula, cb, interp)
     if _kick(cfg, ['filter'], 'filter'):
         return False, True, True
     return no_update, no_update, no_update
@@ -835,18 +1027,41 @@ def kick_filter(n, ais, bathy, coast, tide, formula, cb):
     State('sel-ais', 'value'), State('sel-bathy', 'value'),
     State('sel-coast', 'value'), State('sel-tide', 'value'),
     State('sel-formula', 'value'), State('sel-cb', 'value'),
+    State('sel-interp', 'value'),
     prevent_initial_call=True,
 )
-def kick_waves(n, ais, bathy, coast, tide, formula, cb):
+def kick_waves(n, ais, bathy, coast, tide, formula, cb, interp):
+    """Run depth+vessel+wave_impact.
+
+    The worker checks (in order): in-memory LAST_RESULTS['df_filtered'],
+    then disk-cached `{stem}_01_filtered.csv` newer than the AIS file,
+    then falls back to running filter first.
+    """
     if not n or not ais or not coast or not bathy:
         return no_update, no_update, no_update
-    # If filter hasn't been run, run all stages so users can also do a one-shot run.
-    stages = ['depth', 'vessel', 'wave_impact'] if 'df_filtered' in LAST_RESULTS \
-             else ['filter', 'depth', 'vessel', 'wave_impact']
-    cfg = _build_config(ais, bathy, coast, tide, formula, cb)
-    if _kick(cfg, stages, 'waves'):
+    cfg = _build_config(ais, bathy, coast, tide, formula, cb, interp)
+    # Always request the wave stages — the worker decides whether to
+    # prepend 'filter' based on cache freshness checks.
+    if _kick(cfg, ['depth', 'vessel', 'wave_impact'], 'waves'):
         return False, True, True
     return no_update, no_update, no_update
+
+
+# ---- AIS import button: triggers clientside fetch with progress overlay ----
+@app.callback(
+    Output('_ais_import', 'data'),
+    Output('pv-ais', 'value', allow_duplicate=True),
+    Input('btn-import-ais', 'n_clicks'),
+    State('sel-ais', 'value'),
+    State('_ais_import', 'data'),
+    prevent_initial_call=True,
+)
+def trigger_ais_import(n, path, prev):
+    if not n or not path:
+        return no_update, no_update
+    nonce = (prev or {}).get('nonce', 0) + 1
+    # Auto-tick the preview tickbox so the imported data shows on map.
+    return {'path': path, 'nonce': nonce}, ['1']
 
 
 @app.callback(
@@ -868,6 +1083,8 @@ def tick(_, prev_wave_v, prev_track_v):
     with _pipeline_lock:
         s = dict(PIPELINE_STATE)
     log_lines = list(s['log'][-300:])
+    if s.get('live'):
+        log_lines.append(s['live'])  # in-progress spinner line, replaced each tick
     log_text = '\n'.join(log_lines) or '(no output yet)'
     elapsed = f"elapsed: {s.get('elapsed_s', 0):.1f}s"
     counts = (f'waves {len(df_waves):,}', f'segments {len(seg_meta):,}',
@@ -891,24 +1108,65 @@ def tick(_, prev_wave_v, prev_track_v):
 
 
 # ---------------------------------------------------------------------------
-# Preview callbacks: maintain Stores fed from dropdown + checkbox state
+# Preview callbacks: bathy / coast / tide listen to dropdown + tickbox + refresh.
+# The refresh button bumps a `nonce`, so even if the dropdown value is unchanged
+# the Store data changes and the clientside callback fires (fixes the "clicking
+# the already-selected dropdown option does nothing" UX).
 # ---------------------------------------------------------------------------
-def _make_pv_callback(store_id, sel_id, pv_id):
+def _make_pv_callback(store_id, sel_id, pv_id, refresh_id):
     @app.callback(
         Output(store_id, 'data'),
         Input(sel_id, 'value'),
         Input(pv_id, 'value'),
+        Input(refresh_id, 'n_clicks'),
+        State(store_id, 'data'),
         prevent_initial_call=False,
     )
-    def _pv(path, pv_val):
-        return {'visible': bool(pv_val), 'path': path}
+    def _pv(path, pv_val, refresh_n, prev):
+        prev_nonce = (prev or {}).get('nonce', 0)
+        # Bump nonce on any refresh-button click so the clientside re-fetches.
+        nonce = (refresh_n or 0) + prev_nonce * 0  # use refresh_n directly
+        return {'visible': bool(pv_val), 'path': path, 'nonce': refresh_n or 0}
     return _pv
 
 
-_make_pv_callback('_pv_ais',   'sel-ais',   'pv-ais')
-_make_pv_callback('_pv_bathy', 'sel-bathy', 'pv-bathy')
-_make_pv_callback('_pv_coast', 'sel-coast', 'pv-coast')
-_make_pv_callback('_pv_tide',  'sel-tide',  'pv-tide')
+_make_pv_callback('_pv_bathy', 'sel-bathy', 'pv-bathy', 'btn-pv-bathy-refresh')
+_make_pv_callback('_pv_coast', 'sel-coast', 'pv-coast', 'btn-pv-coast-refresh')
+_make_pv_callback('_pv_tide',  'sel-tide',  'pv-tide',  'btn-pv-tide-refresh')
+
+
+# AIS preview tickbox is decoupled from the dropdown — it just toggles
+# visibility of the already-imported AIS data.
+@app.callback(
+    Output('_pv_ais', 'data'),
+    Input('pv-ais', 'value'),
+    prevent_initial_call=False,
+)
+def _pv_ais_toggle(pv_val):
+    return {'visible': bool(pv_val)}
+
+
+# ---- Debug filter: isolate one (mmsi, segment_id) on the map ----
+@app.callback(
+    Output('_debug_filter', 'data'),
+    Input('btn-debug-apply', 'n_clicks'),
+    Input('btn-debug-clear', 'n_clicks'),
+    State('inp-debug-mmsi', 'value'),
+    State('inp-debug-seg', 'value'),
+    State('_debug_filter', 'data'),
+    prevent_initial_call=True,
+)
+def _set_debug_filter(apply_n, clear_n, mmsi, seg, prev):
+    from dash import ctx
+    nonce = ((apply_n or 0) + (clear_n or 0))
+    if ctx.triggered_id == 'btn-debug-clear':
+        return {'mmsi': None, 'segment_id': None, 'nonce': nonce}
+    # Coerce empty strings to None (number inputs return '' until typed).
+    return {
+        'mmsi': int(mmsi) if mmsi not in (None, '') else None,
+        'segment_id': int(seg) if seg not in (None, '') else None,
+        'nonce': nonce,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -1014,6 +1272,36 @@ function(n) {
     }
     window.__fetchAssetsWithProgress = fetchAssetsWithProgress;
 
+    // ---------- Render-state pill (shown after fetch, until first paint) ----------
+    function setRenderStatus(text, doneFlag) {
+        let el = document.getElementById('render-status');
+        if (!el) {
+            el = document.createElement('div');
+            el.id = 'render-status';
+            document.body.appendChild(el);
+        }
+        el.textContent = text;
+        el.className = doneFlag ? 'done' : '';
+    }
+    function clearRenderStatus(delay) {
+        const el = document.getElementById('render-status');
+        if (!el) return;
+        if (delay) {
+            el.classList.add('fade');
+            setTimeout(() => { if (el.parentNode) el.remove(); }, delay);
+        } else {
+            el.remove();
+        }
+    }
+    window.__setRenderStatus = setRenderStatus;
+    window.__clearRenderStatus = clearRenderStatus;
+    // Yields until deck.gl has painted at least one frame after rebuild.
+    function waitForPaint() {
+        return new Promise(r => requestAnimationFrame(() =>
+            requestAnimationFrame(r)));   // two RAFs = at least one full paint cycle
+    }
+    window.__waitForPaint = waitForPaint;
+
     // ---------- Helpers ----------
     const debounce = (fn, ms) => {
         let h = null;
@@ -1084,6 +1372,9 @@ function(n) {
         // Track whether we have data so layers gate themselves.
         window.__hasTracks = false;
         window.__hasWaves = false;
+        // Debug filter: when set to {mmsi, segment_id}, hide full tracks layer
+        // and show only the matching segment + each vertex as a pickable dot.
+        window.__debugFilter = { mmsi: null, segment_id: null };
 
         const buildLayers = (zoom, hoveredIdx) => {
             const useRaster = zoom < """ + str(ZOOM_RASTER_THRESHOLD) + r""";
@@ -1110,7 +1401,10 @@ function(n) {
                     pickable: false, opacity: 0.65,
                 }));
             }
-            if (window.__hasTracks && !useRaster && tMMSI.length > 0) {
+            const df = window.__debugFilter || {};
+            const debugActive = df.mmsi != null && df.segment_id != null;
+
+            if (window.__hasTracks && !useRaster && tMMSI.length > 0 && !debugActive) {
                 layers.push(new deck.PathLayer({
                     id: 'tracks',
                     data: { length: tMMSI.length, startIndices,
@@ -1123,6 +1417,48 @@ function(n) {
                         showTip(x, y, `<b>TRACK</b><br>MMSI: ${tMMSI[index]}<br>seg: ${tSeg[index]}<br>n: ${tN[index]}`);
                     },
                 }));
+            }
+
+            // Debug filter: isolate one (mmsi, segment_id) — show segment line + every vertex as a pickable dot.
+            if (debugActive && window.__hasTracks) {
+                const segIdx = segLookup.get(`${df.mmsi}|${df.segment_id}`);
+                if (segIdx != null && segIdx < startIndices.length - 1) {
+                    const segStart = startIndices[segIdx];
+                    const segEnd   = startIndices[segIdx + 1];
+                    const segCoords = cPos.subarray(segStart * 2, segEnd * 2);
+                    layers.push(new deck.PathLayer({
+                        id: 'debug-segment-line',
+                        data: {
+                            length: 1,
+                            startIndices: [0, segEnd - segStart],
+                            attributes: { getPath: { value: segCoords, size: 2 } },
+                        },
+                        _pathType: 'open',
+                        getColor: [255, 180, 0, 240],
+                        getWidth: 2, widthUnits: 'pixels', widthMinPixels: 2,
+                        pickable: false,
+                    }));
+                    layers.push(new deck.ScatterplotLayer({
+                        id: 'debug-segment-points',
+                        data: { length: segEnd - segStart,
+                                attributes: { getPosition: { value: segCoords, size: 2 } } },
+                        pickable: true, stroked: true, filled: true,
+                        getRadius: 5, radiusUnits: 'pixels',
+                        radiusMinPixels: 4, radiusMaxPixels: 8,
+                        getFillColor: [255, 60, 0, 220],
+                        getLineColor: [255, 255, 255, 240],
+                        lineWidthMinPixels: 1,
+                        onHover: ({x, y, index}) => {
+                            if (index < 0) { hideTip(); return; }
+                            const lon = segCoords[index*2];
+                            const lat = segCoords[index*2+1];
+                            showTip(x, y,
+                                `<b>POINT ${index}/${segEnd - segStart - 1}</b><br>` +
+                                `MMSI ${df.mmsi}  seg ${df.segment_id}<br>` +
+                                `lon: ${lon.toFixed(6)}<br>lat: ${lat.toFixed(6)}`);
+                        },
+                    }));
+                }
             }
             if (window.__hasWaves && wMMSI.length > 0) {
                 layers.push(new deck.ScatterplotLayer({
@@ -1216,22 +1552,25 @@ function(n) {
                     getWidth: 1, widthMinPixels: 1, pickable: false,
                 }));
             }
-            if (pv.coast && pv.coast.paths && pv.coast.paths.length > 0) {
-                layers.push(new deck.PathLayer({
+            if (pv.coast && pv.coast.geojson) {
+                // GeoJsonLayer handles Polygon/MultiPolygon/LineString natively.
+                layers.push(new deck.GeoJsonLayer({
                     id: 'pv-coast',
-                    data: pv.coast.paths,
-                    getPath: d => d, _pathType: 'open',
-                    getColor: [0, 80, 200, 220],
-                    getWidth: 2, widthMinPixels: 2,
+                    data: pv.coast.geojson,
+                    stroked: true, filled: true,
+                    getFillColor: [60, 130, 220, 40],
+                    getLineColor: [20, 80, 180, 230],
+                    getLineWidth: 2, lineWidthMinPixels: 2,
                     pickable: false,
                 }));
             }
-            if (pv.ais && pv.ais.pos && pv.ais.pos.length > 0) {
+            // AIS preview: rendered only when visible flag is on (import is separate).
+            if (pv.ais && pv.ais.visible && pv.ais.pos && pv.ais.pos.length > 0) {
                 layers.push(new deck.ScatterplotLayer({
                     id: 'pv-ais',
                     data: { length: pv.ais.pos.length / 2,
                             attributes: { getPosition: { value: pv.ais.pos, size: 2 } } },
-                    getRadius: 4, radiusUnits: 'pixels', radiusMinPixels: 2,
+                    getRadius: 3, radiusUnits: 'pixels', radiusMinPixels: 1,
                     getFillColor: [50, 150, 255, 200],
                     pickable: false,
                 }));
@@ -1270,15 +1609,20 @@ function(n) {
         }, 250);
         window.__rebuild = () => window.deckInstance.setProps({ layers: buildLayers(window._currentZoom, window._hoveredWave) });
 
-        // Post-pipeline refresh hooks: show the same progress overlay as before, then rebuild layers.
+        // Post-pipeline refresh hooks: show the same progress overlay as before, then rebuild layers,
+        // then show a "Rendering..." pill until deck.gl has painted at least one frame.
         window.__refreshWaveLayer = async (version) => {
             const [buf] = await fetchAssetsWithProgress([
                 { key: 'waves', url: `/api/waves.arrow?v=${version}`, label: 'wave impacts' },
             ], 'Loading wave impacts');
+            setRenderStatus('Rendering waves...', false);
             rebuildWaveArrays(window.tableFromIPC(buf));
             window.__hasWaves = wMMSI.length > 0;
             window._hoveredWave = null;
             window.__rebuild();
+            await waitForPaint();
+            setRenderStatus(`Waves ready (${wMMSI.length.toLocaleString()})`, true);
+            clearRenderStatus(1500);
         };
         window.__refreshTrackCaches = async (version) => {
             const [c, m, o] = await fetchAssetsWithProgress([
@@ -1286,6 +1630,7 @@ function(n) {
                 { key: 'track_meta',    url: `/api/track_meta.arrow?v=${version}`,    label: 'track metadata' },
                 { key: 'track_offsets', url: `/api/track_offsets.arrow?v=${version}`, label: 'track offsets' },
             ], 'Loading vessel tracks');
+            setRenderStatus('Rendering tracks...', false);
             initTrackArrays(
                 window.tableFromIPC(c),
                 window.tableFromIPC(m),
@@ -1293,38 +1638,63 @@ function(n) {
             );
             window.__hasTracks = tMMSI.length > 0;
             window.__rebuild();
+            await waitForPaint();
+            setRenderStatus(`Tracks ready (${tMMSI.length.toLocaleString()} segments)`, true);
+            clearRenderStatus(1500);
         };
 
-        // Preview setters — invoked by Dash clientside callbacks below.
-        window.__setPreviewAis = async (state) => {
-            if (!state || !state.visible || !state.path) {
-                window.__previews.ais = null; window.__rebuild(); return null;
-            }
+        // ---- AIS import (slow, explicit button) + preview toggle (cheap) ----
+        window.__importedAisPath = null;
+        window.__importAis = async (path) => {
+            if (!path) return 'no file selected';
             try {
-                const buf = await fetch('/api/preview/ais.arrow?path=' + encodeURIComponent(state.path))
-                    .then(r => r.arrayBuffer());
-                const t = window.tableFromIPC(new Uint8Array(buf));
+                const [buf] = await fetchAssetsWithProgress([
+                    { key: 'ais',  url: '/api/preview/ais.arrow?path=' + encodeURIComponent(path),
+                      label: 'AIS positions' },
+                ], 'Importing AIS data');
+                setRenderStatus('Rendering AIS points...', false);
+                const t = window.tableFromIPC(buf);
                 const lon = t.getChild('longitude').toArray();
                 const lat = t.getChild('latitude').toArray();
                 const pos = new Float32Array(lon.length * 2);
                 for (let i = 0; i < lon.length; i++) { pos[i*2]=lon[i]; pos[i*2+1]=lat[i]; }
-                window.__previews.ais = { pos };
-                // Fit camera to bbox
-                const bbResp = await fetch('/api/preview/ais.bbox?path=' + encodeURIComponent(state.path)).then(r => r.json());
-                if (bbResp.bbox) {
-                    const [w, s, e, n] = bbResp.bbox;
-                    const lonC = (w + e) / 2, latC = (s + n) / 2;
-                    const span = Math.max(e - w, n - s);
-                    const z = Math.max(8, Math.min(15, 10 - Math.log2(span)));
-                    window.deckInstance.setProps({ initialViewState: { longitude: lonC, latitude: latC, zoom: z, pitch: 0, bearing: 0 } });
-                    window._currentZoom = z;
-                }
+                window.__previews.ais = { pos, visible: true };
+                window.__importedAisPath = path;
+                try {
+                    const bb = await fetch('/api/preview/ais.bbox?path=' + encodeURIComponent(path)).then(r => r.json());
+                    if (bb.bbox) {
+                        const [w, s, e, n] = bb.bbox;
+                        const lonC = (w + e) / 2, latC = (s + n) / 2;
+                        const span = Math.max(e - w, n - s);
+                        const z = Math.max(8, Math.min(15, 10 - Math.log2(span)));
+                        window.deckInstance.setProps({ initialViewState: { longitude: lonC, latitude: latC, zoom: z, pitch: 0, bearing: 0 } });
+                        window._currentZoom = z;
+                    }
+                } catch (e) { /* bbox fit failure is non-fatal */ }
                 window.__rebuild();
-                return `${lon.length.toLocaleString()} preview points`;
+                await waitForPaint();
+                setRenderStatus(`AIS ready (${lon.length.toLocaleString()} points)`, true);
+                clearRenderStatus(1500);
+                return `imported ${lon.length.toLocaleString()} points`;
             } catch (e) {
-                window.__previews.ais = null; window.__rebuild();
+                clearRenderStatus(0);
                 return 'ERROR: ' + e.message;
             }
+        };
+        window.__togglePreviewAis = (visible) => {
+            if (window.__previews.ais) {
+                window.__previews.ais.visible = !!visible;
+                window.__rebuild();
+                return window.__previews.ais.visible
+                    ? `showing ${(window.__previews.ais.pos.length/2).toLocaleString()} points`
+                    : 'hidden';
+            }
+            return visible ? 'import first' : '';
+        };
+        // Legacy entry point kept for backward compat — now just toggles visibility.
+        window.__setPreviewAis = async (state) => {
+            if (!state) return '';
+            return window.__togglePreviewAis(state.visible) || '';
         };
         window.__setPreviewBathy = async (state) => {
             if (!state || !state.visible || !state.path) {
@@ -1354,32 +1724,67 @@ function(n) {
         };
         window.__setPreviewCoast = async (state) => {
             if (!state || !state.visible || !state.path) {
-                window.__previews.coast = null; window.__rebuild(); return null;
+                window.__previews.coast = null; window.__rebuild(); return '';
             }
             try {
                 const gj = await fetch('/api/preview/coast.geojson?path=' + encodeURIComponent(state.path)).then(r => r.json());
                 if (gj.error) throw new Error(gj.error);
-                const paths = [];
-                const flatten = (geom) => {
-                    if (!geom) return;
-                    const t = geom.type, c = geom.coordinates;
-                    if (t === 'LineString')      { paths.push(c); }
-                    else if (t === 'Polygon')    { c.forEach(ring => paths.push(ring)); }
-                    else if (t === 'MultiLineString' || t === 'MultiPolygon') {
-                        c.forEach(part => flatten({ type: t === 'MultiLineString' ? 'LineString' : 'Polygon', coordinates: part }));
-                    } else if (t === 'GeometryCollection') {
-                        geom.geometries.forEach(flatten);
-                    }
-                };
-                gj.features.forEach(f => flatten(f.geometry));
-                window.__previews.coast = { paths };
+                window.__previews.coast = { geojson: gj };
+                // Fit camera to the shapefile bbox.
+                if (gj.bbox && gj.bbox.length === 4) {
+                    const [w, s, e, n] = gj.bbox;
+                    const lonC = (w + e) / 2, latC = (s + n) / 2;
+                    const span = Math.max(e - w, n - s, 0.001);
+                    const z = Math.max(8, Math.min(15, 10 - Math.log2(span)));
+                    window.deckInstance.setProps({ initialViewState: { longitude: lonC, latitude: latC, zoom: z, pitch: 0, bearing: 0 } });
+                    window._currentZoom = z;
+                }
                 window.__rebuild();
-                return `${gj.features.length} feature(s), ${paths.length} ring(s)`;
+                const nFeat = gj.features ? gj.features.length : 0;
+                return `${nFeat} feature(s)`;
             } catch (e) {
                 window.__previews.coast = null; window.__rebuild();
                 return 'ERROR: ' + e.message;
             }
         };
+        // ---- Debug filter setter ----
+        window.__setDebugFilter = (state) => {
+            window.__debugFilter = state || { mmsi: null, segment_id: null };
+            const df = window.__debugFilter;
+            if (df.mmsi == null || df.segment_id == null) {
+                window.__rebuild();
+                return 'showing all tracks';
+            }
+            if (!segLookup) return 'no track data yet — run Filter first';
+            const segIdx = segLookup.get(`${df.mmsi}|${df.segment_id}`);
+            if (segIdx == null || segIdx >= startIndices.length - 1) {
+                window.__rebuild();
+                return `not found: MMSI=${df.mmsi}, segment=${df.segment_id}`;
+            }
+            const segStart = startIndices[segIdx];
+            const segEnd   = startIndices[segIdx + 1];
+            const n = segEnd - segStart;
+            // Fit camera to the segment's bbox.
+            let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
+            for (let i = segStart; i < segEnd; i++) {
+                const x = cPos[i*2], y = cPos[i*2+1];
+                if (x < minX) minX = x; if (x > maxX) maxX = x;
+                if (y < minY) minY = y; if (y > maxY) maxY = y;
+            }
+            if (isFinite(minX)) {
+                const lonC = (minX + maxX) / 2, latC = (minY + maxY) / 2;
+                const span = Math.max(maxX - minX, maxY - minY, 0.0005);
+                const z = Math.max(12, Math.min(18, 11 - Math.log2(span)));
+                window.deckInstance.setProps({
+                    initialViewState: { longitude: lonC, latitude: latC,
+                                        zoom: z, pitch: 0, bearing: 0 },
+                });
+                window._currentZoom = z;
+            }
+            window.__rebuild();
+            return `MMSI ${df.mmsi} seg ${df.segment_id}: ${n} vertices  (hover dots for lon/lat)`;
+        };
+
         window.__setPreviewTide = async (state) => {
             if (!state || !state.visible || !state.path) return null;
             try {
@@ -1462,6 +1867,36 @@ _make_preview_clientside('_pv_ais',   'pv-ais-info',   '__setPreviewAis')
 _make_preview_clientside('_pv_bathy', 'pv-bathy-info', '__setPreviewBathy')
 _make_preview_clientside('_pv_coast', 'pv-coast-info', '__setPreviewCoast')
 _make_preview_clientside('_pv_tide',  'pv-tide-info',  '__setPreviewTide')
+
+
+# AIS import clientside callback — triggered by the Import button via _ais_import Store.
+app.clientside_callback(
+    r"""
+    async function(state) {
+        if (!state || !state.path || !state.nonce) return '';
+        if (typeof window.__importAis !== 'function') return 'init pending...';
+        const result = await window.__importAis(state.path);
+        return result || '';
+    }
+    """,
+    Output('pv-ais-info', 'children', allow_duplicate=True),
+    Input('_ais_import', 'data'),
+    prevent_initial_call=True,
+)
+
+
+# Debug filter clientside callback — calls __setDebugFilter and surfaces the info text.
+app.clientside_callback(
+    r"""
+    function(state) {
+        if (typeof window.__setDebugFilter !== 'function') return 'init pending...';
+        return window.__setDebugFilter(state) || '';
+    }
+    """,
+    Output('debug-info', 'children'),
+    Input('_debug_filter', 'data'),
+    prevent_initial_call=True,
+)
 
 
 # ---------------------------------------------------------------------------
