@@ -484,18 +484,28 @@ def validate_speed(df: pd.DataFrame) -> pd.DataFrame:
 def interpolate_trajectories(
     df: pd.DataFrame,
     interval_s: float = 30.0,
+    method: str = "linear",
 ) -> pd.DataFrame:
-    """Interpolate each trajectory segment using Cubic Hermite Splines.
+    """Interpolate each trajectory segment to a uniform time grid.
 
-    For each segment with >= 2 points:
-    - Convert lon/lat to flat-Earth x/y for spline fitting.
-    - Build two splines: x(t) and y(t) using SOG/COG as velocity constraints.
-    - Evaluate at uniform ``interval_s`` time intervals.
-    - Derive interpolated SOG and COG from spline first derivatives.
-    - Draught is nearest-neighbour in time (not interpolated).
+    Parameters
+    ----------
+    df : input vessel positions with columns: mmsi, segment_id, obstime,
+        longitude, latitude, sog, cog, width, length, draught, typecargo.
+    interval_s : output time spacing in seconds.
+    method : either ``"linear"`` (straight-line interpolation between consecutive
+        raw points; SOG and COG derived from each segment's constant velocity)
+        or ``"hermite"`` (CubicHermiteSpline using SOG and COG as velocity
+        constraints; smoother but can overshoot near noisy SOG/COG values).
 
-    Segments with only 1 point pass through unchanged.
+    For each segment with >= 2 points the chosen interpolant is evaluated at
+    uniform ``interval_s`` intervals.  Draught is nearest-neighbour in time
+    (not interpolated).  Segments with only 1 point pass through unchanged.
     """
+    method = (method or "linear").lower()
+    if method not in ("linear", "hermite"):
+        raise ValueError(f"interpolate_trajectories: unknown method {method!r}; "
+                         "expected 'linear' or 'hermite'")
     if df.empty:
         return df
 
@@ -558,22 +568,35 @@ def interpolate_trajectories(
         x = lons_all[start:end] * _DEG_TO_M
         y = lats_all[start:end] * _DEG_TO_M
 
-        speed_ms = sog_all[start:end] * _KNOTS_TO_MS
-        cog_rad  = np.radians(cog_all[start:end])
-        dxdt = speed_ms * np.sin(cog_rad)
-        dydt = speed_ms * np.cos(cog_rad)
-
-        xspline = CubicHermiteSpline(t_s, x, dxdt)
-        yspline = CubicHermiteSpline(t_s, y, dydt)
-
         t_interp = np.arange(t_s[0], t_s[-1], interval_s, dtype=float)
         if t_interp[-1] < t_s[-1]:
             t_interp = np.append(t_interp, t_s[-1])
 
-        x_interp    = xspline(t_interp, nu=0)
-        dxdt_interp = xspline(t_interp, nu=1)
-        y_interp    = yspline(t_interp, nu=0)
-        dydt_interp = yspline(t_interp, nu=1)
+        if method == "linear":
+            # Pure straight-line interpolation between consecutive raw points;
+            # SOG and COG come from each bracketing segment's constant velocity
+            # so the visible polyline and the kinematic fields stay consistent.
+            x_interp = np.interp(t_interp, t_s, x)
+            y_interp = np.interp(t_interp, t_s, y)
+            # idx[k] is the index of the right endpoint of the bracket containing t_interp[k]
+            idx = np.searchsorted(t_s, t_interp, side="right").clip(1, n - 1)
+            dt_seg = (t_s[idx] - t_s[idx - 1]).astype(float)
+            # Guard against zero-duration brackets (shouldn't happen post-dedupe).
+            dt_seg[dt_seg <= 0] = 1.0
+            dxdt_interp = (x[idx] - x[idx - 1]) / dt_seg
+            dydt_interp = (y[idx] - y[idx - 1]) / dt_seg
+        else:
+            # Cubic Hermite spline with SOG/COG as velocity constraints
+            speed_ms = sog_all[start:end] * _KNOTS_TO_MS
+            cog_rad  = np.radians(cog_all[start:end])
+            dxdt = speed_ms * np.sin(cog_rad)
+            dydt = speed_ms * np.cos(cog_rad)
+            xspline = CubicHermiteSpline(t_s, x, dxdt)
+            yspline = CubicHermiteSpline(t_s, y, dydt)
+            x_interp    = xspline(t_interp, nu=0)
+            dxdt_interp = xspline(t_interp, nu=1)
+            y_interp    = yspline(t_interp, nu=0)
+            dydt_interp = yspline(t_interp, nu=1)
 
         speed_interp = np.sqrt(dxdt_interp**2 + dydt_interp**2)
         sog_interp   = speed_interp / _KNOTS_TO_MS
@@ -682,8 +705,13 @@ def filter_ais(
     interval_s: float = 30.0,
     max_draught_to_width: float = 1.0,
     study_area_shp: str | Path | None = None,
+    interp_method: str = "linear",
 ) -> pd.DataFrame:
-    """Run the full AIS filtering pipeline and return a cleaned DataFrame."""
+    """Run the full AIS filtering pipeline and return a cleaned DataFrame.
+
+    ``interp_method`` is either ``"linear"`` (straight-line; default) or
+    ``"hermite"`` (CubicHermiteSpline with SOG/COG as velocity constraints).
+    """
     df = load_ais(csv_path)
     df = deduplicate(df)
     df = uniformize_vessel_info(df)
@@ -693,7 +721,7 @@ def filter_ais(
     df = clean_error_coords(df, max_velocity_knots=max_velocity_knots)
     df = clean_error_speed(df, max_acceleration_ms2=max_acceleration_ms2)
     df = validate_speed(df)
-    df = interpolate_trajectories(df, interval_s=interval_s)
+    df = interpolate_trajectories(df, interval_s=interval_s, method=interp_method)
     df = filter_study_area(df, polygon_shp=study_area_shp)
     df = mask_land(df, coastline_shp)
     return df

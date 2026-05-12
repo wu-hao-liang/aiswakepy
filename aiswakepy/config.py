@@ -17,6 +17,10 @@ class AisConfig(BaseModel):
     max_acceleration_ms2: float = 10.0
     max_draught_to_width: float = 1.0
     interp_interval_s: float = 30.0
+    # "linear": straight-line between consecutive raw points (default; conservative,
+    # no overshoot). "hermite": CubicHermiteSpline using SOG/COG as velocity
+    # constraints (smoother, but can produce spikes near noisy SOG/COG values).
+    interp_method: Literal["linear", "hermite"] = "linear"
     study_area_shp: str | None = None
 
 

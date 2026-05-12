@@ -67,6 +67,7 @@ def run_pipeline(
             interval_s=config.ais.interp_interval_s,
             max_draught_to_width=config.ais.max_draught_to_width,
             study_area_shp=config.ais.study_area_shp,
+            interp_method=config.ais.interp_method,
         )
         print(
             f"  \u2192 {len(results['df_filtered'])} rows after filtering "
