@@ -135,8 +135,13 @@ def _build_vessel_caches(df_v: pd.DataFrame) -> None:
             kept_ends   = kept_starts + kept_sizes.astype(np.int64)
             # Indices of rows belonging to kept segments — concatenated ranges.
             row_idx = np.concatenate([np.arange(s, e) for s, e in zip(kept_starts, kept_ends)])
-            sel_lon = df_sorted['longitude'].to_numpy(dtype=np.float32)[row_idx]
-            sel_lat = df_sorted['latitude'].to_numpy(dtype=np.float32)[row_idx]
+            sel_lon  = df_sorted['longitude'].to_numpy(dtype=np.float32)[row_idx]
+            sel_lat  = df_sorted['latitude'].to_numpy(dtype=np.float32)[row_idx]
+            sel_sog  = df_sorted['sog'].to_numpy(dtype=np.float32)[row_idx]
+            sel_cog  = df_sorted['cog'].to_numpy(dtype=np.float32)[row_idx]
+            # obstime as int64 ns for Arrow transport
+            sel_time = df_sorted['obstime'].to_numpy(dtype='datetime64[ns]')[row_idx]
+            sel_time_ns = sel_time.astype(np.int64)
             flat_arr = np.column_stack([sel_lon, sel_lat]).astype(np.float32)
             offsets_arr = np.concatenate(([0], np.cumsum(kept_sizes))).astype(np.int32)
             meta_mmsi = mmsi_arr[kept_starts]
@@ -146,8 +151,11 @@ def _build_vessel_caches(df_v: pd.DataFrame) -> None:
     seg_meta = [{'mmsi': int(m), 'segment_id': int(s), 'n_points': int(n)}
                 for m, s, n in zip(meta_mmsi, meta_seg, meta_n)]
     arrow_coords = pa.table({
-        'lon': pa.array(flat_arr[:, 0], type=pa.float32()),
-        'lat': pa.array(flat_arr[:, 1], type=pa.float32()),
+        'lon':      pa.array(flat_arr[:, 0], type=pa.float32()),
+        'lat':      pa.array(flat_arr[:, 1], type=pa.float32()),
+        'sog':      pa.array(sel_sog, type=pa.float32()),
+        'cog':      pa.array(sel_cog, type=pa.float32()),
+        'obstime':  pa.array(sel_time_ns, type=pa.int64()),
     })
     arrow_meta = pa.table({
         'mmsi':       pa.array(meta_mmsi.astype(np.int64), type=pa.int64()),
@@ -225,6 +233,8 @@ IPC_VESSELS = _ipc(pa.table({
 }))
 IPC_TRACK_COORDS = _ipc(pa.table({
     'lon': pa.array([], pa.float32()), 'lat': pa.array([], pa.float32()),
+    'sog': pa.array([], pa.float32()), 'cog': pa.array([], pa.float32()),
+    'obstime': pa.array([], pa.int64()),
 }))
 IPC_TRACK_META = _ipc(pa.table({
     'mmsi': pa.array([], pa.int64()), 'segment_id': pa.array([], pa.int32()),
@@ -252,13 +262,18 @@ def _scan_examples() -> dict:
         'bathymetry': sorted(rel(p) for ext in ('mesh', 'dfs2', 'dfsu')
                              for p in (REPO / 'examples/bathymetry').glob(f'*.{ext}')),
         'coastline': sorted(rel(p) for p in (REPO / 'examples/coastline').glob('*.shp')),
+        'land': sorted(rel(p) for p in (REPO / 'examples/land').glob('*.shp')),
         'tide': sorted(rel(p) for p in (REPO / 'examples/tide').glob('*.dfs0')),
     }
 
 
 EXAMPLE_FILES = _scan_examples()
-WAVE_FORMULAE = ['kriebel', 'pianc', 'sorensen', 'gates', 'blaauw', 'bhowmik', 'maynord']
 CB_METHODS = ['L_Le', 'B_Le', 'table']
+INTERP_METHODS = [
+    {'label': 'linear (straight-line)', 'value': 'linear'},
+    {'label': 'hermite (cubic spline)', 'value': 'hermite'},
+    {'label': 'mixed (hermite above 1 m/s, else linear)', 'value': 'mixed'},
+]
 
 
 # ---------------------------------------------------------------------------
@@ -420,23 +435,58 @@ def _pipeline_thread(config_dict: dict, stages: list[str], step_label: str) -> N
 # Preview helpers
 # ---------------------------------------------------------------------------
 def _preview_ais_arrow(path: Path) -> bytes:
-    """Return Arrow IPC of all (lon,lat) rows from the AIS CSV (no subsampling).
+    """Return Arrow IPC of (lon, lat, sog, cog, obstime) from the AIS CSV.
 
-    Note: large AIS files (millions of rows) produce tens of MB of Arrow IPC.
     The client UI gates this behind an explicit 'Import' button so the user
-    chooses when to pay the cost.
+    chooses when to pay the cost on large files (millions of rows → tens of MB).
     """
-    df = pd.read_csv(path, usecols=['longitude', 'latitude'])
+    cols = ['longitude', 'latitude']
+    try:
+        df = pd.read_csv(path, nrows=1)
+        for c in ['sog', 'cog']:
+            if c in df.columns or c.lower() in (x.lower() for x in df.columns):
+                cols.append(c)
+        if 'obstime' in df.columns or 'obstime' in (x.lower() for x in df.columns):
+            cols.append('obstime')
+    except Exception:
+        pass
+    df = pd.read_csv(path, usecols=cols)
+    df.columns = [c.strip().lower() for c in df.columns]
     df = df.dropna(subset=['longitude', 'latitude'])
-    df = df.astype({'longitude': 'float32', 'latitude': 'float32'})
+    cast = {'longitude': 'float32', 'latitude': 'float32'}
+    for c in ['sog', 'cog']:
+        if c in df.columns:
+            cast[c] = 'float32'
+    df = df.astype(cast)
+    # Convert obstime string → int64 ns so the client can decode it with
+    # new Date(ns / 1e6).  Sentinel 0 for unparseable / missing values.
+    time_col = None
+    for c in df.columns:
+        if c.lower() == 'obstime':
+            time_col = c
+            break
+    if time_col:
+        # Parse as UTC, strip tz, store as int64 epoch ns.
+        # Client reconstructs local display via new Date(ns / 1e6).
+        t = pd.to_datetime(df[time_col], utc=True, errors='coerce')
+        t = t.dt.tz_localize(None)
+        df[time_col + '_ns'] = t.astype('datetime64[ns]').astype('int64').fillna(0)
+        df = df.drop(columns=[time_col])
     return _ipc(pa.Table.from_pandas(df, preserve_index=False))
 
 
-def _preview_ais_bbox(path: Path) -> tuple[float, float, float, float]:
-    """Return (min_lon, min_lat, max_lon, max_lat) — used to fit the camera."""
-    df = pd.read_csv(path, usecols=['longitude', 'latitude'])
-    return (float(df['longitude'].min()), float(df['latitude'].min()),
-            float(df['longitude'].max()), float(df['latitude'].max()))
+def _preview_ais_bbox(path: Path) -> dict:
+    """Return bbox + time range — used to fit the camera and show data info."""
+    df = pd.read_csv(path, usecols=['longitude', 'latitude', 'obstime'])
+    lons = df['longitude']; lats = df['latitude']
+    times = pd.to_datetime(df['obstime'], utc=False, errors='coerce').dropna()
+    return {
+        'bbox': [float(lons.min()), float(lats.min()),
+                 float(lons.max()), float(lats.max())],
+        'time_min': str(times.iloc[0]) if len(times) else None,
+        'time_max': str(times.iloc[-1]) if len(times) else None,
+        'n_rows': len(df),
+    }
 
 
 def _preview_coast_geojson(path: Path) -> dict:
@@ -618,15 +668,6 @@ INDEX_TEMPLATE = """<!DOCTYPE html>
                          margin: 8px 0 2px; font-weight: 600; }
         .row-with-preview { display: flex; gap: 6px; align-items: center; }
         .row-with-preview > :first-child { flex: 1; min-width: 0; }
-        .refresh-btn { flex: 0 0 auto !important; width: 26px !important;
-                       padding: 4px 0 !important; font-size: 13px !important;
-                       background: #ddd !important; color: #333 !important;
-                       border: 1px solid #bbb !important; }
-        .refresh-btn:hover { background: #c8c8c8 !important; }
-        .ais-actions { display: flex; gap: 6px; align-items: center;
-                       margin: 4px 0 0; }
-        .ais-actions > button { flex: 0 0 auto !important; }
-        .ais-actions .preview-box { flex: 1; }
         .secondary-btn { background: #ddd !important; color: #333 !important;
                          border: 1px solid #bbb !important;
                          padding: 6px 10px !important; font-size: 11px !important; }
@@ -756,8 +797,7 @@ def _r_preview_ais():
 def _r_preview_ais_bbox():
     try:
         p = _safe_repo_path(request.args.get('path', ''))
-        bbox = _preview_ais_bbox(p)
-        return jsonify(bbox=bbox)
+        return jsonify(_preview_ais_bbox(p))
     except Exception as exc:
         return jsonify(error=str(exc)), 400
 
@@ -817,24 +857,20 @@ _default_bathy = next((p for p in EXAMPLE_FILES['bathymetry'] if '61803960_WestC
                       EXAMPLE_FILES['bathymetry'][0] if EXAMPLE_FILES['bathymetry'] else None)
 _default_coast = next((p for p in EXAMPLE_FILES['coastline'] if 'Coast_P1' in p),
                       EXAMPLE_FILES['coastline'][0] if EXAMPLE_FILES['coastline'] else None)
+_default_land = next((p for p in EXAMPLE_FILES['land'] if 'RD7550' in p),
+                     EXAMPLE_FILES['land'][0] if EXAMPLE_FILES['land'] else None)
 _default_tide = next((p for p in EXAMPLE_FILES['tide'] if '_6min' in p),
                      EXAMPLE_FILES['tide'][0] if EXAMPLE_FILES['tide'] else None)
 
 
-def _picker_with_refresh(label: str, dropdown_id: str, preview_id: str,
-                         info_id: str, refresh_id: str,
-                         options: list, value, clearable=False):
-    """Dropdown + small ↻ button + preview tickbox. The refresh button forces a
-    re-fetch even when the dropdown value didn't change (workaround for Dash's
-    no-callback-on-same-value behaviour)."""
+def _picker_with_preview(label: str, dropdown_id: str, preview_id: str,
+                         info_id: str, options: list, value, clearable=False):
+    """Dropdown row with a preview tickbox on the side (no refresh button)."""
     return html.Div([
         html.Label(label),
         html.Div([
             dcc.Dropdown(id=dropdown_id, options=_opt_list(options),
                          value=value, clearable=clearable),
-            html.Button('↻', id=refresh_id, n_clicks=0,
-                        title='Re-apply selection',
-                        className='refresh-btn'),
             html.Div(
                 dcc.Checklist(id=preview_id, options=[{'label': 'preview', 'value': '1'}],
                               value=[]),
@@ -857,53 +893,51 @@ app.layout = html.Div([
     html.Div([
         html.H4('Run pipeline'),
 
-        # ---- AIS CSV: dropdown + Import + Preview tickbox + Filter button ----
-        html.Label('AIS CSV'),
-        dcc.Dropdown(id='sel-ais', options=_opt_list(EXAMPLE_FILES['ais']),
-                     value=_default_ais, clearable=False),
+        # ---- AIS Data: dropdown + preview tickbox beside it, then Import/Filter below ----
+        html.Label('AIS Data'),
         html.Div([
-            html.Button('Import', id='btn-import-ais', n_clicks=0,
-                        title='Load the selected AIS CSV onto the map',
-                        className='secondary-btn'),
+            dcc.Dropdown(id='sel-ais', options=_opt_list(EXAMPLE_FILES['ais']),
+                         value=_default_ais, clearable=False),
             html.Div(
                 dcc.Checklist(id='pv-ais',
                               options=[{'label': 'preview', 'value': '1'}],
                               value=[]),
                 className='preview-box',
             ),
+        ], className='row-with-preview'),
+        html.Div([
+            html.Button('Import', id='btn-import-ais', n_clicks=0,
+                        title='Load the selected AIS CSV onto the map',
+                        className='secondary-btn'),
             html.Button('Filter', id='btn-filter', n_clicks=0,
                         title='Run Stage 1: AIS cleaning + interpolation',
                         className='secondary-btn'),
-        ], className='ais-actions'),
+        ], className='row-buttons'),
         html.Div(id='pv-ais-info', className='preview-info'),
 
-        # ---- Other inputs: dropdown + refresh + preview ----
-        _picker_with_refresh('Bathymetry', 'sel-bathy', 'pv-bathy',
-                             'pv-bathy-info', 'btn-pv-bathy-refresh',
-                             EXAMPLE_FILES['bathymetry'], _default_bathy),
-        _picker_with_refresh('Coastline', 'sel-coast', 'pv-coast',
-                             'pv-coast-info', 'btn-pv-coast-refresh',
-                             EXAMPLE_FILES['coastline'], _default_coast),
-        _picker_with_refresh('Tide DFS0 (optional)', 'sel-tide', 'pv-tide',
-                             'pv-tide-info', 'btn-pv-tide-refresh',
-                             EXAMPLE_FILES['tide'], _default_tide, clearable=True),
+        _picker_with_preview('Bathymetry', 'sel-bathy', 'pv-bathy',
+                             'pv-bathy-info', EXAMPLE_FILES['bathymetry'],
+                             _default_bathy),
+        _picker_with_preview('Coastline (wave shore)', 'sel-coast', 'pv-coast',
+                             'pv-coast-info', EXAMPLE_FILES['coastline'],
+                             _default_coast),
+
+        _picker_with_preview('Land mask (filter)', 'sel-land', 'pv-land',
+                             'pv-land-info', EXAMPLE_FILES['land'],
+                             _default_land),
+
+        _picker_with_preview('Tide DFS0', 'sel-tide', 'pv-tide',
+                             'pv-tide-info', EXAMPLE_FILES['tide'],
+                             _default_tide, clearable=True),
 
         html.Label('Interpolation method'),
-        dcc.Dropdown(id='sel-interp',
-                     options=[
-                         {'label': 'linear (straight-line)', 'value': 'linear'},
-                         {'label': 'hermite (cubic spline)', 'value': 'hermite'},
-                     ],
+        dcc.Dropdown(id='sel-interp', options=INTERP_METHODS,
                      value='linear', clearable=False),
 
         html.Label('Cb method (Le determination)'),
         dcc.Dropdown(id='sel-cb',
                      options=[{'label': m, 'value': m} for m in CB_METHODS],
                      value='L_Le', clearable=False),
-        html.Label('Wave formula'),
-        dcc.Dropdown(id='sel-formula',
-                     options=[{'label': f, 'value': f} for f in WAVE_FORMULAE],
-                     value='kriebel', clearable=False),
 
         html.Div([
             html.Button('Calculate waves', id='btn-waves', n_clicks=0,
@@ -955,11 +989,12 @@ app.layout = html.Div([
     dcc.Store(id='_wave_version', data=0),
     dcc.Store(id='_track_version', data=0),
     dcc.Store(id='_ais_import', data={'path': None, 'nonce': 0}),
-    # Preview state Stores: {visible, path, nonce}; nonce bumps on refresh-btn click
+    # Preview state Stores: {visible, path}
     dcc.Store(id='_pv_ais',   data={'visible': False, 'path': None}),
-    dcc.Store(id='_pv_bathy', data={'visible': False, 'path': None, 'nonce': 0}),
-    dcc.Store(id='_pv_coast', data={'visible': False, 'path': None, 'nonce': 0}),
-    dcc.Store(id='_pv_tide',  data={'visible': False, 'path': None, 'nonce': 0}),
+    dcc.Store(id='_pv_bathy', data={'visible': False, 'path': None}),
+    dcc.Store(id='_pv_coast', data={'visible': False, 'path': None}),
+    dcc.Store(id='_pv_land',  data={'visible': False, 'path': None}),
+    dcc.Store(id='_pv_tide',  data={'visible': False, 'path': None}),
     dcc.Store(id='_debug_filter', data={'mmsi': None, 'segment_id': None, 'nonce': 0}),
 ])
 
@@ -967,8 +1002,8 @@ app.layout = html.Div([
 # ---------------------------------------------------------------------------
 # Server-side callbacks: run buttons + polling
 # ---------------------------------------------------------------------------
-def _build_config(ais, bathy, coast, tide, formula, cb_method, interp_method='linear') -> dict:
-    ais_cfg = {'raw_csv': ais}
+def _build_config(ais, land, bathy, coast, tide, cb_method, interp_method='linear') -> dict:
+    ais_cfg = {'raw_csv': ais, 'land_shp': land, 'min_speed_knots': 0.0}
     if interp_method:
         ais_cfg['interp_method'] = interp_method
     cfg = {
@@ -976,7 +1011,7 @@ def _build_config(ais, bathy, coast, tide, formula, cb_method, interp_method='li
         'vessel': {'cb_method': cb_method} if cb_method else {},
         'bathymetry': {'source': bathy},
         'coastline': {'shapefile': coast},
-        'wave': {'formula': formula} if formula else {},
+        'wave': {'formula': 'kriebel'},
         'output': {'directory': 'output/', 'save_stage_csv': True},
     }
     if tide:
@@ -1004,16 +1039,16 @@ def _kick(config_dict, stages, label):
     Output('btn-filter', 'disabled', allow_duplicate=True),
     Output('btn-waves',  'disabled', allow_duplicate=True),
     Input('btn-filter', 'n_clicks'),
-    State('sel-ais', 'value'), State('sel-bathy', 'value'),
-    State('sel-coast', 'value'), State('sel-tide', 'value'),
-    State('sel-formula', 'value'), State('sel-cb', 'value'),
-    State('sel-interp', 'value'),
+    State('sel-ais', 'value'), State('sel-land', 'value'),
+    State('sel-bathy', 'value'), State('sel-coast', 'value'),
+    State('sel-tide', 'value'),
+    State('sel-cb', 'value'), State('sel-interp', 'value'),
     prevent_initial_call=True,
 )
-def kick_filter(n, ais, bathy, coast, tide, formula, cb, interp):
-    if not n or not ais or not coast:
+def kick_filter(n, ais, land, bathy, coast, tide, cb, interp):
+    if not n or not ais or not land or not coast:
         return no_update, no_update, no_update
-    cfg = _build_config(ais, bathy, coast, tide, formula, cb, interp)
+    cfg = _build_config(ais, land, bathy, coast, tide, cb, interp)
     if _kick(cfg, ['filter'], 'filter'):
         return False, True, True
     return no_update, no_update, no_update
@@ -1024,22 +1059,22 @@ def kick_filter(n, ais, bathy, coast, tide, formula, cb, interp):
     Output('btn-filter', 'disabled', allow_duplicate=True),
     Output('btn-waves',  'disabled', allow_duplicate=True),
     Input('btn-waves', 'n_clicks'),
-    State('sel-ais', 'value'), State('sel-bathy', 'value'),
-    State('sel-coast', 'value'), State('sel-tide', 'value'),
-    State('sel-formula', 'value'), State('sel-cb', 'value'),
-    State('sel-interp', 'value'),
+    State('sel-ais', 'value'), State('sel-land', 'value'),
+    State('sel-bathy', 'value'), State('sel-coast', 'value'),
+    State('sel-tide', 'value'),
+    State('sel-cb', 'value'), State('sel-interp', 'value'),
     prevent_initial_call=True,
 )
-def kick_waves(n, ais, bathy, coast, tide, formula, cb, interp):
+def kick_waves(n, ais, land, bathy, coast, tide, cb, interp):
     """Run depth+vessel+wave_impact.
 
     The worker checks (in order): in-memory LAST_RESULTS['df_filtered'],
-    then disk-cached `{stem}_01_filtered.csv` newer than the AIS file,
+    then disk-cached ``{stem}_01_filtered.csv`` newer than the AIS file,
     then falls back to running filter first.
     """
-    if not n or not ais or not coast or not bathy:
+    if not n or not ais or not land or not coast or not bathy:
         return no_update, no_update, no_update
-    cfg = _build_config(ais, bathy, coast, tide, formula, cb, interp)
+    cfg = _build_config(ais, land, bathy, coast, tide, cb, interp)
     # Always request the wave stages — the worker decides whether to
     # prepend 'filter' based on cache freshness checks.
     if _kick(cfg, ['depth', 'vessel', 'wave_impact'], 'waves'):
@@ -1108,31 +1143,24 @@ def tick(_, prev_wave_v, prev_track_v):
 
 
 # ---------------------------------------------------------------------------
-# Preview callbacks: bathy / coast / tide listen to dropdown + tickbox + refresh.
-# The refresh button bumps a `nonce`, so even if the dropdown value is unchanged
-# the Store data changes and the clientside callback fires (fixes the "clicking
-# the already-selected dropdown option does nothing" UX).
+# Preview callbacks: bathy / coast / tide listen to dropdown + tickbox.
 # ---------------------------------------------------------------------------
-def _make_pv_callback(store_id, sel_id, pv_id, refresh_id):
+def _make_pv_callback(store_id, sel_id, pv_id):
     @app.callback(
         Output(store_id, 'data'),
         Input(sel_id, 'value'),
         Input(pv_id, 'value'),
-        Input(refresh_id, 'n_clicks'),
-        State(store_id, 'data'),
         prevent_initial_call=False,
     )
-    def _pv(path, pv_val, refresh_n, prev):
-        prev_nonce = (prev or {}).get('nonce', 0)
-        # Bump nonce on any refresh-button click so the clientside re-fetches.
-        nonce = (refresh_n or 0) + prev_nonce * 0  # use refresh_n directly
-        return {'visible': bool(pv_val), 'path': path, 'nonce': refresh_n or 0}
+    def _pv(path, pv_val):
+        return {'visible': bool(pv_val), 'path': path}
     return _pv
 
 
-_make_pv_callback('_pv_bathy', 'sel-bathy', 'pv-bathy', 'btn-pv-bathy-refresh')
-_make_pv_callback('_pv_coast', 'sel-coast', 'pv-coast', 'btn-pv-coast-refresh')
-_make_pv_callback('_pv_tide',  'sel-tide',  'pv-tide',  'btn-pv-tide-refresh')
+_make_pv_callback('_pv_bathy', 'sel-bathy', 'pv-bathy')
+_make_pv_callback('_pv_coast', 'sel-coast', 'pv-coast')
+_make_pv_callback('_pv_land',  'sel-land',  'pv-land')
+_make_pv_callback('_pv_tide',  'sel-tide',  'pv-tide')
 
 
 # AIS preview tickbox is decoupled from the dropdown — it just toggles
@@ -1322,11 +1350,19 @@ function(n) {
         let tSeg  = new Int32Array(0);
         let tN    = new Int32Array(0);
         let segLookup = new Map();
+        let pointSog = new Float32Array(0);
+        let pointCog = new Float32Array(0);
+        let pointTime = new BigInt64Array(0);  // obstime as ns-since-epoch
+
         const initTrackArrays = (cT, mT, oT) => {
             const cLon = cT.getChild('lon').toArray();
             const cLat = cT.getChild('lat').toArray();
             cPos = new Float32Array(cLon.length * 2);
             for (let i = 0; i < cLon.length; i++) { cPos[i*2]=cLon[i]; cPos[i*2+1]=cLat[i]; }
+            // Per-point attributes for debug tooltip
+            pointSog  = cT.getChild('sog')     ? cT.getChild('sog').toArray()     : new Float32Array(cLon.length);
+            pointCog  = cT.getChild('cog')     ? cT.getChild('cog').toArray()     : new Float32Array(cLon.length);
+            pointTime = cT.getChild('obstime') ? cT.getChild('obstime').toArray() : new BigInt64Array(cLon.length);
             startIndices = oT.getChild('offset').toArray();
             tMMSI = mT.getChild('mmsi').toArray();
             tSeg  = mT.getChild('segment_id').toArray();
@@ -1449,13 +1485,26 @@ function(n) {
                         getLineColor: [255, 255, 255, 240],
                         lineWidthMinPixels: 1,
                         onHover: ({x, y, index}) => {
-                            if (index < 0) { hideTip(); return; }
+                            if (index < 0) {
+                                hideTip();
+                                document.getElementById('click-info').textContent = '';
+                                return;
+                            }
                             const lon = segCoords[index*2];
                             const lat = segCoords[index*2+1];
+                            const globalIdx = segStart + index;
+                            const timeNs = pointTime[globalIdx] != null ? Number(pointTime[globalIdx]) : NaN;
+                            const dt = isNaN(timeNs) ? '?' : new Date(timeNs / 1e6).toISOString().replace('T', ' ').slice(0, 19);
+                            const sogVal = pointSog[globalIdx] != null ? pointSog[globalIdx].toFixed(1) : '?';
+                            const cogVal = pointCog[globalIdx] != null ? pointCog[globalIdx].toFixed(0) : '?';
+                            document.getElementById('click-info').textContent =
+                                `POINT ${index}/${segEnd - segStart - 1} | MMSI ${df.mmsi} seg ${df.segment_id} | ${dt} | SOG ${sogVal} kn COG ${cogVal}°`;
                             showTip(x, y,
                                 `<b>POINT ${index}/${segEnd - segStart - 1}</b><br>` +
                                 `MMSI ${df.mmsi}  seg ${df.segment_id}<br>` +
-                                `lon: ${lon.toFixed(6)}<br>lat: ${lat.toFixed(6)}`);
+                                `${dt}<br>` +
+                                `SOG: ${sogVal} kn  COG: ${cogVal}°<br>` +
+                                `lon: ${lon.toFixed(6)}  lat: ${lat.toFixed(6)}`);
                         },
                     }));
                 }
@@ -1572,7 +1621,22 @@ function(n) {
                             attributes: { getPosition: { value: pv.ais.pos, size: 2 } } },
                     getRadius: 3, radiusUnits: 'pixels', radiusMinPixels: 1,
                     getFillColor: [50, 150, 255, 200],
-                    pickable: false,
+                    pickable: true,
+                    onHover: ({x, y, index}) => {
+                        if (index < 0) { hideTip(); return; }
+                        const timeNs = pv.ais.obstimeNs && pv.ais.obstimeNs[index] != null ? Number(pv.ais.obstimeNs[index]) : NaN;
+                        let dt = '?';
+                        try { if (!isNaN(timeNs)) dt = new Date(timeNs / 1e6).toISOString().replace('T', ' ').slice(0, 19); } catch (_) {}
+                        const s = pv.ais.sog    ? pv.ais.sog[index]    : null;
+                        const c = pv.ais.cog    ? pv.ais.cog[index]    : null;
+                        const lon = pv.ais.pos[index*2];
+                        const lat = pv.ais.pos[index*2+1];
+                        showTip(x, y,
+                            `<b>AIS #${index.toLocaleString()}</b><br>` +
+                            `SOG: ${s != null ? s.toFixed(1) : '?'} kn  COG: ${c != null ? c.toFixed(0) : '?'}°<br>` +
+                            `${dt}<br>` +
+                            `lon: ${lon.toFixed(6)}  lat: ${lat.toFixed(6)}`);
+                    },
                 }));
             }
             return layers;
@@ -1658,7 +1722,11 @@ function(n) {
                 const lat = t.getChild('latitude').toArray();
                 const pos = new Float32Array(lon.length * 2);
                 for (let i = 0; i < lon.length; i++) { pos[i*2]=lon[i]; pos[i*2+1]=lat[i]; }
-                window.__previews.ais = { pos, visible: true };
+                const pvSog  = t.getChild('sog')     ? t.getChild('sog').toArray()     : new Float32Array(lon.length);
+                const pvCog  = t.getChild('cog')     ? t.getChild('cog').toArray()     : new Float32Array(lon.length);
+                const pvTime = t.getChild('obstime_ns') ? t.getChild('obstime_ns').toArray() : new BigInt64Array(lon.length);
+                window.__previews.ais = { pos, visible: true,
+                    sog: pvSog, cog: pvCog, obstimeNs: pvTime };
                 window.__importedAisPath = path;
                 try {
                     const bb = await fetch('/api/preview/ais.bbox?path=' + encodeURIComponent(path)).then(r => r.json());
@@ -1675,7 +1743,14 @@ function(n) {
                 await waitForPaint();
                 setRenderStatus(`AIS ready (${lon.length.toLocaleString()} points)`, true);
                 clearRenderStatus(1500);
-                return `imported ${lon.length.toLocaleString()} points`;
+                let report = `imported ${lon.length.toLocaleString()} points`;
+                try {
+                    const meta = await fetch('/api/preview/ais.bbox?path=' + encodeURIComponent(path)).then(r => r.json());
+                    if (meta.time_min) {
+                        report += `\ntime: ${meta.time_min}  →  ${meta.time_max}`;
+                    }
+                } catch (e) { /* nonfatal */ }
+                return report;
             } catch (e) {
                 clearRenderStatus(0);
                 return 'ERROR: ' + e.message;
@@ -1866,6 +1941,7 @@ async function(state) {
 _make_preview_clientside('_pv_ais',   'pv-ais-info',   '__setPreviewAis')
 _make_preview_clientside('_pv_bathy', 'pv-bathy-info', '__setPreviewBathy')
 _make_preview_clientside('_pv_coast', 'pv-coast-info', '__setPreviewCoast')
+_make_preview_clientside('_pv_land',  'pv-land-info',  '__setPreviewCoast')
 _make_preview_clientside('_pv_tide',  'pv-tide-info',  '__setPreviewTide')
 
 
