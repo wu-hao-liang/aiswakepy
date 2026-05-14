@@ -11,16 +11,37 @@ from pydantic import BaseModel, field_validator, model_validator
 
 class AisConfig(BaseModel):
     raw_csv: str
-    min_speed_knots: float = 0.5
+    # Shapefile used to mask out AIS points on land (separate from the coastline
+    # shapefile used for wave-impact shore intersection).
+    land_shp: str
+    min_speed_knots: float = 0.0
     traj_gap_s: float = 180.0
     max_velocity_knots: float = 36.0
     max_acceleration_ms2: float = 10.0
     max_draught_to_width: float = 1.0
     interp_interval_s: float = 30.0
+    # Threshold (m/s) below which a vessel is considered stationary / low-speed.
+    # Used by the mixed interpolation method (linear when both endpoints below
+    # this value) and by the kinematic error-coord check (extra flag when both
+    # endpoints are low-speed but the computed displacement speed exceeds
+    # 2× this threshold).
+    low_sog_threshold_ms: float = 1.0
+    # Velocity-consistency ratio for error-coord detection.  A consecutive pair
+    # (i, i+1) is flagged when the displacement-derived speed exceeds
+    # ``velocity_ratio_threshold`` × the average of the two reported SOG values.
+    # Default 2.0 means "positions moved more than twice as fast as the AIS
+    # transponder claims".  Lower values are more aggressive; 2.0 is conservative.
+    velocity_ratio_threshold: float = 2.0
+    # Speed-consistency ratio for clean_error_speed.  A consecutive pair (i,i+1)
+    # is flagged when the position-derived speed (dl/dt) is less than
+    # ``speed_consistency_ratio`` × the magnitude of the vector-averaged AIS
+    # velocity ((v_i+v_{i+1})/2).  Default 0.5 means "positions moved at less
+    # than half the speed the transponder claims" → SOG/COG is likely erroneous.
+    speed_consistency_ratio: float = 0.5
     # "linear": straight-line between consecutive raw points (default; conservative,
     # no overshoot). "hermite": CubicHermiteSpline using SOG/COG as velocity
     # constraints (smoother, but can produce spikes near noisy SOG/COG values).
-    interp_method: Literal["linear", "hermite"] = "linear"
+    interp_method: Literal["linear", "hermite", "mixed"] = "linear"
     study_area_shp: str | None = None
 
 

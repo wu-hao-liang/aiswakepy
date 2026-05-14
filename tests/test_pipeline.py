@@ -47,10 +47,13 @@ def _make_bathy_stub(depth_value: float = 15.0):
 
 def _make_config(tmp_path: Path, ais_path: Path, shp_path: Path) -> dict:
     return {
-        "ais": {"raw_csv": str(ais_path), "interp_trigger_m": 200},
+        "ais": {
+            "raw_csv": str(ais_path),
+            "land_shp": str(shp_path),  # land mask (separate from coastline)
+        },
         "vessel": {"cb_method": "L_Le"},
         "bathymetry": {"source": "dummy.mesh"},
-        "coastline": {"shapefile": str(shp_path)},
+        "coastline": {"shapefile": str(shp_path)},  # wave-impact shore intersection
         "wave": {"gravity": 9.78},
         "impact": {"max_propagation_m": 5000.0, "wake_cutoff_m": 0.001},
         "output": {

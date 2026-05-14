@@ -60,14 +60,19 @@ def run_pipeline(
         t0 = time.perf_counter()
         results["df_filtered"] = filter_ais(
             csv_path=config.ais.raw_csv,
+            land_shp=config.ais.land_shp,
             coastline_shp=config.coastline.shapefile,
             gap_s=config.ais.traj_gap_s,
             max_velocity_knots=config.ais.max_velocity_knots,
             max_acceleration_ms2=config.ais.max_acceleration_ms2,
             interval_s=config.ais.interp_interval_s,
             max_draught_to_width=config.ais.max_draught_to_width,
+            min_speed_knots=config.ais.min_speed_knots,
             study_area_shp=config.ais.study_area_shp,
             interp_method=config.ais.interp_method,
+            low_sog_threshold_ms=config.ais.low_sog_threshold_ms,
+            velocity_ratio_threshold=config.ais.velocity_ratio_threshold,
+            speed_consistency_ratio=config.ais.speed_consistency_ratio,
         )
         print(
             f"  \u2192 {len(results['df_filtered'])} rows after filtering "

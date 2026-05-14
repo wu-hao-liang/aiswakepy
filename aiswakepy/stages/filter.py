@@ -1,18 +1,22 @@
 """Stage 1 — AIS filtering and interpolation.
 
-Pipeline:
- 1. load_ais                — read CSV, parse timestamps, retain required columns
- 2. deduplicate             — drop exact (mmsi, obstime) duplicates
- 3. uniformize_vessel_info  — set width/length/typecargo to mode per MMSI
- 4. remove_zero_dimensions  — drop rows where width/length/draught <= 0
- 5. remove_invalid_draught  — drop rows where draught > width (implausible)
- 6. segment_trajectories    — time-gap-based segmentation (default 180 s)
- 7. clean_error_coords      — Kinematic Consistency Check: remove GPS spikes
- 8. clean_error_speed       — Acceleration Check: replace erroneous SOG/COG
- 9. validate_speed          — secondary cap: SOG = min(reported, geodetic-derived)
-10. interpolate_trajectories — Cubic Hermite Spline at fixed time intervals
-11. filter_study_area       — optional: keep only points inside a polygon
-12. mask_land               — remove points inside coastline polygon
+Pipeline (execution order):
+ 1. load_ais                     — read CSV, parse timestamps, retain required columns
+ 2. deduplicate                  — drop exact (mmsi, obstime) duplicates
+ 3. uniformize_vessel_info       — set width/length/typecargo to mode per MMSI
+ 4. remove_zero_dimensions       — drop rows where width/length/draught <= 0
+ 5. remove_invalid_draught       — drop rows where draught > width (implausible)
+ 6. mask_land ×2                 — remove raw points on land (before segmentation)
+ 7. segment_trajectories         — time-gap-based segmentation of surviving points
+ 8. clean_error_coords           — Kinematic Consistency Check (per segment)
+ 9. clean_error_speed            — Acceleration + speed-consistency check (per segment)
+10. filter_low_speed             — strip rows with SOG < min_speed_knots
+11. segment_trajectories (re-run) — re-segment after low-speed point removal
+12. interpolate_trajectories     — straight-line / Hermite / mixed to uniform grid
+13a. mask_land (land)            — drop post-interpolation land points
+13b. mask_land (coastline)       — drop points inside coastline
+13c. segment_trajectories        — re-segment after land point removal
+14. filter_study_area            — optional: keep only points inside a polygon
 """
 
 from __future__ import annotations
@@ -23,8 +27,6 @@ import geopandas as gpd
 import numpy as np
 import pandas as pd
 from scipy.interpolate import CubicHermiteSpline
-from shapely.ops import unary_union
-
 from aiswakepy.geo.geodesy import forward_point, geodetic_distance
 
 _KNOTS_TO_MS = 0.5144444   # 1 knot in m/s
@@ -155,20 +157,53 @@ def remove_invalid_draught(
 
 
 # ---------------------------------------------------------------------------
-# 6. Segment trajectories
+# 10. Low-speed filter
 # ---------------------------------------------------------------------------
 
-def segment_trajectories(df: pd.DataFrame, gap_s: float = 180.0) -> pd.DataFrame:
+def filter_low_speed(
+    df: pd.DataFrame,
+    min_speed_knots: float = 0.0,
+) -> pd.DataFrame:
+    """Remove rows where SOG is below ``min_speed_knots``.
+
+    Vessels that are berthed, anchored, or drifting produce negligible wake.
+    This step runs early (before segmentation) to strip those rows cheaply.
+    """
+    from aiswakepy._progress import Spinner
+    spinner = Spinner(desc="filter_low_speed")
+    mask = df["sog"] >= min_speed_knots
+    result = df[mask].reset_index(drop=True)
+    spinner.done(rows=len(result))
+    return result
+
+
+# ---------------------------------------------------------------------------
+# 7. Segment trajectories
+# ---------------------------------------------------------------------------
+
+def segment_trajectories(df: pd.DataFrame, gap_s: float = 180.0,
+                         use_force_break: bool = False) -> pd.DataFrame:
     """Sort by mmsi + obstime and assign integer segment_id.
 
     A new segment starts when the time gap to the previous fix of the same
-    vessel exceeds ``gap_s`` seconds (default 180 s).
+    vessel exceeds ``gap_s`` seconds (default 180 s), or when crossing to
+    a different MMSI.
+
+    If ``use_force_break`` is True and the DataFrame has a ``_force_break``
+    column, any row with ``_force_break=True`` also starts a new segment
+    (regardless of time gap).  ``mask_land`` sets these flags when it
+    removes land points, so the trajectory is split at land crossings.
+
+    Safe to call multiple times — completely re-assigns segment_ids from
+    scratch based on the current row order.
     """
     from aiswakepy._progress import Spinner
     spinner = Spinner(desc="segment_trajectories")
     df = df.sort_values(["mmsi", "obstime"]).copy()
     dt = df.groupby("mmsi")["obstime"].diff().dt.total_seconds().fillna(gap_s + 1)
     new_seg = (dt > gap_s) | (df["mmsi"] != df["mmsi"].shift(1))
+    if use_force_break and "_force_break" in df.columns:
+        new_seg = new_seg | df["_force_break"].to_numpy(dtype=bool)
     df["segment_id"] = new_seg.cumsum().astype(int)
     result = df.reset_index(drop=True)
     spinner.done(rows=len(result))
@@ -176,20 +211,31 @@ def segment_trajectories(df: pd.DataFrame, gap_s: float = 180.0) -> pd.DataFrame
 
 
 # ---------------------------------------------------------------------------
-# 7. Error coordinate cleaning — Kinematic Consistency Check
+# 8. Error coordinate cleaning — Kinematic Consistency Check
 # ---------------------------------------------------------------------------
 
 def clean_error_coords(
     df: pd.DataFrame,
     max_velocity_knots: float = 36.0,
+    low_sog_threshold_ms: float = 1.0,
+    velocity_ratio_threshold: float = 2.0,
 ) -> pd.DataFrame:
     """Remove GPS spike points using a Kinematic Consistency Check.
 
     Algorithm
     ---------
     For each consecutive pair (i, i+1) within a segment, compute average speed.
-    If average speed > ``max_velocity_knots``, flag both endpoints as suspicious
-    (+1 flag each). After all pairs are checked, resolve by flag count:
+    A pair is flagged when:
+
+    * average speed > ``max_velocity_knots`` (hard speed cap), OR
+    * both endpoints report SOG < ``low_sog_threshold_ms`` (nominally stationary)
+      but the computed displacement speed exceeds 2× that threshold — this
+      catches GPS position spikes that would otherwise pass the speed cap.
+    * the displacement speed exceeds ``velocity_ratio_threshold`` × the
+      average of the two reported SOG values — the positions moved far
+      faster than the transponder claims, indicating a coordinate spike.
+
+    After all pairs are checked, resolve by flag count:
 
     - Flag 2  : point is the GPS spike (both adjacent segments are too fast) → remove.
     - Flag 1, neighbour has flag 2 : point is clean (neighbour was the spike) → keep.
@@ -204,11 +250,16 @@ def clean_error_coords(
     """
     from aiswakepy._progress import Spinner
     max_velocity_ms = max_velocity_knots * _KNOTS_TO_MS
+    spike_speed_ms = 2.0 * low_sog_threshold_ms  # e.g. 2 m/s when threshold is 1 m/s
     keep_mask = np.ones(len(df), dtype=bool)
-    idx_arr = df.index.to_numpy()
+
+    # Group by MMSI — this runs before segment_trajectories, so segment_id may
+    # not exist yet. MMSI-level grouping gives the same kinematic isolation.
+    grouping = df.groupby("mmsi", sort=False) if "segment_id" not in df.columns \
+               else df.groupby("segment_id", sort=False)
 
     spinner = Spinner(desc="clean_error_coords")
-    for _si, (seg_id, seg_df) in enumerate(df.groupby("segment_id", sort=False)):
+    for _si, (_, seg_df) in enumerate(grouping):
         spinner.update(_si + 1)
         if len(seg_df) < 2:
             continue
@@ -233,7 +284,26 @@ def clean_error_coords(
         dt_safe = np.where(dt > 0, dt, np.finfo(float).eps)
         avg_speed = dl / dt_safe  # m/s
 
+        # Primary check: raw speed cap
         fast = avg_speed > max_velocity_ms
+
+        # Secondary check: low-SOG GPS spikes.
+        # Both endpoints report near-zero speed, but the positions moved
+        # significantly — the GPS coordinate is a spike, not real motion.
+        sog_arr = seg_df["sog"].to_numpy(dtype=float)
+        sog_arr_ms = sog_arr * _KNOTS_TO_MS
+        low_sog_pair = (sog_arr_ms[:-1] < low_sog_threshold_ms) & \
+                       (sog_arr_ms[1:]  < low_sog_threshold_ms)
+        fast = fast | (low_sog_pair & (avg_speed > spike_speed_ms))
+
+        # Tertiary check: velocity-consistency ratio.
+        # If the positions moved more than velocity_ratio_threshold × faster
+        # than the average of the two reported SOG values, the coordinate is
+        # likely a GPS spike that the speed cap and low-SOG checks missed.
+        sog_avg_ms = 0.5 * (sog_arr_ms[:-1] + sog_arr_ms[1:])
+        sog_avg_safe = np.maximum(sog_avg_ms, 1e-3)  # avoid /0
+        fast = fast | ((avg_speed / sog_avg_safe) > velocity_ratio_threshold)
+
         flags[:-1] += fast.astype(int)
         flags[1:] += fast.astype(int)
 
@@ -334,24 +404,33 @@ def clean_error_coords(
 
 
 # ---------------------------------------------------------------------------
-# 8. Error speed cleaning — Acceleration Check
+# 9. Error speed cleaning — Acceleration + speed-consistency check
 # ---------------------------------------------------------------------------
 
 def clean_error_speed(
     df: pd.DataFrame,
     max_acceleration_ms2: float = 10.0,
+    speed_consistency_ratio: float = 0.5,
 ) -> pd.DataFrame:
-    """Replace erroneous SOG/COG using an Acceleration Check.
+    """Replace erroneous SOG/COG using an Acceleration Check and a speed-
+    consistency check.
 
     Must be called after ``clean_error_coords`` (GPS spikes removed first).
 
-    For each point, the AIS-reported velocity (from SOG/COG) is compared to the
-    velocity implied by adjacent point positions.  The acceleration required to
-    transition from the AIS velocity to the segment-average velocity within half
-    the time interval is computed.  If |acceleration| exceeds
-    ``max_acceleration_ms2`` in either the x or y direction, the point's SOG/COG
-    is replaced with the distance-weighted average of the adjacent finite-difference
-    velocities.
+    Two independent checks flag a point for SOG/COG replacement:
+
+    1. **Acceleration check**: if the AIS-reported velocity (SOG/COG) requires
+       acceleration exceeding ``max_acceleration_ms2`` to match the segment-
+       average velocity within half the time interval, the point is flagged.
+
+    2. **Speed-consistency check**: for each consecutive pair (i, i+1), if the
+       position-derived speed (dl/dt) is less than ``speed_consistency_ratio`` ×
+       the magnitude of the vector-averaged AIS velocity, both endpoints are
+       flagged.  This catches cases where AIS reports movement (SOG ≫ 0) but
+       the GPS positions show near-stationary — the SOG/COG is unreliable.
+
+    Flagged points get their SOG/COG replaced with the distance-weighted
+    average of adjacent segment velocities.
     """
     from aiswakepy._progress import Spinner
     df = df.copy()
@@ -359,8 +438,11 @@ def clean_error_speed(
     cog_arr = df["cog"].to_numpy(dtype=float).copy()
     _eps = np.finfo(float).eps
 
+    grouping = df.groupby("mmsi", sort=False) if "segment_id" not in df.columns \
+               else df.groupby("segment_id", sort=False)
+
     spinner = Spinner(desc="clean_error_speed")
-    for _si, (seg_id, seg_df) in enumerate(df.groupby("segment_id", sort=False)):
+    for _si, (_, seg_df) in enumerate(grouping):
         spinner.update(_si + 1)
         n = len(seg_df)
         if n < 2:
@@ -403,6 +485,19 @@ def clean_error_speed(
         bad[:-1] |= bad_fwd
         bad[1:]  |= bad_bwd
 
+        # ---- Speed-consistency check ----
+        # For each pair (i, i+1): if dl/dt ≪ |v_i + v_{i+1}| / 2,
+        # the positions say the vessel is near-stationary but the AIS
+        # transponder claims it is moving — the SOG/COG is suspect.
+        dl_pair = np.sqrt(dx**2 + dy**2)        # distance per pair (m)
+        dist_speed = dl_pair / dt_safe          # speed from positions (m/s)
+        vx_avg = 0.5 * (vx_ais[:-1] + vx_ais[1:])
+        vy_avg = 0.5 * (vy_ais[:-1] + vy_ais[1:])
+        vec_avg_mag = np.sqrt(vx_avg**2 + vy_avg**2)  # |(v_i+v_{i+1})/2|
+        inconsistent = dist_speed < (speed_consistency_ratio * vec_avg_mag)
+        bad[:-1] |= inconsistent
+        bad[1:]  |= inconsistent
+
         if not bad.any():
             continue
 
@@ -434,57 +529,14 @@ def clean_error_speed(
 
 
 # ---------------------------------------------------------------------------
-# 9. Speed validation (secondary cap)
-# ---------------------------------------------------------------------------
-
-def validate_speed(df: pd.DataFrame) -> pd.DataFrame:
-    """Secondary cap: SOG = min(reported, geodetic-derived) within each segment.
-
-    After ``clean_error_speed`` the reported SOG/COG should already be consistent
-    with the trajectory. This step acts as a final safety net by capping the
-    reported SOG at the geodetically-computed speed between consecutive fixes.
-    """
-    from aiswakepy._progress import Spinner
-    spinner = Spinner(desc="validate_speed")
-    df = df.copy()
-
-    lons = df["longitude"].to_numpy()
-    lats = df["latitude"].to_numpy()
-    times = df["obstime"].to_numpy()
-    segs = df["segment_id"].to_numpy()
-
-    n = len(df)
-    v_calc = np.full(n, np.nan)
-    dist_m = np.full(n, np.nan)
-
-    same_seg = np.zeros(n, dtype=bool)
-    same_seg[1:] = segs[1:] == segs[:-1]
-    idx = np.where(same_seg)[0]
-    if len(idx):
-        d = geodetic_distance(lons[idx - 1], lats[idx - 1], lons[idx], lats[idx])
-        dt = (times[idx] - times[idx - 1]) / np.timedelta64(1, "s")
-        dist_m[idx] = d
-        valid_dt = dt > 0
-        v_calc[idx[valid_dt]] = d[valid_dt] / dt[valid_dt] / _KNOTS_TO_MS
-
-    sog = df["sog"].to_numpy(dtype=float).copy()
-    valid = ~np.isnan(v_calc)
-    sog[valid] = np.minimum(sog[valid], v_calc[valid])
-
-    df["sog"] = sog
-    df["_dist_to_prev_m"] = dist_m
-    spinner.done(rows=len(df))
-    return df
-
-
-# ---------------------------------------------------------------------------
-# 10. Interpolation — Cubic Hermite Spline (time-based)
+# 12. Interpolation — linear / Hermite / mixed (time-based)
 # ---------------------------------------------------------------------------
 
 def interpolate_trajectories(
     df: pd.DataFrame,
     interval_s: float = 30.0,
     method: str = "linear",
+    low_sog_threshold_ms: float = 1.0,
 ) -> pd.DataFrame:
     """Interpolate each trajectory segment to a uniform time grid.
 
@@ -493,25 +545,31 @@ def interpolate_trajectories(
     df : input vessel positions with columns: mmsi, segment_id, obstime,
         longitude, latitude, sog, cog, width, length, draught, typecargo.
     interval_s : output time spacing in seconds.
-    method : either ``"linear"`` (straight-line interpolation between consecutive
-        raw points; SOG and COG derived from each segment's constant velocity)
-        or ``"hermite"`` (CubicHermiteSpline using SOG and COG as velocity
-        constraints; smoother but can overshoot near noisy SOG/COG values).
+    method : ``"linear"``, ``"hermite"``, or ``"mixed"``.
+        Position interpolation (lon, lat) follows the chosen method.  SOG/COG
+        are always linearly interpolated as vectors between the two raw
+        endpoints (SOG via np.interp; COG via sin/cos circular mean) in all
+        three methods — this avoids segment-velocity collapse and spline
+        overshoot contaminating the speed columns.
+        - ``"linear"``: straight-line between consecutive raw points.
+        - ``"hermite"``: CubicHermiteSpline with SOG/COG as velocity constraints.
+        - ``"mixed"``: per-bracket hybrid — linear when BOTH endpoints have
+          SOG < ``low_sog_threshold_ms`` (both stationary), else hermite.
+    low_sog_threshold_ms : speed threshold (m/s) for ``"mixed"`` method.
+        Default 1.0 m/s (≈ 2 knots).
 
-    For each segment with >= 2 points the chosen interpolant is evaluated at
-    uniform ``interval_s`` intervals.  Draught is nearest-neighbour in time
-    (not interpolated).  Segments with only 1 point pass through unchanged.
+    For each segment with >= 2 points, interpolation is done per-bracket
+    (between consecutive raw points) using ``np.linspace`` so that every
+    surviving raw point is reproduced exactly.  Intermediate points are
+    evenly distributed across each bracket.  Draught is nearest-neighbour
+    in time (not interpolated).  Segments with 1 point pass through unchanged.
     """
     method = (method or "linear").lower()
-    if method not in ("linear", "hermite"):
+    if method not in ("linear", "hermite", "mixed"):
         raise ValueError(f"interpolate_trajectories: unknown method {method!r}; "
-                         "expected 'linear' or 'hermite'")
+                         "expected 'linear', 'hermite', or 'mixed'")
     if df.empty:
         return df
-
-    # Drop internal column not needed downstream
-    if "_dist_to_prev_m" in df.columns:
-        df = df.drop(columns=["_dist_to_prev_m"])
 
     # Sort by segment_id so rows are contiguous per segment
     df = df.sort_values("segment_id").reset_index(drop=True)
@@ -543,6 +601,48 @@ def interpolate_trajectories(
         "longitude", "latitude", "sog", "cog", "typecargo", "segment_id",
     )}
 
+    # ---- Helper: bracket-based interpolation for one segment ----
+    def _bracket_times(t_s, interval_s):
+        """Return list of evenly-spaced time arrays per bracket.
+
+        Every raw point time t_s[i] appears exactly once in the concatenated
+        result.  Intermediate points are distributed evenly across each bracket
+        so the spacing is as close to ``interval_s`` as the bracket length allows.
+        """
+        parts = []
+        for i in range(len(t_s) - 1):
+            ta, tb = t_s[i], t_s[i + 1]
+            n_step = max(1, int((tb - ta) / interval_s))
+            ti = np.linspace(ta, tb, n_step + 1)          # includes both endpoints
+            if i > 0:
+                ti = ti[1:]                                # drop duplicate raw point
+            parts.append(ti)
+        return parts
+
+    def _build_output(t_interp, x_interp, y_interp, sog_interp, cog_interp,
+                      t_ns0, sid, draught_arr, t_s):
+        """Append a per-segment output block to ``out``."""
+        ni = len(t_interp)
+        lon_i = x_interp / _DEG_TO_M
+        lat_i = y_interp / _DEG_TO_M
+        dr_idx = np.searchsorted(t_s, t_interp).clip(1, len(t_s) - 1)
+        left_dist  = np.abs(t_interp - t_s[dr_idx - 1])
+        right_dist = np.abs(t_interp - t_s[dr_idx])
+        nearest    = np.where(left_dist <= right_dist, dr_idx - 1, dr_idx)
+        draught_i = draught_arr[nearest]
+        out["mmsi"].append(np.full(ni, mmsi_all[start]))
+        out["width"].append(np.full(ni, width_all[start]))
+        out["length"].append(np.full(ni, length_all[start]))
+        out["draught"].append(draught_i)
+        out["obstime_ns"].append(t_ns0 + (t_interp * 1e9).astype(np.int64))
+        out["longitude"].append(lon_i)
+        out["latitude"].append(lat_i)
+        out["sog"].append(sog_interp)
+        out["cog"].append(cog_interp)
+        out["typecargo"].append(np.full(ni, typecargo_all[start]))
+        out["segment_id"].append(np.full(ni, sid))
+
+    # ---- Per-segment loop ----
     for seg_i, (start, end) in enumerate(zip(seg_starts, seg_ends)):
         spinner.update(seg_i + 1)
         n   = int(end - start)
@@ -562,68 +662,59 @@ def interpolate_trajectories(
             out["segment_id"].append(np.full(n, sid))
             continue
 
-        t_ns = t_ns_all[start:end]
-        t_s  = (t_ns - t_ns[0]) / 1e9
-
+        t_ns_seg = t_ns_all[start:end]
+        t_s  = (t_ns_seg - t_ns_seg[0]) / 1e9
         x = lons_all[start:end] * _DEG_TO_M
         y = lats_all[start:end] * _DEG_TO_M
+        speed_ms   = sog_all[start:end] * _KNOTS_TO_MS
+        cog_rad_seg = np.radians(cog_all[start:end])
 
-        t_interp = np.arange(t_s[0], t_s[-1], interval_s, dtype=float)
-        if t_interp[-1] < t_s[-1]:
-            t_interp = np.append(t_interp, t_s[-1])
+        # Build per-bracket time arrays — every raw point guaranteed.
+        t_parts = _bracket_times(t_s, interval_s)
+        t_interp = np.concatenate(t_parts)
 
-        if method == "linear":
-            # Pure straight-line interpolation between consecutive raw points;
-            # SOG and COG come from each bracketing segment's constant velocity
-            # so the visible polyline and the kinematic fields stay consistent.
+        # SOG: linear scalar interpolation between raw endpoints.
+        sog_interp = np.interp(t_interp, t_s, sog_all[start:end])
+        # COG: sin/cos circular-mean interpolation.
+        cos_interp = np.interp(t_interp, t_s, np.cos(cog_rad_seg))
+        sin_interp = np.interp(t_interp, t_s, np.sin(cog_rad_seg))
+        cog_interp = (np.degrees(np.arctan2(sin_interp, cos_interp)) + 360.0) % 360.0
+
+        if method == "mixed":
+            # Per-bracket: hermite if both endpoint SOG ≥ threshold, else linear.
+            vx_ais = speed_ms * np.sin(cog_rad_seg)
+            vy_ais = speed_ms * np.cos(cog_rad_seg)
+            x_parts, y_parts = [], []
+            for i in range(n - 1):
+                ta, tb = t_s[i], t_s[i + 1]
+                ti = t_parts[i]
+                use_linear = (speed_ms[i] < low_sog_threshold_ms and
+                              speed_ms[i + 1] < low_sog_threshold_ms)
+                if use_linear:
+                    xi = np.interp(ti, t_s[i : i + 2], x[i : i + 2])
+                    yi = np.interp(ti, t_s[i : i + 2], y[i : i + 2])
+                else:
+                    xs = CubicHermiteSpline(t_s[i : i + 2], x[i : i + 2],
+                                            vx_ais[i : i + 2])
+                    ys = CubicHermiteSpline(t_s[i : i + 2], y[i : i + 2],
+                                            vy_ais[i : i + 2])
+                    xi = xs(ti, nu=0); yi = ys(ti, nu=0)
+                x_parts.append(xi); y_parts.append(yi)
+            x_interp = np.concatenate(x_parts) if x_parts else np.array([], dtype=float)
+            y_interp = np.concatenate(y_parts) if y_parts else np.array([], dtype=float)
+        elif method == "hermite":
+            vx = speed_ms * np.sin(cog_rad_seg)
+            vy = speed_ms * np.cos(cog_rad_seg)
+            xspline = CubicHermiteSpline(t_s, x, vx)
+            yspline = CubicHermiteSpline(t_s, y, vy)
+            x_interp = xspline(t_interp, nu=0)
+            y_interp = yspline(t_interp, nu=0)
+        else:  # linear
             x_interp = np.interp(t_interp, t_s, x)
             y_interp = np.interp(t_interp, t_s, y)
-            # idx[k] is the index of the right endpoint of the bracket containing t_interp[k]
-            idx = np.searchsorted(t_s, t_interp, side="right").clip(1, n - 1)
-            dt_seg = (t_s[idx] - t_s[idx - 1]).astype(float)
-            # Guard against zero-duration brackets (shouldn't happen post-dedupe).
-            dt_seg[dt_seg <= 0] = 1.0
-            dxdt_interp = (x[idx] - x[idx - 1]) / dt_seg
-            dydt_interp = (y[idx] - y[idx - 1]) / dt_seg
-        else:
-            # Cubic Hermite spline with SOG/COG as velocity constraints
-            speed_ms = sog_all[start:end] * _KNOTS_TO_MS
-            cog_rad  = np.radians(cog_all[start:end])
-            dxdt = speed_ms * np.sin(cog_rad)
-            dydt = speed_ms * np.cos(cog_rad)
-            xspline = CubicHermiteSpline(t_s, x, dxdt)
-            yspline = CubicHermiteSpline(t_s, y, dydt)
-            x_interp    = xspline(t_interp, nu=0)
-            dxdt_interp = xspline(t_interp, nu=1)
-            y_interp    = yspline(t_interp, nu=0)
-            dydt_interp = yspline(t_interp, nu=1)
 
-        speed_interp = np.sqrt(dxdt_interp**2 + dydt_interp**2)
-        sog_interp   = speed_interp / _KNOTS_TO_MS
-        cog_interp   = (np.degrees(np.arctan2(dxdt_interp, dydt_interp)) + 360.0) % 360.0
-
-        lon_interp = x_interp / _DEG_TO_M
-        lat_interp = y_interp / _DEG_TO_M
-
-        # Draught: nearest-neighbour via searchsorted — O(m log n) not O(m×n)
-        idx = np.searchsorted(t_s, t_interp).clip(1, n - 1)
-        left_dist  = np.abs(t_interp - t_s[idx - 1])
-        right_dist = np.abs(t_interp - t_s[idx])
-        nearest    = np.where(left_dist <= right_dist, idx - 1, idx)
-        draught_interp = draught_all[start:end][nearest]
-
-        ni = len(t_interp)
-        out["mmsi"].append(np.full(ni, mmsi_all[start]))
-        out["width"].append(np.full(ni, width_all[start]))
-        out["length"].append(np.full(ni, length_all[start]))
-        out["draught"].append(draught_interp)
-        out["obstime_ns"].append(t_ns[0] + (t_interp * 1e9).astype(np.int64))
-        out["longitude"].append(lon_interp)
-        out["latitude"].append(lat_interp)
-        out["sog"].append(sog_interp)
-        out["cog"].append(cog_interp)
-        out["typecargo"].append(np.full(ni, typecargo_all[start]))
-        out["segment_id"].append(np.full(ni, sid))
+        _build_output(t_interp, x_interp, y_interp, sog_interp, cog_interp,
+                      t_ns_seg[0], sid, draught_all[start:end], t_s)
 
     # Single DataFrame construction from concatenated numpy arrays
     result = pd.DataFrame({
@@ -644,7 +735,7 @@ def interpolate_trajectories(
 
 
 # ---------------------------------------------------------------------------
-# 11. Study-area polygon filter (optional)
+# 14. Study-area polygon filter (optional — runs last)
 # ---------------------------------------------------------------------------
 
 def filter_study_area(
@@ -661,67 +752,230 @@ def filter_study_area(
     from aiswakepy._progress import Spinner
     spinner = Spinner(desc="filter_study_area")
     study_area = gpd.read_file(str(polygon_shp))
-    region = unary_union(study_area.geometry)
-    points = gpd.GeoSeries(
-        gpd.points_from_xy(df["longitude"], df["latitude"]),
+    pts_gdf = gpd.GeoDataFrame(
+        geometry=gpd.points_from_xy(df["longitude"], df["latitude"]),
         crs="EPSG:4326",
     )
-    inside = points.within(region)
-    result = df[inside].reset_index(drop=True)
+    joined = gpd.sjoin(pts_gdf, study_area, predicate="within", how="left")
+    result = df[joined["index_right"].notna().to_numpy()].reset_index(drop=True)
     spinner.done(rows=len(result))
     return result
 
 
 # ---------------------------------------------------------------------------
-# 12. Land masking
+# 6. Land masking (pre-segmentation)
 # ---------------------------------------------------------------------------
 
-def mask_land(df: pd.DataFrame, coastline_shp: str | Path) -> pd.DataFrame:
-    """Remove AIS points that fall inside the coastline polygon."""
+def mask_land(df: pd.DataFrame, land_shp: str | Path,
+              track_breaks: bool = False) -> pd.DataFrame:
+    """Remove AIS points that fall inside the land polygon.
+
+    ``land_shp`` is a separate shapefile from the coastline used for
+    wave-impact shore intersection — this one defines the land area
+    to exclude AIS points from (e.g. Singapore main island, Jurong).
+
+    If ``track_breaks`` is True, a ``_force_break`` column is added:
+    the first surviving point after each removed land point is flagged
+    so that ``segment_trajectories`` can split the trajectory at land
+    crossings regardless of the time gap.
+
+    Uses ``gpd.sjoin`` with an R-tree spatial index (O(N log M)).
+    """
     from aiswakepy._progress import Spinner
     spinner = Spinner(desc="mask_land")
-    coast = gpd.read_file(coastline_shp)
-    land = unary_union(coast.geometry)
-    points = gpd.GeoSeries(
-        gpd.points_from_xy(df["longitude"], df["latitude"]),
+    land_gdf = gpd.read_file(land_shp)
+    if land_gdf.crs is None:
+        raise ValueError(
+            f"Land shapefile {land_shp!r} has no CRS.  Include a .prj file "
+            "defining the coordinate reference system as EPSG:4326 (WGS 84)."
+        )
+    if land_gdf.crs.to_epsg() != 4326:
+        land_gdf = land_gdf.to_crs("EPSG:4326")
+    # Sort so that adjacency after removal is meaningful.
+    df = df.sort_values(["mmsi", "obstime"]).reset_index(drop=True)
+    pts_gdf = gpd.GeoDataFrame(
+        geometry=gpd.points_from_xy(df["longitude"], df["latitude"]),
         crs="EPSG:4326",
     )
-    in_land = points.within(land)
+    joined = gpd.sjoin(pts_gdf, land_gdf, predicate="within", how="left")
+    in_land = joined["index_right"].notna().to_numpy()
+
+    if track_breaks:
+        # Flag the surviving point immediately after each land point.
+        force = np.zeros(len(df), dtype=bool)
+        force[1:] = in_land[:-1]
+        # Don't flag cross-MMSI adjacency.
+        mmsi_arr = df["mmsi"].to_numpy()
+        same_mmsi = np.zeros(len(df), dtype=bool)
+        same_mmsi[1:] = mmsi_arr[1:] == mmsi_arr[:-1]
+        force = force & same_mmsi
+        # Combine with any existing flags from a previous mask_land call.
+        if "_force_break" in df.columns:
+            force = force | df["_force_break"].to_numpy(dtype=bool)
+        df["_force_break"] = force
+
     result = df[~in_land].reset_index(drop=True)
     spinner.done(rows=len(result))
     return result
 
 
 # ---------------------------------------------------------------------------
-# 13. Orchestrator
+# 13. Post-interpolation land mask with segment splitting
+# ---------------------------------------------------------------------------
+
+def mask_land_and_split_segments(
+    df: pd.DataFrame,
+    land_shp: str | Path,
+) -> pd.DataFrame:
+    """Remove interpolated points that fall on land and split segments in two
+    where the crossing occurred.
+
+    Unlike ``mask_land`` (which simply drops inland rows), this function
+    runs *after* interpolation and preserves the segment structure on both
+    sides of the land crossing:
+
+    - Points at the start or end of a segment that fall on land are dropped
+      (the segment is trimmed).
+    - A run of land points in the middle of a segment splits it into two
+      sub-segments, each with a fresh ``segment_id``.  The land points
+      themselves are removed.
+    - Intact segments keep their structure (receiving a clean renumbered ID).
+
+    Single-point sub-segments and intact segments alike are preserved.
+    """
+    if df.empty:
+        return df
+
+    from aiswakepy._progress import Spinner
+    spinner = Spinner(desc="mask_land_post_interp")
+
+    land_gdf = gpd.read_file(str(land_shp))
+    if land_gdf.crs is None:
+        raise ValueError(
+            f"Land shapefile {land_shp!r} has no CRS.  Include a .prj file "
+            "defining the coordinate reference system as EPSG:4326 (WGS 84)."
+        )
+    if land_gdf.crs.to_epsg() != 4326:
+        land_gdf = land_gdf.to_crs("EPSG:4326")
+    pts_gdf = gpd.GeoDataFrame(
+        geometry=gpd.points_from_xy(df["longitude"], df["latitude"]),
+        crs="EPSG:4326",
+    )
+    joined = gpd.sjoin(pts_gdf, land_gdf, predicate="within", how="left")
+    in_land = joined["index_right"].notna().to_numpy()
+
+    keep_mask = np.ones(len(df), dtype=bool)
+    new_seg_ids = np.full(len(df), -1, dtype=np.int32)
+    next_seg_id = 1   # start from 1 — same convention as segment_trajectories
+
+    seg_arr = df["segment_id"].to_numpy()
+    for seg_id in sorted(df["segment_id"].unique()):
+        seg_mask = seg_arr == seg_id
+        seg_idx = np.where(seg_mask)[0]
+        n = len(seg_idx)
+        clean = ~in_land[seg_idx]
+
+        if clean.all():
+            new_seg_ids[seg_idx] = next_seg_id
+            next_seg_id += 1
+            continue
+
+        # Mark all land-falling points for removal first.
+        keep_mask[seg_idx[~clean]] = False
+
+        # Then carve the remaining clean runs into sub-segments.
+        padded = np.concatenate([[False], clean, [False]])
+        changes = np.diff(padded.astype(int))
+        starts = np.where(changes == 1)[0]
+        ends   = np.where(changes == -1)[0]
+
+        for s, e in zip(starts, ends):
+            new_seg_ids[seg_idx[s:e]] = next_seg_id
+            next_seg_id += 1
+
+    result = df[keep_mask].copy()
+    result["segment_id"] = new_seg_ids[keep_mask]
+    result = result.reset_index(drop=True)
+    spinner.done(rows=len(result))
+    return result
+
+
+# ---------------------------------------------------------------------------
+# 15. Orchestrator
 # ---------------------------------------------------------------------------
 
 def filter_ais(
     csv_path: str | Path,
+    land_shp: str | Path,
     coastline_shp: str | Path,
     gap_s: float = 180.0,
     max_velocity_knots: float = 36.0,
     max_acceleration_ms2: float = 10.0,
     interval_s: float = 30.0,
     max_draught_to_width: float = 1.0,
+    min_speed_knots: float = 0.0,
     study_area_shp: str | Path | None = None,
     interp_method: str = "linear",
+    low_sog_threshold_ms: float = 1.0,
+    velocity_ratio_threshold: float = 2.0,
+    speed_consistency_ratio: float = 0.5,
 ) -> pd.DataFrame:
     """Run the full AIS filtering pipeline and return a cleaned DataFrame.
 
-    ``interp_method`` is either ``"linear"`` (straight-line; default) or
-    ``"hermite"`` (CubicHermiteSpline with SOG/COG as velocity constraints).
+    ``interp_method`` is ``"linear"``, ``"hermite"``, or ``"mixed"``.
+
+    ``low_sog_threshold_ms`` feeds the kinematic error-coord check
+    and the mixed interpolation method.
+
+    ``velocity_ratio_threshold`` controls the velocity-consistency check in
+    error-coord detection.
+
+    Pipeline order (see module docstring for full list):
+    1-5.    Load, dedupe, uniformize, drop zero dims, drop invalid draught.
+    6.      ``mask_land`` ×2 — remove raw land points before segmentation.
+    7.      ``segment_trajectories`` — assign IDs to surviving points.
+    8-9.    Kinematic cleaning (per segment): coord errors, speed errors.
+    10.     ``filter_low_speed`` — strip SOG < min_speed_knots.
+    11.     ``segment_trajectories`` — re-segment after low-speed removal.
+    12.     ``interpolate_trajectories`` — uniform time-grid.
+    13a.    ``mask_land`` (land) — drop post-interpolation land points.
+    13b.    ``mask_land`` (coastline) — drop points inside coastline.
+    13c.    ``segment_trajectories`` — re-segment after land point removal.
+    14.     ``filter_study_area`` — optional polygon filter.
     """
     df = load_ais(csv_path)
     df = deduplicate(df)
     df = uniformize_vessel_info(df)
     df = remove_zero_dimensions(df)
     df = remove_invalid_draught(df, max_draught_to_width=max_draught_to_width)
+    # 6. Remove raw land points — before segmentation.
+    #    track_breaks=True → surviving points after a land gap get _force_break.
+    df = mask_land(df, land_shp, track_breaks=True)
+    df = mask_land(df, coastline_shp, track_breaks=True)
+    # 7. Segment with force-break flags so land crossings start new segments.
+    df = segment_trajectories(df, gap_s=gap_s, use_force_break=True)
+    # 8-9. Per-segment kinematic cleaning.
+    df = clean_error_coords(df, max_velocity_knots=max_velocity_knots,
+                            low_sog_threshold_ms=low_sog_threshold_ms,
+                            velocity_ratio_threshold=velocity_ratio_threshold)
+    df = clean_error_speed(df, max_acceleration_ms2=max_acceleration_ms2,
+                           speed_consistency_ratio=speed_consistency_ratio)
+    # 10. Strip rows whose final SOG is below min_speed_knots
+    # (clean_error_speed may have replaced SOG values).
+    df = filter_low_speed(df, min_speed_knots=min_speed_knots)
+    # 11. Re-segment after low-speed point removal — time-gap only (no
+    #     force-break: we want interpolation to work within each segment).
     df = segment_trajectories(df, gap_s=gap_s)
-    df = clean_error_coords(df, max_velocity_knots=max_velocity_knots)
-    df = clean_error_speed(df, max_acceleration_ms2=max_acceleration_ms2)
-    df = validate_speed(df)
-    df = interpolate_trajectories(df, interval_s=interval_s, method=interp_method)
+    # 12. Interpolation to uniform time grid.
+    df = interpolate_trajectories(df, interval_s=interval_s, method=interp_method,
+                                  low_sog_threshold_ms=low_sog_threshold_ms)
+    # 13. Post-interpolation land check — spline may have strayed onto land.
+    # 13a. Drop points on land and flag breaks.
+    df = mask_land(df, land_shp, track_breaks=True)
+    # 13b. Drop points inside coastline and flag breaks.
+    df = mask_land(df, coastline_shp, track_breaks=True)
+    # 13c. Re-segment with force-break flags.
+    df = segment_trajectories(df, gap_s=gap_s, use_force_break=True)
+    # 14. Study-area filter — optional, last.
     df = filter_study_area(df, polygon_shp=study_area_shp)
-    df = mask_land(df, coastline_shp)
     return df

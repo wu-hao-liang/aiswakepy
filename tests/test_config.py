@@ -10,7 +10,7 @@ from pydantic import ValidationError
 from aiswakepy.config import ShipwakeConfig, load_config
 
 _MINIMAL = {
-    "ais": {"raw_csv": "data/test.csv"},
+    "ais": {"raw_csv": "data/test.csv", "land_shp": "shp/land.shp"},
     "bathymetry": {"source": "bathy/test.mesh"},
     "coastline": {"shapefile": "shp/coast.shp"},
 }
@@ -38,7 +38,7 @@ def test_load_from_path_object(tmp_path: Path):
     p = tmp_path / "config.json"
     p.write_text(json.dumps(_MINIMAL))
     cfg = load_config(p)
-    assert cfg.ais.min_speed_knots == 0.5   # default
+    assert cfg.ais.min_speed_knots == 0.0   # default
 
 
 def test_defaults_applied():

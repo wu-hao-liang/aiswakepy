@@ -22,7 +22,6 @@ from aiswakepy.stages.filter import (
     remove_zero_dimensions,
     segment_trajectories,
     uniformize_vessel_info,
-    validate_speed,
 )
 
 # ---------------------------------------------------------------------------
@@ -296,32 +295,6 @@ def test_clean_speed_high_accel_replaced():
 
 
 # ---------------------------------------------------------------------------
-# validate_speed
-# ---------------------------------------------------------------------------
-
-def test_validate_speed_clamps():
-    rows = [
-        _base_row(lon=103.850000, lat=1.290000, sog=10.0, t="2024-01-01 00:00:00"),
-        _base_row(lon=103.850450, lat=1.290000, sog=10.0, t="2024-01-01 00:01:00"),
-    ]
-    df = _df_from_rows(rows)
-    df = segment_trajectories(df)
-    df = validate_speed(df)
-    assert df.iloc[1]["sog"] < 10.0
-
-
-def test_validate_speed_keeps_low_sog():
-    rows = [
-        _base_row(lon=103.850000, lat=1.290000, sog=5.0, t="2024-01-01 00:00:00"),
-        _base_row(lon=103.850900, lat=1.290000, sog=5.0, t="2024-01-01 00:00:10"),
-    ]
-    df = _df_from_rows(rows)
-    df = segment_trajectories(df)
-    df = validate_speed(df)
-    assert df.iloc[1]["sog"] == pytest.approx(5.0)
-
-
-# ---------------------------------------------------------------------------
 # interpolate_trajectories (Hermite spline)
 # ---------------------------------------------------------------------------
 
@@ -333,7 +306,6 @@ def test_interpolate_hermite_produces_points():
     ]
     df = _df_from_rows(rows)
     df = segment_trajectories(df, gap_s=600)
-    df = validate_speed(df)
     df_interp = interpolate_trajectories(df, interval_s=30.0)
     # 60s span at 30s → 3 points
     assert len(df_interp) >= 2
@@ -346,7 +318,6 @@ def test_interpolate_single_point_passthrough():
     rows = [_base_row(lon=103.85, lat=1.29, t="2024-01-01 00:00:00")]
     df = _df_from_rows(rows)
     df = segment_trajectories(df, gap_s=600)
-    df = validate_speed(df)
     df_interp = interpolate_trajectories(df, interval_s=30.0)
     assert len(df_interp) == 1
 
@@ -359,7 +330,6 @@ def test_interpolate_cog_in_range():
     ]
     df = _df_from_rows(rows)
     df = segment_trajectories(df, gap_s=600)
-    df = validate_speed(df)
     df_interp = interpolate_trajectories(df, interval_s=30.0)
     assert (df_interp["cog"] >= 0).all()
     assert (df_interp["cog"] < 360).all()
@@ -446,7 +416,7 @@ def test_filter_ais_integration(tmp_path):
     ])
     shp = _write_coast_shp(tmp_path, poly)
 
-    df = filter_ais(csv_path, shp, gap_s=600)
+    df = filter_ais(csv_path, shp, shp, gap_s=600)
     assert len(df) > 0
     # No output point should be inside the land polygon
     inside = (

@@ -1,6 +1,7 @@
 {
   "ais": {
     "raw_csv": "examples/ais/AIS_2563.csv",
+    "land_shp": "examples/coastline/proposed_WC_dissolved_v2_WGS84.shp",
     "min_speed_knots": 0.5,
     "traj_gap_s": 180,
     "max_velocity_knots": 12.0,
