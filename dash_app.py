@@ -34,7 +34,8 @@ RASTER_W, RASTER_H = 1024, 768
 RASTER_AOI = (103.55, 1.20, 103.78, 1.32)  # west, south, east, north
 ZOOM_RASTER_THRESHOLD = 11
 PREVIEW_AIS_MAX_POINTS = 5000          # subsample raw AIS to this many points for preview
-PREVIEW_BATHY_MAX_TRIANGLES = 30000     # cap mesh wireframe size for preview
+PREVIEW_BATHY_MAX_TRIANGLES = 500000    # cap mesh element count for preview
+_bathy_ipc_cache: dict[str, tuple[bytes, bytes]] = {}  # path → (coords_ipc, offsets_ipc)
 
 # ---------------------------------------------------------------------------
 # Module-level caches (mutated by _build_* helpers and the pipeline thread)
@@ -104,10 +105,16 @@ def _build_vessel_caches(df_v: pd.DataFrame) -> None:
     df_vessels = df_v
 
     print(f'  encoding vessel Arrow ({len(df_v):,} rows)...')
-    arrow_vessels = pa.Table.from_pandas(
-        df_v[['longitude', 'latitude', 'mmsi', 'sog', 'cog', 'typecargo']],
-        preserve_index=False,
-    )
+    _obstime_ns = df_v['obstime'].to_numpy(dtype='datetime64[ns]').astype(np.int64) if 'obstime' in df_v.columns else np.zeros(len(df_v), dtype=np.int64)
+    arrow_vessels = pa.table({
+        'longitude': pa.array(df_v['longitude'].to_numpy(dtype=np.float32), type=pa.float32()),
+        'latitude':  pa.array(df_v['latitude'].to_numpy(dtype=np.float32),  type=pa.float32()),
+        'mmsi':      pa.array(df_v['mmsi'].to_numpy(dtype=np.int64),         type=pa.int64()),
+        'sog':       pa.array(df_v['sog'].to_numpy(dtype=np.float32),        type=pa.float32()),
+        'cog':       pa.array(df_v['cog'].to_numpy(dtype=np.float32),        type=pa.float32()),
+        'typecargo': pa.array(df_v['typecargo'].to_numpy(dtype=np.float32) if 'typecargo' in df_v.columns else np.full(len(df_v), np.nan, dtype=np.float32), type=pa.float32()),
+        'obstime':   pa.array(_obstime_ns, type=pa.int64()),
+    })
     IPC_VESSELS = _ipc(arrow_vessels)
 
     print('  building track segments (vectorised)...')
@@ -494,8 +501,7 @@ def _pipeline_thread(config_dict: dict, stages: list[str], step_label: str) -> N
 def _preview_ais_arrow(path: Path) -> bytes:
     """Return Arrow IPC of (lon, lat, sog, cog, obstime) from the AIS CSV.
 
-    The client UI gates this behind an explicit 'Import' button so the user
-    chooses when to pay the cost on large files (millions of rows → tens of MB).
+    Called automatically when the user selects a new AIS CSV in the dropdown.
     """
     cols = ['longitude', 'latitude']
     try:
@@ -647,12 +653,19 @@ def _preview_tide(path: Path) -> dict:
     }
 
 
-def _preview_bathy_arrow(path: Path) -> bytes | None:
-    """Load a .mesh/.dfsu and return an Arrow table with line segments for a wireframe.
+def _preview_bathy_arrow(path: Path, bbox: tuple | None = None) -> tuple[bytes, bytes] | None:  # noqa: C901
+    """Load a .mesh/.dfsu and return (coords_ipc, offsets_ipc) for polygon rendering.
 
-    Layout: two Float32 columns (lon, lat). Every successive pair of rows is one
-    line segment. Triangles contribute 3 segments each. Returns None for .dfs2.
+    coords_ipc: Arrow table {lon: f32, lat: f32} — flat vertex ring for all elements.
+    offsets_ipc: Arrow table {offset: i32, z: f32} — start index per element (padded
+        to length = n_elements + 1) with per-element mean z value.
+    bbox: optional (west, south, east, north) to restrict elements to those whose
+        centroid falls within the box.  Pass the AIS bbox padded 2× on the client.
+    Returns None for .dfs2.
     """
+    key = f"{path}|{bbox}"
+    if key in _bathy_ipc_cache:
+        return _bathy_ipc_cache[key]
     suffix = path.suffix.lower()
     if suffix == '.dfs2':
         return None  # gridded — no triangulation to draw
@@ -661,38 +674,41 @@ def _preview_bathy_arrow(path: Path) -> bytes | None:
         geom = mikeio.Mesh(str(path)).geometry
     else:  # .dfsu
         geom = mikeio.open(str(path)).geometry
-    nodes = np.asarray(geom.node_coordinates)[:, :2]            # (N, 2) lon,lat
-    elements = np.asarray(geom.element_table)                    # list of node-index lists
-    # Normalize to 2D int array; mikeio is 1-based for some builds — guard against that.
-    elements = [list(e) for e in elements]
-    if elements and min(min(e) for e in elements) >= 1:
-        elements = [[i - 1 for i in e] for e in elements]
-    # Collect unique edges (deduplicated) — shared triangle edges must appear once.
-    edge_set: set[tuple[int, int]] = set()
-    for e in elements:
-        k = len(e)
-        for j in range(k):
-            a, b = int(e[j]), int(e[(j + 1) % k])
-            edge_set.add((min(a, b), max(a, b)))
+    nodes_xyz = np.asarray(geom.node_coordinates, dtype=np.float64)  # (N, 3) lon,lat,z
+    nodes_xy = nodes_xyz[:, :2]
+    elements = [np.asarray(e, dtype=np.int64) for e in geom.element_table]
 
-    MAX_EDGES = PREVIEW_BATHY_MAX_TRIANGLES * 2  # generous cap (~60 k edges)
-    edges = list(edge_set)
-    if len(edges) > MAX_EDGES:
-        import random as _rnd
-        _rnd.seed(0)
-        _rnd.shuffle(edges)
-        edges = edges[:MAX_EDGES]
+    # Bbox filter: keep elements whose centroid lies within the supplied bbox.
+    if bbox is not None:
+        bw, bs, be, bn = bbox
+        keep = []
+        for elem in elements:
+            ns = nodes_xy[elem]
+            cx, cy = ns[:, 0].mean(), ns[:, 1].mean()
+            if bw <= cx <= be and bs <= cy <= bn:
+                keep.append(elem)
+        elements = keep
 
-    seg_lon = []
-    seg_lat = []
-    for a, b in edges:
-        seg_lon.append(nodes[a, 0]); seg_lat.append(nodes[a, 1])
-        seg_lon.append(nodes[b, 0]); seg_lat.append(nodes[b, 1])
-    arr = pa.table({
-        'lon': pa.array(np.asarray(seg_lon, dtype=np.float32)),
-        'lat': pa.array(np.asarray(seg_lat, dtype=np.float32)),
-    })
-    return _ipc(arr)
+    # Per-element vertex flatten (use mikeio's element_table ordering, same as
+    # geom.to_shapely()); per-element mean z for depth-based fill colour.
+    sizes = np.array([len(e) for e in elements], dtype=np.int32)
+    offsets = np.concatenate(([0], np.cumsum(sizes))).astype(np.int32)
+    flat = np.concatenate([nodes_xy[e, :] for e in elements]).astype(np.float32)  # (M, 2)
+    elem_z = np.array([nodes_xyz[e, 2].mean() for e in elements], dtype=np.float32)
+
+    coords_ipc = _ipc(pa.table({
+        'lon': pa.array(flat[:, 0], type=pa.float32()),
+        'lat': pa.array(flat[:, 1], type=pa.float32()),
+    }))
+    # Pad z to match offsets length (Arrow requires equal-length columns).
+    z_padded = np.concatenate([elem_z, [np.float32('nan')]]).astype(np.float32)
+    offsets_ipc = _ipc(pa.table({
+        'offset': pa.array(offsets, type=pa.int32()),
+        'z':      pa.array(z_padded, type=pa.float32()),
+    }))
+    result = (coords_ipc, offsets_ipc)
+    _bathy_ipc_cache[key] = result
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -1105,14 +1121,40 @@ def _r_preview_tide():
         return jsonify(error=str(exc)), 400
 
 
+def _parse_bbox(bbox_str: str) -> tuple | None:
+    if not bbox_str:
+        return None
+    try:
+        parts = [float(x) for x in bbox_str.split(',')]
+        return tuple(parts) if len(parts) == 4 else None
+    except ValueError:
+        return None
+
+
 @app.server.route('/api/preview/bathy.arrow')
 def _r_preview_bathy():
     try:
         p = _safe_repo_path(request.args.get('path', ''))
-        b = _preview_bathy_arrow(p)
-        if b is None:
+        bbox = _parse_bbox(request.args.get('bbox', ''))
+        result = _preview_bathy_arrow(p, bbox)
+        if result is None:
             return jsonify(error='dfs2 grid preview not implemented'), 400
-        return _bytes_response(b)
+        coords_ipc, _ = result
+        return _bytes_response(coords_ipc)
+    except Exception as exc:
+        return jsonify(error=str(exc)), 400
+
+
+@app.server.route('/api/preview/bathy_offsets.arrow')
+def _r_preview_bathy_offsets():
+    try:
+        p = _safe_repo_path(request.args.get('path', ''))
+        bbox = _parse_bbox(request.args.get('bbox', ''))
+        result = _preview_bathy_arrow(p, bbox)
+        if result is None:
+            return jsonify(error='dfs2 grid preview not implemented'), 400
+        _, offsets_ipc = result
+        return _bytes_response(offsets_ipc)
     except Exception as exc:
         return jsonify(error=str(exc)), 400
 
@@ -1141,8 +1183,9 @@ def _opt_list(items: list[str]) -> list[dict]:
 
 def _picker_with_preview(label: str, dropdown_id: str, preview_id: str,
                          info_id: str, options: list, value, clearable=False,
-                         placeholder=''):
+                         placeholder='', preview_disabled=False):
     """Dropdown row with a preview tickbox on the side (no refresh button)."""
+    preview_opts = [{'label': 'preview', 'value': '1', 'disabled': preview_disabled}]
     return html.Div([
         html.Label(label),
         html.Div([
@@ -1150,8 +1193,7 @@ def _picker_with_preview(label: str, dropdown_id: str, preview_id: str,
                          value=value, clearable=clearable, placeholder=placeholder,
                          className='compact-dropdown', style={'fontSize': '10px'}),
             html.Div(
-                dcc.Checklist(id=preview_id, options=[{'label': 'preview', 'value': '1'}],
-                              value=[]),
+                dcc.Checklist(id=preview_id, options=preview_opts, value=[]),
                 className='preview-box',
             ),
         ], className='row-with-preview'),
@@ -1224,14 +1266,6 @@ app.layout = html.Div([
 
     html.Div([
 
-        # ---- Coastline & Land mask first — user confirms these before AIS ----
-        _picker_with_preview('Coastline (block/calculate waves)', 'sel-coast', 'pv-coast',
-                             'pv-coast-info', [], None, clearable=True,
-                             placeholder='Select shapefile...'),
-        _picker_with_preview('Land (filter AIS data)', 'sel-land', 'pv-land',
-                             'pv-land-info', [], None, clearable=True,
-                             placeholder='Select shapefile...'),
-
         # ---- AIS Data ----
         html.Label('AIS Data'),
         html.Div([
@@ -1246,10 +1280,15 @@ app.layout = html.Div([
             ),
         ], className='row-with-preview'),
         html.Div(id='pv-ais-info', className='preview-info'),
+
+        # ---- Coastline & Land mask ----
+        _picker_with_preview('Coastline (block/calculate waves)', 'sel-coast', 'pv-coast',
+                             'pv-coast-info', [], None, clearable=True,
+                             placeholder='Select shapefile...'),
+        _picker_with_preview('Land (filter AIS data)', 'sel-land', 'pv-land',
+                             'pv-land-info', [], None, clearable=True,
+                             placeholder='Select shapefile...'),
         html.Div([
-            html.Button('Import', id='btn-import-ais', n_clicks=0,
-                        title='Load the selected AIS CSV onto the map',
-                        className='secondary-btn'),
             html.Button('Filter', id='btn-filter', n_clicks=0, disabled=True,
                         title='Run Stage 1: AIS cleaning + interpolation',
                         className='secondary-btn'),
@@ -1257,7 +1296,8 @@ app.layout = html.Div([
 
         _picker_with_preview('Bathymetry', 'sel-bathy', 'pv-bathy',
                              'pv-bathy-info', [], None, clearable=True,
-                             placeholder='Select .dfsu or .mesh file...'),
+                             placeholder='Select .dfsu or .mesh file...',
+                             preview_disabled=True),
         _picker_with_preview('Tide DFS0', 'sel-tide', 'pv-tide',
                              'pv-tide-info', [], None, clearable=True,
                              placeholder='Select .dfs0 file...'),
@@ -1752,33 +1792,37 @@ def kick_waves(n, ais, land, bathy, coast, tide, tide_item,
     return no_update, no_update, no_update
 
 
-# ---- AIS import button: triggers clientside fetch with progress overlay ----
+# ---- AIS auto-import: fires whenever the user picks a new AIS file ----
 @app.callback(
     Output('_ais_import', 'data'),
     Output('pv-ais', 'value', allow_duplicate=True),
-    Input('btn-import-ais', 'n_clicks'),
-    State('sel-ais', 'value'),
+    Input('sel-ais', 'value'),
     State('_ais_import', 'data'),
     prevent_initial_call=True,
 )
-def trigger_ais_import(n, path, prev):
-    if not n or not path:
+def trigger_ais_import(path, prev):
+    if not path:
         return no_update, no_update
     nonce = (prev or {}).get('nonce', 0) + 1
     # Auto-tick the preview tickbox so the imported data shows on map.
     return {'path': path, 'nonce': nonce}, ['1']
 
 
+_BATHY_PREVIEW_OPT_ENABLED  = [{'label': 'preview', 'value': '1'}]
+_BATHY_PREVIEW_OPT_DISABLED = [{'label': 'preview', 'value': '1', 'disabled': True}]
+
+
 @app.callback(
     Output('btn-filter', 'disabled', allow_duplicate=True),
     Output('btn-waves', 'disabled', allow_duplicate=True),
+    Output('pv-bathy', 'options'),
     Input('_ais_import', 'data'),
     prevent_initial_call=True,
 )
 def _enable_after_import(data):
     if data and data.get('path'):
-        return False, False
-    return no_update, no_update
+        return False, False, _BATHY_PREVIEW_OPT_ENABLED
+    return no_update, no_update, no_update
 
 
 @app.callback(
@@ -2147,6 +2191,10 @@ function(n) {
         let filteredCoords = new Float32Array(0);
         let filteredStarts = new Int32Array([0]);
         let filteredSegIdxs = [];  // segIdx for each entry in filteredStarts
+        let filteredPointPos = new Float32Array(0);   // flat lon,lat per visible point
+        let filteredPointSeg = new Int32Array(0);     // segIdx for each visible point
+        let filteredPointRow = new Int32Array(0);     // original cPos row for sog/cog/time
+        const MAX_FILTERED_POINTS = 200_000;
 
         const initTrackArrays = (cT, mT, oT) => {
             const cLon = cT.getChild('lon').toArray();
@@ -2302,18 +2350,30 @@ function(n) {
                 filteredCoords = new Float32Array(0);
                 filteredStarts = new Int32Array([0]);
                 filteredSegIdxs = [];
+                filteredPointPos = new Float32Array(0);
+                filteredPointSeg = new Int32Array(0);
+                filteredPointRow = new Int32Array(0);
                 return;
             }
             const totalPts = visArr.reduce((s, i) => s + (startIndices[i+1] - startIndices[i]), 0);
             filteredCoords = new Float32Array(totalPts * 2);
             filteredStarts = new Int32Array(visArr.length + 1);
+            filteredPointPos = new Float32Array(totalPts * 2);
+            filteredPointSeg = new Int32Array(totalPts);
+            filteredPointRow = new Int32Array(totalPts);
             let ptr = 0;
             for (let k = 0; k < visArr.length; k++) {
                 const si = visArr[k];
                 const s = startIndices[si], e = startIndices[si + 1];
+                const n = e - s;
                 filteredCoords.set(cPos.subarray(s * 2, e * 2), ptr * 2);
+                filteredPointPos.set(cPos.subarray(s * 2, e * 2), ptr * 2);
                 filteredStarts[k] = ptr;
-                ptr += (e - s);
+                for (let j = 0; j < n; j++) {
+                    filteredPointSeg[ptr + j] = si;
+                    filteredPointRow[ptr + j] = s + j;
+                }
+                ptr += n;
             }
             filteredStarts[visArr.length] = ptr;
             filteredSegIdxs = visArr;
@@ -2526,7 +2586,7 @@ function(n) {
                 container.removeEventListener('pointermove', onMove);
                 container.removeEventListener('pointerup', onUp);
                 window.__freehandMode = false;
-                window.deckInstance.setProps({ controller: window.__shiftHeld });
+                window.deckInstance.setProps({ controller: DEFAULT_CONTROLLER });
                 window.__updateDeckCursor();
                 if (btn) { btn.textContent = 'Free-hand'; btn.style.opacity = ''; }
                 cv.style.display = 'none';
@@ -2604,6 +2664,7 @@ function(n) {
                         getWidth: 1, widthUnits: 'pixels', widthMinPixels: 1,
                         updateTriggers: { getColor: [tType] },
                         onHover: ({x, y, index}) => {
+                            if (!window.__ctrlHeld) { hideTip(); return; }
                             if (index < 0) { hideTip(); return; }
                             showTip(x, y, `<b>TRACK</b><br>MMSI: ${tMMSI[index]}<br>seg: ${tSeg[index]}<br>n: ${tN[index]}<br>type: ${tType[index]}`);
                         },
@@ -2619,11 +2680,48 @@ function(n) {
                         getWidth: 1.5, widthUnits: 'pixels', widthMinPixels: 1,
                         updateTriggers: { getColor: [filteredSegIdxs] },
                         onHover: ({x, y, index}) => {
+                            if (!window.__ctrlHeld) { hideTip(); return; }
                             if (index < 0) { hideTip(); return; }
                             const si = filteredSegIdxs[index];
                             showTip(x, y, `<b>TRACK</b><br>MMSI: ${tMMSI[si]}<br>seg: ${tSeg[si]}<br>n: ${tN[si]}<br>type: ${tType[si]}`);
                         },
                     }));
+                    // Per-point layer so individual AIS pings can be hovered
+                    const nPts = filteredPointPos.length / 2;
+                    if (nPts > 0 && nPts <= MAX_FILTERED_POINTS) {
+                        layers.push(new deck.ScatterplotLayer({
+                            id: 'tracks-pts',
+                            data: { length: nPts,
+                                    attributes: { getPosition: { value: filteredPointPos, size: 2 } } },
+                            getRadius: 2, radiusUnits: 'pixels', radiusMinPixels: 1,
+                            getFillColor: (_, {index}) => {
+                                const si = filteredPointSeg[index];
+                                return trackColor(tType[si], 230);
+                            },
+                            pickable: true,
+                            onHover: ({x, y, index}) => {
+                                if (!window.__ctrlHeld) { hideTip(); return; }
+                                if (index < 0) { hideTip(); return; }
+                                const row = filteredPointRow[index];
+                                const si  = filteredPointSeg[index];
+                                const timeNs = pointTime && pointTime[row] != null ? Number(pointTime[row]) : NaN;
+                                let dt = '?';
+                                try { if (!isNaN(timeNs)) dt = new Date(timeNs / 1e6).toISOString().replace('T', ' ').slice(0, 19); } catch (_) {}
+                                const s = pointSog ? pointSog[row] : null;
+                                const c = pointCog ? pointCog[row] : null;
+                                const lon2 = filteredPointPos[index * 2];
+                                const lat2 = filteredPointPos[index * 2 + 1];
+                                showTip(x, y,
+                                    `<b>TRACK POINT</b><br>` +
+                                    `MMSI: ${tMMSI[si]}  seg: ${tSeg[si]}<br>` +
+                                    (s != null ? `SOG: ${s.toFixed(1)} kn` : '') +
+                                    (c != null ? `  COG: ${Math.round(c)}°` : '') + '<br>' +
+                                    `time: ${dt}<br>` +
+                                    `${lon2.toFixed(5)}, ${lat2.toFixed(5)}`
+                                );
+                            },
+                        }));
+                    }
                 }
                 // else: vis.size === 0 → nothing added → all hidden
             }
@@ -2640,6 +2738,15 @@ function(n) {
                     lineWidthMinPixels: 1,
                     updateTriggers: { getFillColor: [wH] },
                     onHover: ({x, y, index}) => {
+                        if (!window.__ctrlHeld) {
+                            hideTip();
+                            if (window._hoveredWave !== null) {
+                                window._hoveredWave = null;
+                                if (window._pinnedWave === null)
+                                    window.deckInstance.setProps({ layers: buildLayers(window._currentZoom, null) });
+                            }
+                            return;
+                        }
                         if (index < 0) {
                             hideTip();
                             if (window._hoveredWave !== null) {
@@ -2713,15 +2820,20 @@ function(n) {
 
             // ---- Preview layers ----
             const pv = window.__previews;
-            if (pv.bathy && pv.bathy.lon && pv.bathy.lon.length > 0) {
-                layers.push(new deck.LineLayer({
+            if (pv.bathy && pv.bathy.pos && pv.bathy.offsets && pv.bathy.offsets.length > 1) {
+                layers.push(new deck.SolidPolygonLayer({
                     id: 'pv-bathy',
-                    data: { length: pv.bathy.lon.length / 2, attributes: {
-                        getSourcePosition: { value: pv.bathy.src, size: 2 },
-                        getTargetPosition: { value: pv.bathy.tgt, size: 2 },
-                    }},
-                    getColor: [0, 130, 0, 110],
-                    getWidth: 1, widthMinPixels: 1, pickable: false,
+                    data: {
+                        length: pv.bathy.offsets.length - 1,
+                        startIndices: pv.bathy.offsets,
+                        attributes: {
+                            getPolygon:   { value: pv.bathy.pos,     size: 2 },
+                            getFillColor: { value: pv.bathy.fillRgb, size: 4 },
+                        },
+                    },
+                    _normalize: false,
+                    filled: true,
+                    pickable: false,
                 }));
             }
             if (pv.coast && pv.coast.geojson) {
@@ -2752,10 +2864,11 @@ function(n) {
                     id: 'pv-ais',
                     data: { length: pv.ais.pos.length / 2,
                             attributes: { getPosition: { value: pv.ais.pos, size: 2 } } },
-                    getRadius: 3, radiusUnits: 'pixels', radiusMinPixels: 1,
+                    getRadius: 1.5, radiusUnits: 'pixels', radiusMinPixels: 0.5,
                     getFillColor: [50, 150, 255, 200],
                     pickable: true,
                     onHover: ({x, y, index}) => {
+                        if (!window.__ctrlHeld) { hideTip(); return; }
                         if (index < 0) { hideTip(); return; }
                         const timeNs = pv.ais.obstimeNs && pv.ais.obstimeNs[index] != null ? Number(pv.ais.obstimeNs[index]) : NaN;
                         let dt = '?';
@@ -2779,21 +2892,26 @@ function(n) {
         // Singapore-wide initial view (covers ~103.55-104.05 / 1.20-1.50).
         const initialZoom = 10;
         const CURSOR_PENCIL = `url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='22' height='22' viewBox='0 0 22 22'%3E%3Cpath fill='%23ffffff' stroke='%23222222' stroke-width='1.3' stroke-linejoin='round' d='M3 19L15 2l4 4L5 21z'/%3E%3Cpath fill='%23cccccc' stroke='%23555555' stroke-width='1' d='M3 19l4 2-5-5z'/%3E%3Ccircle cx='18' cy='5' r='1' fill='%2380c0ff'/%3E%3C/svg%3E") 0 22, crosshair`;
-        window.__shiftHeld = false;
-        // Single source of truth for cursor — used by deck.gl getCursor AND manual updates
-        const getCursorForState = (isDragging = false) => {
+        window.__ctrlHeld = false;
+        // Pan + zoom always on. Ctrl key gates hover/click (inspect mode).
+        const DEFAULT_CONTROLLER = { type: deck.MapController, dragPan: true,
+            dragRotate: false, scrollZoom: true, doubleClickZoom: true, touchZoom: true };
+        // Single source of truth for cursor — used by deck.gl getCursor AND manual updates.
+        // isHovering comes from deck.gl's pick state; isDragging from mousedown/up.
+        const getCursorForState = (isDragging = false, isHovering = false) => {
             if (window.__freehandMode) return CURSOR_PENCIL;
-            if (window.__shiftHeld) return isDragging ? 'grabbing' : 'grab';
-            return 'default';
+            if (window.__ctrlHeld)     return isHovering ? 'pointer' : 'default';
+            return isDragging ? 'grabbing' : 'grab';
         };
         window.deckInstance = new deck.Deck({
             parent: container,
             width: '100%', height: '100%',
             initialViewState: { longitude: 103.82, latitude: 1.32, zoom: initialZoom, pitch: 0, bearing: 0 },
-            controller: false,
+            controller: DEFAULT_CONTROLLER,
             layers: buildLayers(initialZoom, null),
-            getCursor: ({isDragging}) => getCursorForState(isDragging),
+            getCursor: ({isDragging, isHovering}) => getCursorForState(isDragging, isHovering),
             onClick: ({layer, index}) => {
+                if (!window.__ctrlHeld) return;
                 // Similar pick mode: capture the clicked track
                 if (window.__similarArmed && layer && layer.id === 'tracks' && index >= 0) {
                     window.__similarArmed = false;
@@ -2843,28 +2961,34 @@ function(n) {
                 return params.viewState;
             },
         });
-        // Force initial cursor (deck.gl defaults to 'grab' without this)
-        container.style.cursor = 'default';
+        // Initial cursor: grab (pan is always available)
+        container.style.cursor = 'grab';
         // Manual cursor update — call this whenever state changes outside a mouse event
         window.__updateDeckCursor = (isDragging = false) => {
             container.style.cursor = getCursorForState(isDragging);
         };
-        // Shift held = pan/zoom mode
+        // Ctrl held = inspect mode (hover tooltips + click picking enabled)
         window.addEventListener('keydown', (e) => {
-            if (e.key !== 'Shift' || window.__shiftHeld || window.__freehandMode) return;
+            if (e.key !== 'Control' || window.__ctrlHeld || window.__freehandMode) return;
             if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA') return;
-            window.__shiftHeld = true;
-            window.deckInstance.setProps({ controller: { dragRotate: false } });
+            window.__ctrlHeld = true;
+            if (typeof window.__rebuild === 'function') window.__rebuild();
             window.__updateDeckCursor();
         });
         window.addEventListener('keyup', (e) => {
-            if (e.key !== 'Shift' || !window.__shiftHeld) return;
-            window.__shiftHeld = false;
-            if (!window.__freehandMode) window.deckInstance.setProps({ controller: false });
+            if (e.key !== 'Control' || !window.__ctrlHeld) return;
+            window.__ctrlHeld = false;
+            hideTip();
+            if (typeof window.__rebuild === 'function') window.__rebuild();
             window.__updateDeckCursor();
         });
+        // Clear inspect mode if window loses focus while Ctrl is held
+        window.addEventListener('blur', () => {
+            if (!window.__ctrlHeld) return;
+            window.__ctrlHeld = false; hideTip(); window.__updateDeckCursor();
+        });
         container.addEventListener('mousedown', () => {
-            if (window.__shiftHeld && !window.__freehandMode) window.__updateDeckCursor(true);
+            if (!window.__freehandMode) window.__updateDeckCursor(true);
         });
         window.addEventListener('mouseup', () => {
             if (!window.__freehandMode) window.__updateDeckCursor(false);
@@ -3111,6 +3235,7 @@ function(n) {
 
         // ---- AIS import (slow, explicit button) + preview toggle (cheap) ----
         window.__importedAisPath = null;
+        window.__aisBbox = null;   // [west, south, east, north] — set on AIS import
         window.__importAis = async (path) => {
             if (!path) return 'no file selected';
             try {
@@ -3137,6 +3262,7 @@ function(n) {
                     const bb = await fetch('/api/preview/ais.bbox?path=' + encodeURIComponent(path)).then(r => r.json());
                     if (bb.bbox) {
                         const [w, s, e, n] = bb.bbox;
+                        window.__aisBbox = [w, s, e, n];
                         const lonC = (w + e) / 2, latC = (s + n) / 2;
                         const span = Math.max(e - w, n - s);
                         const z = Math.max(8, Math.min(15, 10 - Math.log2(span)));
@@ -3164,6 +3290,31 @@ function(n) {
                 return 'ERROR: ' + e.message;
             }
         };
+        // Replaces the AIS preview buffer with the server-side filtered points.
+        // Called after track_version bumps (filter stage completes).
+        window.__refreshFilteredAisPoints = async () => {
+            try {
+                const resp = await fetch('/api/vessels.arrow');
+                if (!resp.ok) { console.warn('__refreshFilteredAisPoints: HTTP', resp.status); return; }
+                const buf = await resp.arrayBuffer();
+                const t = window.tableFromIPC(new Uint8Array(buf));
+                const lon = t.getChild('longitude') ? t.getChild('longitude').toArray() : null;
+                const lat = t.getChild('latitude')  ? t.getChild('latitude').toArray()  : null;
+                if (!lon || lon.length === 0) { console.warn('__refreshFilteredAisPoints: empty table'); return; }
+                const pos = new Float32Array(lon.length * 2);
+                for (let i = 0; i < lon.length; i++) { pos[i*2]=lon[i]; pos[i*2+1]=lat[i]; }
+                const sog  = t.getChild('sog')     ? t.getChild('sog').toArray()     : new Float32Array(lon.length);
+                const cog  = t.getChild('cog')     ? t.getChild('cog').toArray()     : new Float32Array(lon.length);
+                const time = t.getChild('obstime') ? t.getChild('obstime').toArray() : new BigInt64Array(lon.length);
+                const prev = window.__previews.ais;
+                const visible   = prev ? prev.visible   : true;
+                const timeMin   = prev ? prev.timeMin   : undefined;
+                const timeMax   = prev ? prev.timeMax   : undefined;
+                window.__previews.ais = { pos, sog, cog, obstimeNs: time,
+                    visible, timeMin, timeMax, filtered: true };
+                if (typeof window.__rebuild === 'function') window.__rebuild();
+            } catch (e) { console.warn('__refreshFilteredAisPoints error:', e); }
+        };
         window.__togglePreviewAis = (visible) => {
             if (window.__previews.ais) {
                 window.__previews.ais.visible = !!visible;
@@ -3185,23 +3336,67 @@ function(n) {
             if (!state || !state.visible || !state.path) {
                 window.__previews.bathy = null; window.__rebuild(); return null;
             }
+            const enc = encodeURIComponent(state.path);
+            // Build padded bbox query param: expand AIS bbox 2× in each dimension.
+            let bboxParam = '';
+            if (window.__aisBbox) {
+                const [bw, bs, be, bn] = window.__aisBbox;
+                const dLon = (be - bw), dLat = (bn - bs);
+                const pw = bw - dLon * 0.5, pe = be + dLon * 0.5;
+                const ps = bs - dLat * 0.5, pn = bn + dLat * 0.5;
+                bboxParam = `&bbox=${pw},${ps},${pe},${pn}`;
+            }
             try {
-                const buf = await fetch('/api/preview/bathy.arrow?path=' + encodeURIComponent(state.path))
-                    .then(r => { if (!r.ok) return r.json().then(j => Promise.reject(new Error(j.error || 'preview failed'))); return r.arrayBuffer(); });
-                const t = window.tableFromIPC(new Uint8Array(buf));
-                const lon = t.getChild('lon').toArray();
-                const lat = t.getChild('lat').toArray();
-                // Edges are pairs of consecutive rows; split into source/target.
-                const nEdges = Math.floor(lon.length / 2);
-                const src = new Float32Array(nEdges * 2);
-                const tgt = new Float32Array(nEdges * 2);
-                for (let i = 0; i < nEdges; i++) {
-                    src[i*2] = lon[i*2]; src[i*2+1] = lat[i*2];
-                    tgt[i*2] = lon[i*2+1]; tgt[i*2+1] = lat[i*2+1];
+                const [bufC, bufO] = await Promise.all([
+                    fetch('/api/preview/bathy.arrow?path=' + enc + bboxParam)
+                        .then(r => { if (!r.ok) return r.json().then(j => Promise.reject(new Error(j.error || 'preview failed'))); return r.arrayBuffer(); }),
+                    fetch('/api/preview/bathy_offsets.arrow?path=' + enc + bboxParam)
+                        .then(r => { if (!r.ok) return r.json().then(j => Promise.reject(new Error(j.error || 'preview failed'))); return r.arrayBuffer(); }),
+                ]);
+                const tC = window.tableFromIPC(new Uint8Array(bufC));
+                const tO = window.tableFromIPC(new Uint8Array(bufO));
+                const lon = tC.getChild('lon').toArray();
+                const lat = tC.getChild('lat').toArray();
+                // Interleave lon/lat into a single Float32Array for deck.gl binary access
+                const pos = new Float32Array(lon.length * 2);
+                for (let i = 0; i < lon.length; i++) { pos[i*2]=lon[i]; pos[i*2+1]=lat[i]; }
+                const offsets = tO.getChild('offset').toArray();
+                const zArr    = tO.getChild('z').toArray();
+                const nElems = offsets.length - 1;
+                // Find z range (skip padding NaN at index nElems)
+                let zMin = Infinity, zMax = -Infinity;
+                for (let i = 0; i < nElems; i++) {
+                    const v = zArr[i];
+                    if (Number.isFinite(v)) {
+                        if (v < zMin) zMin = v;
+                        if (v > zMax) zMax = v;
+                    }
                 }
-                window.__previews.bathy = { lon, src, tgt };
+                if (!Number.isFinite(zMin)) { zMin = 0; zMax = 1; }
+                const zSpan = (zMax - zMin) || 1;
+                // Per-vertex RGBA colour buffer (dark blue=deep → light cyan=shallow)
+                const totalVerts = lon.length;
+                const fillRgb = new Uint8Array(totalVerts * 4);
+                const DEEP = [12, 35, 95];
+                const SHAL = [175, 220, 235];
+                for (let i = 0; i < nElems; i++) {
+                    const z = Number.isFinite(zArr[i]) ? zArr[i] : zMin;
+                    // t=0 → deepest (zMin), t=1 → shallowest (zMax)
+                    const t = (z - zMin) / zSpan;
+                    const r = (DEEP[0] + (SHAL[0] - DEEP[0]) * t) | 0;
+                    const g = (DEEP[1] + (SHAL[1] - DEEP[1]) * t) | 0;
+                    const b = (DEEP[2] + (SHAL[2] - DEEP[2]) * t) | 0;
+                    const vS = offsets[i], vE = offsets[i + 1];
+                    for (let v = vS; v < vE; v++) {
+                        fillRgb[v*4]   = r;
+                        fillRgb[v*4+1] = g;
+                        fillRgb[v*4+2] = b;
+                        fillRgb[v*4+3] = 200;
+                    }
+                }
+                window.__previews.bathy = { pos, offsets, fillRgb, zMin, zMax };
                 window.__rebuild();
-                return `${nEdges.toLocaleString()} mesh edges`;
+                return `${nElems.toLocaleString()} mesh elements  (z: ${zMin.toFixed(2)} → ${zMax.toFixed(2)})`;
             } catch (e) {
                 window.__previews.bathy = null; window.__rebuild();
                 return 'ERROR: ' + e.message;
@@ -3298,10 +3493,8 @@ async function(version) {
     if (typeof window.__refreshTrackCaches === 'function') {
         try {
             await window.__refreshTrackCaches(version);
-            // Hide raw AIS import dots after filter — filtered data is now in the track layer
-            if (window.__previews?.ais) {
-                window.__previews.ais.visible = false;
-                if (typeof window.__rebuild === 'function') window.__rebuild();
+            if (window.__previews?.ais && typeof window.__refreshFilteredAisPoints === 'function') {
+                await window.__refreshFilteredAisPoints();
             }
         } catch (e) { console.error(e); }
     }
@@ -3318,15 +3511,6 @@ app.clientside_callback(TRACK_RELOAD_JS,
     Output('_init', 'data', allow_duplicate=True),
     Input('_track_version', 'data'),
     prevent_initial_call=True)
-
-
-@app.callback(
-    Output('pv-ais', 'value', allow_duplicate=True),
-    Input('_track_version', 'data'),
-    prevent_initial_call=True,
-)
-def _clear_ais_preview_after_filter(_):
-    return []
 
 
 # ---- Preview clientside hooks: each updates a preview-info span and the deck.gl layers
@@ -3433,7 +3617,7 @@ app.clientside_callback(
 )
 
 
-# AIS import clientside callback — triggered by the Import button via _ais_import Store.
+# AIS import clientside callback — triggered by file selection via _ais_import Store.
 app.clientside_callback(
     r"""
     async function(state) {
