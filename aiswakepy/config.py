@@ -63,6 +63,9 @@ class CoastlineConfig(BaseModel):
 
 
 class WaveConfig(BaseModel):
+    formula: Literal[
+        "kriebel", "bhowmik", "blaauw", "gates", "maynord", "pianc", "sorensen"
+    ] = "kriebel"
     max_Froude_M: float = 0.5
     min_Froude_M: float = 0.1
     max_bf: float = 0.4

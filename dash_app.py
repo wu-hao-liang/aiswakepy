@@ -72,8 +72,13 @@ def _ensure_vessel_columns(df_w: pd.DataFrame, df_v: pd.DataFrame) -> pd.DataFra
         'mmsi': 'MMSI', 'obstime': 'DateTime',
         'longitude': 'VesselLongitude', 'latitude': 'VesselLatitude',
         'cog': 'VesselCOG', 'draught': 'VesselDraught',
-    })
-    out = df_w.merge(join, on=['MMSI', 'DateTime'], how='left')
+    }).copy()
+    # Normalise both join keys to second-precision string to avoid dtype mismatches
+    df_w = df_w.copy()
+    df_w['_dt_key'] = pd.to_datetime(df_w['DateTime'], errors='coerce').dt.floor('s').astype(str)
+    join['_dt_key'] = pd.to_datetime(join['DateTime'], errors='coerce').dt.floor('s').astype(str)
+    join = join.drop(columns=['DateTime'])
+    out = df_w.merge(join, on=['MMSI', '_dt_key'], how='left').drop(columns=['_dt_key'])
     n_unmatched = out['VesselLongitude'].isna().sum()
     if n_unmatched:
         print(f'  [compat] WARN: {n_unmatched} wave records have no matching vessel row')
@@ -112,6 +117,9 @@ def _build_vessel_caches(df_v: pd.DataFrame) -> None:
         meta_mmsi = np.array([], dtype=np.int64)
         meta_seg  = np.array([], dtype=np.int32)
         meta_n    = np.array([], dtype=np.int32)
+        meta_type = np.array([], dtype=np.int32)
+        sel_sog = sel_cog = np.array([], dtype=np.float32)
+        sel_time_ns = np.array([], dtype=np.int64)
     else:
         df_sorted = df_v.sort_values(['mmsi', 'segment_id'], kind='stable').reset_index(drop=True)
         mmsi_arr = df_sorted['mmsi'].to_numpy(dtype=np.int64)
@@ -129,6 +137,9 @@ def _build_vessel_caches(df_v: pd.DataFrame) -> None:
             meta_mmsi = np.array([], dtype=np.int64)
             meta_seg  = np.array([], dtype=np.int32)
             meta_n    = np.array([], dtype=np.int32)
+            meta_type = np.array([], dtype=np.int32)
+            sel_sog = sel_cog = np.array([], dtype=np.float32)
+            sel_time_ns = np.array([], dtype=np.int64)
         else:
             kept_starts = starts[keep]
             kept_sizes  = sizes[keep]
@@ -147,6 +158,9 @@ def _build_vessel_caches(df_v: pd.DataFrame) -> None:
             meta_mmsi = mmsi_arr[kept_starts]
             meta_seg  = sid_arr[kept_starts].astype(np.int32)
             meta_n    = kept_sizes.astype(np.int32)
+            # typecargo: use first point of each segment (fill NaN → -1)
+            type_arr = df_sorted['typecargo'].fillna(-1).to_numpy(dtype=np.float32) if 'typecargo' in df_sorted.columns else np.full(len(df_sorted), -1.0)
+            meta_type = type_arr[kept_starts].astype(np.int32)
 
     seg_meta = [{'mmsi': int(m), 'segment_id': int(s), 'n_points': int(n)}
                 for m, s, n in zip(meta_mmsi, meta_seg, meta_n)]
@@ -161,6 +175,7 @@ def _build_vessel_caches(df_v: pd.DataFrame) -> None:
         'mmsi':       pa.array(meta_mmsi.astype(np.int64), type=pa.int64()),
         'segment_id': pa.array(meta_seg,                   type=pa.int32()),
         'n_points':   pa.array(meta_n,                     type=pa.int32()),
+        'typecargo':  pa.array(meta_type,                  type=pa.int32()),
     })
     arrow_offsets = pa.table({'offset': pa.array(offsets_arr, type=pa.int32())})
     IPC_TRACK_COORDS = _ipc(arrow_coords)
@@ -238,7 +253,7 @@ IPC_TRACK_COORDS = _ipc(pa.table({
 }))
 IPC_TRACK_META = _ipc(pa.table({
     'mmsi': pa.array([], pa.int64()), 'segment_id': pa.array([], pa.int32()),
-    'n_points': pa.array([], pa.int32()),
+    'n_points': pa.array([], pa.int32()), 'typecargo': pa.array([], pa.int32()),
 }))
 IPC_TRACK_OFFSETS = _ipc(pa.table({'offset': pa.array([0], pa.int32())}))
 # Build wave Arrow with the empty df so the schema matches
@@ -253,27 +268,48 @@ print('caches initialised empty - tracks/waves appear after the corresponding pi
 
 
 # ---------------------------------------------------------------------------
-# Examples directory inventory
+# Data directory inventory
 # ---------------------------------------------------------------------------
-def _scan_examples() -> dict:
+DATA_ROOT = REPO / 'data'
+DATA_ROOT.mkdir(exist_ok=True)
+
+
+def _scan_data_subdirs() -> list[dict]:
+    """Return working-directory dropdown options from data/ subdirectories."""
+    dirs = sorted(
+        p.relative_to(REPO).as_posix()
+        for p in DATA_ROOT.iterdir() if p.is_dir()
+    )
+    return [{'label': d, 'value': d} for d in dirs]
+
+
+def _scan_working_dir(workdir: str | None) -> dict:
+    """Scan standard subdirs under the working directory.
+
+    Expected layout::
+
+        data/<workdir>/
+            ais/*.csv
+            coastline/*.shp
+            land/*.shp
+            bathymetry/*.{mesh,dfs2,dfsu}
+            tide/*.dfs0
+    """
+    empty = {'ais': [], 'bathymetry': [], 'coastline': [], 'land': [], 'tide': []}
+    if not workdir:
+        return empty
+    base = REPO / workdir
+    if not base.exists():
+        return empty
     rel = lambda p: p.relative_to(REPO).as_posix()
     return {
-        'ais': sorted(rel(p) for p in (REPO / 'examples/ais').glob('*.csv')),
+        'ais':        sorted(rel(p) for p in (base / 'ais').glob('*.csv')),
         'bathymetry': sorted(rel(p) for ext in ('mesh', 'dfs2', 'dfsu')
-                             for p in (REPO / 'examples/bathymetry').glob(f'*.{ext}')),
-        'coastline': sorted(rel(p) for p in (REPO / 'examples/coastline').glob('*.shp')),
-        'land': sorted(rel(p) for p in (REPO / 'examples/land').glob('*.shp')),
-        'tide': sorted(rel(p) for p in (REPO / 'examples/tide').glob('*.dfs0')),
+                             for p in (base / 'bathymetry').glob(f'*.{ext}')),
+        'coastline':  sorted(rel(p) for p in (base / 'coastline').glob('*.shp')),
+        'land':       sorted(rel(p) for p in (base / 'land').glob('*.shp')),
+        'tide':       sorted(rel(p) for p in (base / 'tide').glob('*.dfs0')),
     }
-
-
-EXAMPLE_FILES = _scan_examples()
-CB_METHODS = ['L_Le', 'B_Le', 'table']
-INTERP_METHODS = [
-    {'label': 'linear (straight-line)', 'value': 'linear'},
-    {'label': 'hermite (cubic spline)', 'value': 'hermite'},
-    {'label': 'mixed (hermite above 1 m/s, else linear)', 'value': 'mixed'},
-]
 
 
 # ---------------------------------------------------------------------------
@@ -390,15 +426,30 @@ def _pipeline_thread(config_dict: dict, stages: list[str], step_label: str) -> N
         LAST_RESULTS.update(results)
 
         # ---- Cache rebuild (no lock held) ----
+        out_dir = Path(cfg.output.directory)
         if 'df_filtered' in results and 'filter' in stages:
             print('Refreshing track caches...')
             t0 = time.perf_counter()
             _build_vessel_caches(results['df_filtered'])
             print(f'  -> {len(results["df_filtered"]):,} rows, '
                   f'{len(seg_meta):,} segments  ({time.perf_counter()-t0:.1f}s)')
+            # Save parquet for dev-loading without re-running the pipeline
+            try:
+                out_dir.mkdir(parents=True, exist_ok=True)
+                results['df_filtered'].to_parquet(out_dir / 'vessels.parquet', index=False)
+                print(f'  ✓ saved dev cache: vessels.parquet')
+            except Exception as e:
+                print(f'  WARN: could not save vessels.parquet: {e}')
             with _pipeline_lock:
                 PIPELINE_STATE['track_version'] += 1
                 PIPELINE_STATE['n_filtered'] = len(results['df_filtered'])
+            # If wave_impact was NOT run this pass, clear stale wave cache so the
+            # client doesn't show leftover dots from a previous pipeline run.
+            if 'wave_impact' not in stages:
+                print('  clearing stale wave cache (filter-only run)...')
+                _build_wave_caches(df_waves.iloc[:0].copy())
+                with _pipeline_lock:
+                    PIPELINE_STATE['wave_version'] += 1
 
         if 'df_wave_impact' in results and 'wave_impact' in stages:
             print('Refreshing wave caches...')
@@ -411,6 +462,12 @@ def _pipeline_thread(config_dict: dict, stages: list[str], step_label: str) -> N
             _build_wave_caches(enriched)
             print(f'  -> {len(results["df_wave_impact"]):,} wave events '
                   f'({time.perf_counter()-t0:.1f}s)')
+            # Save wave parquet for dev-loading
+            try:
+                enriched.to_parquet(out_dir / 'waves.parquet', index=False)
+                print(f'  ✓ saved dev cache: waves.parquet')
+            except Exception as e:
+                print(f'  WARN: could not save waves.parquet: {e}')
             with _pipeline_lock:
                 PIPELINE_STATE['wave_version'] += 1
                 PIPELINE_STATE['n_waves'] = len(results['df_wave_impact'])
@@ -610,19 +667,27 @@ def _preview_bathy_arrow(path: Path) -> bytes | None:
     elements = [list(e) for e in elements]
     if elements and min(min(e) for e in elements) >= 1:
         elements = [[i - 1 for i in e] for e in elements]
-    n_tris = len(elements)
-    if n_tris > PREVIEW_BATHY_MAX_TRIANGLES:
-        stride = max(1, n_tris // PREVIEW_BATHY_MAX_TRIANGLES)
-        elements = elements[::stride]
-    # Emit edges: for each element, every consecutive pair + closing pair.
-    seg_lon = []
-    seg_lat = []
+    # Collect unique edges (deduplicated) — shared triangle edges must appear once.
+    edge_set: set[tuple[int, int]] = set()
     for e in elements:
         k = len(e)
         for j in range(k):
-            a, b = e[j], e[(j + 1) % k]
-            seg_lon.append(nodes[a, 0]); seg_lat.append(nodes[a, 1])
-            seg_lon.append(nodes[b, 0]); seg_lat.append(nodes[b, 1])
+            a, b = int(e[j]), int(e[(j + 1) % k])
+            edge_set.add((min(a, b), max(a, b)))
+
+    MAX_EDGES = PREVIEW_BATHY_MAX_TRIANGLES * 2  # generous cap (~60 k edges)
+    edges = list(edge_set)
+    if len(edges) > MAX_EDGES:
+        import random as _rnd
+        _rnd.seed(0)
+        _rnd.shuffle(edges)
+        edges = edges[:MAX_EDGES]
+
+    seg_lon = []
+    seg_lat = []
+    for a, b in edges:
+        seg_lon.append(nodes[a, 0]); seg_lat.append(nodes[a, 1])
+        seg_lon.append(nodes[b, 0]); seg_lat.append(nodes[b, 1])
     arr = pa.table({
         'lon': pa.array(np.asarray(seg_lon, dtype=np.float32)),
         'lat': pa.array(np.asarray(seg_lat, dtype=np.float32)),
@@ -653,25 +718,65 @@ INDEX_TEMPLATE = """<!DOCTYPE html>
         window.tableFromIPC = tableFromIPC;
         window.dispatchEvent(new Event('arrow-ready'));
     </script>
+    <script>
+        (function initRSB() {
+            var btn  = document.getElementById('btn-rsb-toggle');
+            var rsb  = document.getElementById('right-sidebar');
+            var deck = document.getElementById('deck-container');
+            if (!btn || !rsb) { setTimeout(initRSB, 80); return; }
+            btn.addEventListener('click', function() {
+                var open = rsb.classList.toggle('open');
+                btn.classList.toggle('open', open);
+                btn.textContent = open ? '▶' : '◀';
+                var leg = document.getElementById('map-legend');
+                if (leg) leg.style.right = open ? '500px' : '20px';
+            });
+        })();
+    </script>
     <style>
         html, body { margin: 0; padding: 0; height: 100%; overflow: hidden;
                      font-family: system-ui, sans-serif; }
-        #status-banner { position: fixed; top: 0; left: 0; right: 0; height: 28px;
-                         padding: 4px 12px; box-sizing: border-box; z-index: 5;
-                         font: 12px monospace; background: #eef; border-bottom: 1px solid #ccd; }
-        #sidebar { position: fixed; top: 28px; left: 0; bottom: 0; width: 340px;
+        #status-banner { position: fixed; top: 0; left: 0; right: 0; height: 40px;
+                         padding: 0 10px 0 12px; box-sizing: border-box; z-index: 25;
+                         font: 12px monospace; background: #eef; border-bottom: 1px solid #ccd;
+                         display: flex; align-items: center; gap: 10px; }
+        #workdir-wrapper { width: 240px; flex-shrink: 0; }
+        #workdir-wrapper .dash-dropdown-wrapper { min-height: 26px !important; }
+        #banner-meta { margin-left: auto; white-space: nowrap; overflow: hidden;
+                       text-overflow: ellipsis; text-align: right; font-size: 11px; }
+        #sidebar { position: fixed; top: 40px; left: 0; bottom: 0; width: 340px;
                    overflow-y: auto; padding: 12px; box-sizing: border-box;
                    background: #f8f8fb; border-right: 1px solid #ddd;
                    font: 12px system-ui, sans-serif; z-index: 4; }
+        #right-sidebar { position: fixed; top: 40px; right: 0; bottom: 0; width: 480px;
+                         overflow-y: auto; padding: 10px 14px; box-sizing: border-box;
+                         background: #f4f5f9; border-left: 1px solid #d4d8e4;
+                         font: 12px system-ui, sans-serif; z-index: 4;
+                         transform: translateX(100%); transition: transform 0.2s ease; }
+        #right-sidebar.open { transform: translateX(0); }
+        #right-sidebar hr { border: none; border-top: 1px solid #d0d8e8; margin: 8px -14px; }
+        #btn-rsb-toggle { position: fixed; top: calc(50vh + 20px); right: 0;
+                          width: 18px; background: #d4dae8; color: #446;
+                          border: 1px solid #b8c2d4; border-right: none;
+                          border-radius: 5px 0 0 5px; padding: 22px 2px;
+                          cursor: pointer; font-size: 9px; line-height: 1;
+                          z-index: 6; transition: right 0.2s ease, background 0.15s; }
+        #btn-rsb-toggle:hover { background: #c4cade; }
+        #btn-rsb-toggle.open { right: 480px; }
         #sidebar h4 { margin: 0 0 8px; font-size: 13px; }
-        #sidebar label { display: block; font-size: 11px; color: #555;
-                         margin: 8px 0 2px; font-weight: 600; }
+        #sidebar label { display: block; font-size: 10px; color: #555;
+                         margin: 6px 0 1px; font-weight: 600; }
         .row-with-preview { display: flex; gap: 6px; align-items: center; }
         .row-with-preview > :first-child { flex: 1; min-width: 0; }
-        .secondary-btn { background: #ddd !important; color: #333 !important;
-                         border: 1px solid #bbb !important;
-                         padding: 6px 10px !important; font-size: 11px !important; }
-        .secondary-btn:hover { background: #c8c8c8 !important; }
+        .secondary-btn { background: #eef2f7 !important; color: #3a6080 !important;
+                         border: 1px solid #a8c0d8 !important;
+                         padding: 6px 10px !important; font-size: 11px !important;
+                         border-radius: 5px !important;
+                         transition: background 0.15s, box-shadow 0.15s !important; }
+        .secondary-btn:hover { background: #dce8f2 !important;
+                               box-shadow: 0 2px 5px rgba(0,80,140,0.15) !important; }
+        .secondary-btn:active { background: #c8daea !important;
+                                box-shadow: inset 0 1px 3px rgba(0,0,0,0.12) !important; }
         .preview-box label { font-weight: normal !important; font-size: 10px !important;
                              color: #888; margin: 0 !important; white-space: nowrap; }
         .preview-info { font-size: 10px; color: #555; margin: 2px 0 0;
@@ -679,15 +784,36 @@ INDEX_TEMPLATE = """<!DOCTYPE html>
         .preview-info.error { color: #c33; }
         #sidebar .row-buttons { display: flex; gap: 6px; margin-top: 12px; }
         #sidebar button { flex: 1; padding: 8px 6px;
-                          border: 1px solid #58a; background: #69b; color: white;
-                          border-radius: 3px; font-weight: bold; font-size: 11px; cursor: pointer; }
-        #sidebar button:hover { background: #58a; }
-        #sidebar button:disabled { background: #aaa; border-color: #888; cursor: wait; }
+                          border: 1px solid #4a85b5;
+                          background: linear-gradient(180deg, #6aabda, #4a85b5);
+                          color: white; border-radius: 5px; font-weight: 600;
+                          font-size: 11px; cursor: pointer; letter-spacing: 0.2px;
+                          text-shadow: 0 1px 1px rgba(0,0,0,0.18);
+                          transition: background 0.15s, box-shadow 0.15s; }
+        #sidebar button:hover { background: linear-gradient(180deg, #5a9bca, #3a75a5);
+                                box-shadow: 0 2px 6px rgba(0,80,140,0.25); }
+        #sidebar button:active { background: linear-gradient(180deg, #3a75a5, #2a6595);
+                                 box-shadow: inset 0 1px 3px rgba(0,0,0,0.2); }
+        #sidebar button:disabled { background: #b8c8d8 !important; border-color: #a0b4c4 !important;
+                                   box-shadow: none !important; cursor: wait; text-shadow: none; }
+        #btn-waves { background: linear-gradient(180deg, #5abaaa, #3a9a8a) !important;
+                     border-color: #3a9a8a !important; }
+        #btn-waves:hover { background: linear-gradient(180deg, #4aaa9a, #2a8a7a) !important;
+                           box-shadow: 0 2px 6px rgba(0,120,100,0.3) !important; }
+        #btn-waves:active { background: linear-gradient(180deg, #2a8a7a, #1a7a6a) !important; }
+        #btn-waves:disabled { background: #b8c8d8 !important; border-color: #a0b4c4 !important; }
+        #new-folder-form { position: fixed; top: 46px; left: 4px; z-index: 30;
+                           background: white; border: 1px solid #b0c4d8; border-radius: 6px;
+                           padding: 8px 12px; box-shadow: 0 4px 16px rgba(0,0,0,0.18);
+                           display: flex; align-items: center; gap: 6px; }
+        #setup-overlay { position: fixed; top: 40px; left: 0; right: 0; bottom: 0;
+                         background: rgba(0,0,0,0.45); z-index: 20; cursor: not-allowed;
+                         display: flex; align-items: center; justify-content: center; }
         #progress-log { background: #1e1e1e; color: #ddd; font: 11px ui-monospace, monospace;
                         padding: 8px; max-height: 45vh; overflow: auto; white-space: pre-wrap;
                         border-radius: 3px; margin: 4px 0; }
-        #deck-container { position: fixed; top: 28px; left: 340px; right: 0; bottom: 0;
-                          z-index: 1; overflow: hidden; }
+        #deck-container { position: fixed; top: 40px; left: 340px; right: 0; bottom: 0;
+                          z-index: 1; overflow: hidden; transition: right 0.2s ease; }
         #tooltip { position: fixed; pointer-events: none; padding: 6px 10px;
                    background: rgba(0,0,0,0.85); color: white; font: 12px monospace;
                    border-radius: 4px; z-index: 100; display: none; white-space: nowrap; }
@@ -760,12 +886,171 @@ def _r_track_meta(): return _bytes_response(IPC_TRACK_META)
 def _r_track_offsets(): return _bytes_response(IPC_TRACK_OFFSETS)
 
 
+def compute_similar_tracks(df: 'pd.DataFrame', seed_mmsi: int, seed_seg: int,
+                           buffer_m: float, min_coverage: float) -> list[list[int]]:
+    """Return [[mmsi, segment_id], ...] for tracks that pass within buffer_m of the seed
+    and have at least min_coverage fraction of their points inside the buffer polygon."""
+    import geopandas as gpd
+    from shapely.geometry import LineString, Polygon
+    from pyproj import Transformer
+
+    seed_df = df[(df['mmsi'] == seed_mmsi) & (df['segment_id'] == seed_seg)]
+    if len(seed_df) < 2:
+        return []
+
+    lon_c = float(seed_df['longitude'].mean())
+    lat_c = float(seed_df['latitude'].mean())
+    zone = int((lon_c + 180) / 6) + 1
+    epsg = 32600 + zone if lat_c >= 0 else 32700 + zone
+
+    to_utm = Transformer.from_crs('EPSG:4326', f'EPSG:{epsg}', always_xy=True)
+    to_wgs = Transformer.from_crs(f'EPSG:{epsg}', 'EPSG:4326', always_xy=True)
+
+    seed_xy = [to_utm.transform(lon, lat)
+               for lon, lat in zip(seed_df['longitude'], seed_df['latitude'])]
+    buf_utm = LineString(seed_xy).buffer(buffer_m)
+    buf_wgs_coords = [to_wgs.transform(x, y) for x, y in buf_utm.exterior.coords]
+    buf_poly = Polygon(buf_wgs_coords)
+
+    other = df[~((df['mmsi'] == seed_mmsi) & (df['segment_id'] == seed_seg))].copy()
+    if len(other) == 0:
+        return []
+
+    gdf = gpd.GeoDataFrame(
+        other[['mmsi', 'segment_id']],
+        geometry=gpd.points_from_xy(other['longitude'], other['latitude']),
+        crs='EPSG:4326',
+    )
+    gdf_buf = gpd.GeoDataFrame(geometry=[buf_poly], crs='EPSG:4326')
+    joined = gpd.sjoin(gdf, gdf_buf, how='left', predicate='within')
+    joined['_in'] = ~joined['index_right'].isna()
+    fractions = joined.groupby(['mmsi', 'segment_id'])['_in'].mean()
+    return [[int(m), int(s)] for (m, s), frac in fractions.items() if frac >= min_coverage]
+
+
+@app.server.route('/api/similar_tracks', methods=['POST'])
+def _r_similar_tracks():
+    body = request.get_json(force=True, silent=True) or {}
+    seed_mmsi = body.get('mmsi')
+    seed_seg  = body.get('segment_id')
+    buffer_m  = float(body.get('buffer_m', 200))
+    min_cov   = float(body.get('min_coverage', 0.5))
+    if seed_mmsi is None or seed_seg is None:
+        return jsonify({'error': 'mmsi and segment_id required'}), 400
+    ref_df = df_vessels if len(df_vessels) > 0 else None
+    if ref_df is None:
+        return jsonify({'error': 'no track data — run Filter first'}), 400
+    try:
+        result = compute_similar_tracks(ref_df, int(seed_mmsi), int(seed_seg), buffer_m, min_cov)
+        return jsonify({'mmsi_segs': result})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
 @app.server.route('/api/raster.png')
 def _r_raster(): return Response(PNG_BYTES, mimetype='image/png')
 
 
-@app.server.route('/api/inventory')
-def _r_inventory(): return jsonify(EXAMPLE_FILES)
+# ---------------------------------------------------------------------------
+# Dev-load: scan for output dirs + load pre-computed data without pipeline run
+# ---------------------------------------------------------------------------
+def _scan_output_dirs() -> list[str]:
+    """Return relative paths to directories that contain loadable dev-cache data."""
+    candidates = []
+    # Standard output/ at repo root
+    if (REPO / 'output').is_dir():
+        candidates.append('output')
+    # data/*/output  (one level of project subdirectory)
+    data_root = REPO / 'data'
+    if data_root.is_dir():
+        for p in sorted(data_root.glob('*/output')):
+            if p.is_dir():
+                candidates.append(str(p.relative_to(REPO)).replace('\\', '/'))
+    return candidates
+
+
+def _dev_load(directory: str) -> dict:
+    """Load pre-computed vessel/wave data from *directory* and rebuild IPC caches.
+
+    Resolution order per asset:
+      Tracks → vessels.parquet → *_03_vessel.csv → *_01_filtered.csv
+      Waves  → waves.parquet   → *_04_wave_impact.csv → shore_impact.csv
+    """
+    global df_vessels, df_waves, IPC_VESSELS, IPC_WAVES
+    global IPC_TRACK_COORDS, IPC_TRACK_META, IPC_TRACK_OFFSETS, PNG_BYTES, seg_meta
+
+    p = (REPO / directory).resolve()
+    if not p.is_dir():
+        raise FileNotFoundError(f'directory not found: {directory}')
+
+    # ---- Vessel / track data ----
+    df_v = None
+    for src in [
+        p / 'vessels.parquet',
+        *sorted(p.glob('*_03_vessel.csv')),
+        *sorted(p.glob('*_01_filtered.csv')),
+    ]:
+        if src.exists():
+            print(f'  dev-load vessels: {src.name}')
+            df_v = pd.read_parquet(src) if src.suffix == '.parquet' else pd.read_csv(src)
+            if 'obstime' in df_v.columns:
+                df_v['obstime'] = pd.to_datetime(df_v['obstime'])
+            break
+    if df_v is None:
+        raise FileNotFoundError('No vessel data found in directory')
+
+    # ---- Wave / impact data ----
+    df_w = None
+    for src in [
+        p / 'waves.parquet',
+        *sorted(p.glob('*_04_wave_impact.csv')),
+        p / 'shore_impact.csv',
+    ]:
+        if src.exists():
+            print(f'  dev-load waves: {src.name}')
+            df_w = pd.read_parquet(src) if src.suffix == '.parquet' else pd.read_csv(src)
+            break
+
+    _build_vessel_caches(df_v)
+    if df_w is not None:
+        # Normalise DateTime to datetime64 so the obstime join key matches
+        if 'DateTime' in df_w.columns and df_w['DateTime'].dtype == object:
+            df_w['DateTime'] = pd.to_datetime(df_w['DateTime'], errors='coerce')
+        enriched = _ensure_vessel_columns(df_w, df_v) if len(df_v) > 0 else df_w
+        _build_wave_caches(enriched)
+    else:
+        # Reset wave caches to empty
+        _build_wave_caches(df_waves.iloc[:0].copy())
+
+    with _pipeline_lock:
+        PIPELINE_STATE['track_version'] += 1
+        if df_w is not None:
+            PIPELINE_STATE['wave_version'] += 1
+        tv = PIPELINE_STATE['track_version']
+        wv = PIPELINE_STATE['wave_version']
+
+    return {
+        'track_version': tv,
+        'wave_version': wv,
+        'n_segs': len(seg_meta),
+        'n_waves': len(df_waves),
+        'source': directory,
+    }
+
+
+@app.server.route('/api/dev_load', methods=['POST'])
+def _r_dev_load():
+    body = request.get_json(force=True, silent=True) or {}
+    directory = body.get('directory', '')
+    if not directory:
+        return jsonify({'error': 'directory required'}), 400
+    try:
+        result = _dev_load(directory)
+        return jsonify(result)
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return jsonify({'error': str(e)}), 500
 
 
 def _safe_repo_path(rel: str) -> Path:
@@ -851,26 +1136,19 @@ def _opt_list(items: list[str]) -> list[dict]:
     return [{'label': Path(p).name, 'value': p} for p in items]
 
 
-_default_ais = next((p for p in EXAMPLE_FILES['ais'] if 'AIS_2563' in p),
-                    EXAMPLE_FILES['ais'][0] if EXAMPLE_FILES['ais'] else None)
-_default_bathy = next((p for p in EXAMPLE_FILES['bathymetry'] if '61803960_WestCoast' in p),
-                      EXAMPLE_FILES['bathymetry'][0] if EXAMPLE_FILES['bathymetry'] else None)
-_default_coast = next((p for p in EXAMPLE_FILES['coastline'] if 'Coast_P1' in p),
-                      EXAMPLE_FILES['coastline'][0] if EXAMPLE_FILES['coastline'] else None)
-_default_land = next((p for p in EXAMPLE_FILES['land'] if 'RD7550' in p),
-                     EXAMPLE_FILES['land'][0] if EXAMPLE_FILES['land'] else None)
-_default_tide = next((p for p in EXAMPLE_FILES['tide'] if '_6min' in p),
-                     EXAMPLE_FILES['tide'][0] if EXAMPLE_FILES['tide'] else None)
+# All defaults start blank — user must select files explicitly.
 
 
 def _picker_with_preview(label: str, dropdown_id: str, preview_id: str,
-                         info_id: str, options: list, value, clearable=False):
+                         info_id: str, options: list, value, clearable=False,
+                         placeholder=''):
     """Dropdown row with a preview tickbox on the side (no refresh button)."""
     return html.Div([
         html.Label(label),
         html.Div([
             dcc.Dropdown(id=dropdown_id, options=_opt_list(options),
-                         value=value, clearable=clearable),
+                         value=value, clearable=clearable, placeholder=placeholder,
+                         className='compact-dropdown', style={'fontSize': '10px'}),
             html.Div(
                 dcc.Checklist(id=preview_id, options=[{'label': 'preview', 'value': '1'}],
                               value=[]),
@@ -881,23 +1159,85 @@ def _picker_with_preview(label: str, dropdown_id: str, preview_id: str,
     ])
 
 
+_RSB_SECTION = {'fontSize': '11px', 'fontWeight': '700', 'color': '#8899bb',
+                'textTransform': 'uppercase', 'letterSpacing': '0.8px',
+                'margin': '8px 0 3px', 'borderBottom': '1px solid #d8dfe8',
+                'paddingBottom': '2px'}
+_RSB_INPUT = {'width': '76px', 'fontSize': '11px', 'padding': '2px 5px',
+              'boxSizing': 'border-box', 'border': '1px solid #c8d4e0',
+              'borderRadius': '3px', 'background': '#f6f8fb', 'color': '#223',
+              'fontFamily': 'ui-monospace, Consolas, monospace',
+              'flexShrink': '0', 'textAlign': 'right'}
+_RSB_DESC = {'fontSize': '10px', 'color': '#8899aa', 'margin': '0',
+             'lineHeight': '1.25'}
+_RSB_LABEL = {'fontWeight': '700', 'fontSize': '11px', 'color': '#445',
+              'lineHeight': '1.2', 'marginBottom': '1px'}
+_RSB_ROW = {'display': 'flex', 'alignItems': 'flex-start',
+            'marginBottom': '2px', 'gap': '8px'}
+
+
+def _rsb_num(label, pid, default, desc):
+    return html.Div([
+        html.Div([
+            html.Div(label, style=_RSB_LABEL),
+            html.Div(desc, style=_RSB_DESC),
+        ], style={'flex': 1, 'minWidth': 0}),
+        dcc.Input(id=pid, type='number', value=default, debounce=True, style=_RSB_INPUT),
+    ], style=_RSB_ROW)
+
+
+def _rsb_dd(label, pid, options, default, desc):
+    return html.Div([
+        html.Div([
+            html.Div(label, style=_RSB_LABEL),
+            html.Div(desc, style=_RSB_DESC),
+        ], style={'flex': 1, 'minWidth': 0}),
+        html.Div(
+            dcc.Dropdown(id=pid, options=options, value=default, clearable=False,
+                         className='compact-dropdown', style={'fontSize': '10px'}),
+            style={'width': '150px', 'flexShrink': '0'},
+        ),
+    ], style=_RSB_ROW)
+
 app.layout = html.Div([
     html.Div([
-        html.Span(id='cnt-vessels', children=f'vessels {len(df_vessels):,}'),
-        ' | ', html.Span(id='cnt-segs',    children=f'segments {len(seg_meta):,}'),
-        ' | ', html.Span(id='cnt-waves',   children=f'waves {len(df_waves):,}'),
-        ' | ', html.Span(id='status', children='loading...'),
-        ' | ', html.Span(id='click-info', style={'fontWeight': 'bold'}),
+        html.Div([
+            dcc.Dropdown(id='sel-workdir', options=[], value=None, clearable=False,
+                         placeholder='Select a data/ subfolder...',
+                         className='compact-dropdown',
+                         style={'fontSize': '10px', 'minWidth': '200px'}),
+        ], id='workdir-wrapper'),
+        html.Button('＋ Folder', id='btn-new-folder', n_clicks=0,
+                    title='Create a new project folder in data/',
+                    style={'padding': '3px 10px', 'fontSize': '11px', 'background': '#e8f0f8',
+                           'border': '1px solid #a8c0d8', 'borderRadius': '4px',
+                           'cursor': 'pointer', 'color': '#3a6080', 'whiteSpace': 'nowrap',
+                           'flexShrink': '0', 'fontWeight': '600'}),
+        html.Div([
+            html.Span(id='cnt-vessels', children=f'vessels {len(df_vessels):,}'),
+            ' | ', html.Span(id='cnt-segs',    children=f'segments {len(seg_meta):,}'),
+            ' | ', html.Span(id='cnt-waves',   children=f'waves {len(df_waves):,}'),
+            ' | ', html.Span(id='status', children='loading...'),
+            ' | ', html.Span(id='click-info', style={'fontWeight': 'bold'}),
+        ], id='banner-meta'),
     ], id='status-banner'),
 
     html.Div([
-        html.H4('Run pipeline'),
 
-        # ---- AIS Data: dropdown + preview tickbox beside it, then Import/Filter below ----
+        # ---- Coastline & Land mask first — user confirms these before AIS ----
+        _picker_with_preview('Coastline (block/calculate waves)', 'sel-coast', 'pv-coast',
+                             'pv-coast-info', [], None, clearable=True,
+                             placeholder='Select shapefile...'),
+        _picker_with_preview('Land (filter AIS data)', 'sel-land', 'pv-land',
+                             'pv-land-info', [], None, clearable=True,
+                             placeholder='Select shapefile...'),
+
+        # ---- AIS Data ----
         html.Label('AIS Data'),
         html.Div([
-            dcc.Dropdown(id='sel-ais', options=_opt_list(EXAMPLE_FILES['ais']),
-                         value=_default_ais, clearable=False),
+            dcc.Dropdown(id='sel-ais', options=[], value=None, clearable=True,
+                         placeholder='Select AIS CSV...',
+                         className='compact-dropdown', style={'fontSize': '10px'}),
             html.Div(
                 dcc.Checklist(id='pv-ais',
                               options=[{'label': 'preview', 'value': '1'}],
@@ -905,84 +1245,276 @@ app.layout = html.Div([
                 className='preview-box',
             ),
         ], className='row-with-preview'),
+        html.Div(id='pv-ais-info', className='preview-info'),
         html.Div([
             html.Button('Import', id='btn-import-ais', n_clicks=0,
                         title='Load the selected AIS CSV onto the map',
                         className='secondary-btn'),
-            html.Button('Filter', id='btn-filter', n_clicks=0,
+            html.Button('Filter', id='btn-filter', n_clicks=0, disabled=True,
                         title='Run Stage 1: AIS cleaning + interpolation',
                         className='secondary-btn'),
         ], className='row-buttons'),
-        html.Div(id='pv-ais-info', className='preview-info'),
 
         _picker_with_preview('Bathymetry', 'sel-bathy', 'pv-bathy',
-                             'pv-bathy-info', EXAMPLE_FILES['bathymetry'],
-                             _default_bathy),
-        _picker_with_preview('Coastline (wave shore)', 'sel-coast', 'pv-coast',
-                             'pv-coast-info', EXAMPLE_FILES['coastline'],
-                             _default_coast),
-
-        _picker_with_preview('Land mask (filter)', 'sel-land', 'pv-land',
-                             'pv-land-info', EXAMPLE_FILES['land'],
-                             _default_land),
-
+                             'pv-bathy-info', [], None, clearable=True,
+                             placeholder='Select .dfsu or .mesh file...'),
         _picker_with_preview('Tide DFS0', 'sel-tide', 'pv-tide',
-                             'pv-tide-info', EXAMPLE_FILES['tide'],
-                             _default_tide, clearable=True),
-
-        html.Label('Interpolation method'),
-        dcc.Dropdown(id='sel-interp', options=INTERP_METHODS,
-                     value='linear', clearable=False),
-
-        html.Label('Cb method (Le determination)'),
-        dcc.Dropdown(id='sel-cb',
-                     options=[{'label': m, 'value': m} for m in CB_METHODS],
-                     value='L_Le', clearable=False),
+                             'pv-tide-info', [], None, clearable=True,
+                             placeholder='Select .dfs0 file...'),
+        # Hidden original dropdown — value still set by _populate_tide_items and read by kick callbacks
+        html.Div(
+            id='sel-tide-item-row',
+            style={'display': 'none'},
+            children=[
+                dcc.Dropdown(id='sel-tide-item', options=[], value=None,
+                             clearable=False, placeholder='Select tide item...',
+                             className='compact-dropdown', style={'fontSize': '10px'}),
+            ],
+        ),
+        # Custom tide-item cascade: pills shown below the DFS0 picker when file is selected
+        html.Div(id='tide-item-pills', style={'display': 'none'},
+                 children=[
+                     html.Span('▶ Tide elevation item:', style={
+                         'fontSize': '10px', 'color': '#556', 'fontWeight': '600',
+                         'display': 'block', 'marginBottom': '2px', 'paddingLeft': '12px',
+                         'borderLeft': '2px solid #a8c0d8',
+                     }),
+                     html.Div(id='tide-item-pills-inner',
+                              style={'display': 'flex', 'flexWrap': 'wrap', 'gap': '4px',
+                                     'paddingLeft': '12px'}),
+                 ]),
+        # Hidden trigger button + store for JS → Dash item selection
+        html.Button(id='_tide-item-btn', n_clicks=0, style={'display': 'none'}),
+        dcc.Store(id='_tide_item_pick', data={'value': None, 'nonce': 0}),
 
         html.Div([
-            html.Button('Calculate waves', id='btn-waves', n_clicks=0,
+            html.Button('Calculate waves', id='btn-waves', n_clicks=0, disabled=True,
                         title='Run depth + vessel + wave_impact stages '
                               '(auto-runs filter first if needed)'),
         ], className='row-buttons'),
 
-        # ---- Debug filter: isolate a single track segment for spike inspection ----
+        # ---- Track visualization filter ----
         html.Hr(),
-        html.Div('Debug: isolate one track segment',
+        html.Div('Vessel Track Visualization Filter',
                  style={'fontWeight': 'bold', 'fontSize': '11px', 'color': '#555'}),
+        # Hidden Dash dropdowns for callback compatibility (driven by JS cascade widget)
+        dcc.Dropdown(id='fil-mmsi', options=[], value=None, clearable=True,
+                     style={'display': 'none'}),
+        dcc.Dropdown(id='fil-segs', options=[], value=None, multi=True,
+                     style={'display': 'none'}),
+        # Cascading MMSI → Segment picker (populated by JS from track data)
+        html.Label('MMSI / Segment', style={'margin': '4px 0 2px'}),
         html.Div([
-            html.Div([
-                html.Label('MMSI', style={'margin': '4px 0 2px'}),
-                dcc.Input(id='inp-debug-mmsi', type='number',
-                          placeholder='e.g. 372490000', debounce=True,
-                          style={'width': '100%', 'fontSize': '11px',
-                                 'padding': '4px', 'boxSizing': 'border-box'}),
-            ], style={'flex': 1}),
-            html.Div([
-                html.Label('segment', style={'margin': '4px 0 2px'}),
-                dcc.Input(id='inp-debug-seg', type='number',
-                          placeholder='e.g. 5730', debounce=True,
-                          style={'width': '100%', 'fontSize': '11px',
-                                 'padding': '4px', 'boxSizing': 'border-box'}),
-            ], style={'flex': 1, 'marginLeft': '6px'}),
-        ], style={'display': 'flex'}),
+            html.Div('All tracks', id='cascade-mmsi-trigger', className='cascade-trigger'),
+            html.Div(id='cascade-mmsi-panel', className='cascade-panel',
+                     style={'display': 'none'}),
+        ], id='cascade-mmsi-seg', style={'position': 'relative', 'marginBottom': '4px'}),
+        html.Label('Vessel Type', style={'margin': '4px 0 2px'}),
+        dcc.Dropdown(id='fil-type', options=[], value=None, multi=True, clearable=True,
+                     placeholder='All types', searchable=True,
+                     className='compact-dropdown', style={'fontSize': '10px'}),
         html.Div([
-            html.Button('Isolate', id='btn-debug-apply', n_clicks=0,
+            html.Button('Free-hand', id='btn-freehand', n_clicks=0,
                         className='secondary-btn',
-                        title='Hide all other tracks; show this segment + each AIS point'),
-            html.Button('Show all', id='btn-debug-clear', n_clicks=0,
+                        title='Draw a line on the map — selects all crossed tracks'),
+            html.Button('Similar', id='btn-similar', n_clicks=0,
                         className='secondary-btn',
-                        title='Restore the full track view'),
+                        title='Pick a track then find tracks with similar routing'),
         ], className='row-buttons'),
-        html.Div(id='debug-info', className='preview-info'),
+        # Inline Similar panel (hidden until a track is picked)
+        html.Div([
+            html.Div('', id='sim-picked-label',
+                     style={'fontSize': '10px', 'color': '#445', 'marginBottom': '5px',
+                            'fontWeight': '600'}),
+            html.Div([
+                html.Span('Buffer (m):', style={'fontSize': '10px', 'marginRight': '4px',
+                                                'whiteSpace': 'nowrap'}),
+                dcc.Input(id='sim-buffer-m', type='number', value=200, debounce=True,
+                          style={'width': '70px', 'fontSize': '10px', 'padding': '2px 4px',
+                                 'border': '1px solid #c8d4e0', 'borderRadius': '3px'}),
+                html.Span('Coverage:', style={'fontSize': '10px', 'margin': '0 4px',
+                                              'whiteSpace': 'nowrap'}),
+                dcc.Input(id='sim-coverage', type='number', value=0.5, debounce=True,
+                          style={'width': '60px', 'fontSize': '10px', 'padding': '2px 4px',
+                                 'border': '1px solid #c8d4e0', 'borderRadius': '3px'}),
+            ], style={'display': 'flex', 'alignItems': 'center', 'marginBottom': '5px',
+                      'flexWrap': 'wrap', 'gap': '3px'}),
+            html.Div([
+                html.Button('Confirm', id='btn-sim-confirm', n_clicks=0,
+                            className='secondary-btn'),
+                html.Button('Cancel', id='btn-sim-cancel', n_clicks=0,
+                            className='secondary-btn'),
+            ], className='row-buttons'),
+        ], id='sim-panel',
+           style={'display': 'none', 'background': '#eef2f7', 'borderRadius': '4px',
+                  'padding': '7px 8px', 'margin': '4px 0',
+                  'border': '1px solid #bcd0e4'}),
+        html.Div([
+            html.Button('Apply filters', id='btn-fil-apply', n_clicks=0,
+                        className='secondary-btn'),
+            html.Button('Clear all', id='btn-fil-clear', n_clicks=0,
+                        className='secondary-btn'),
+        ], className='row-buttons'),
+        html.Div('', id='fil-status',
+                 style={'fontSize': '10px', 'color': '#556', 'marginTop': '3px',
+                        'minHeight': '14px'}),
 
         html.Hr(),
         html.Div('Progress', style={'fontWeight': 'bold'}),
         html.Pre(id='progress-log', children='(idle)'),
         html.Div(id='progress-elapsed-side',
                  style={'fontSize': '11px', 'color': '#666', 'marginTop': '4px'}),
+
+        html.Hr(),
+        html.Div('Dev: Load from disk', style={'fontWeight': 'bold', 'fontSize': '11px',
+                                               'color': '#7a6040', 'marginBottom': '4px'}),
+        html.Div('Load pre-computed output without re-running the pipeline.',
+                 style={'fontSize': '10px', 'color': '#998877', 'marginBottom': '4px'}),
+        dcc.Dropdown(id='sel-dev-dir', options=[], value=None, clearable=True,
+                     placeholder='Select output directory…',
+                     className='compact-dropdown', style={'fontSize': '10px'}),
+        html.Div([
+            html.Button('Load', id='btn-dev-load', n_clicks=0,
+                        className='secondary-btn',
+                        style={'background': '#f2ede4 !important', 'color': '#7a6040',
+                               'borderColor': '#c8b488'}),
+        ], className='row-buttons', style={'marginTop': '4px'}),
+        html.Div('', id='dev-load-status',
+                 style={'fontSize': '10px', 'color': '#7a6040', 'marginTop': '3px',
+                        'minHeight': '14px'}),
     ], id='sidebar'),
 
     html.Div(id='deck-container'),
+    # New folder form — fixed panel below the workdir dropdown
+    html.Div(id='new-folder-form', style={'display': 'none'}, children=[
+        dcc.Input(id='inp-new-folder', type='text', placeholder='folder name',
+                  debounce=False,
+                  style={'fontSize': '11px', 'padding': '4px 8px', 'borderRadius': '4px',
+                         'border': '1px solid #b0c4d8', 'width': '160px',
+                         'outline': 'none'}),
+        html.Button('Create', id='btn-create-folder', n_clicks=0,
+                    style={'fontSize': '11px', 'padding': '4px 10px', 'background': '#4a85b5',
+                           'color': 'white', 'border': '1px solid #3a75a5', 'borderRadius': '4px',
+                           'cursor': 'pointer', 'fontWeight': '600'}),
+        html.Button('✕', id='btn-cancel-folder', n_clicks=0,
+                    style={'fontSize': '11px', 'padding': '4px 8px', 'background': '#eef2f7',
+                           'border': '1px solid #a8c0d8', 'borderRadius': '4px',
+                           'cursor': 'pointer', 'color': '#556'}),
+        html.Span(id='new-folder-status', style={'fontSize': '10px', 'color': '#c44'}),
+    ]),
+    # Setup overlay — blocks UI until a working directory is selected
+    html.Div(id='setup-overlay', children=[
+        html.Div('Select a working directory to begin',
+                 style={'color': 'white', 'background': 'rgba(0,0,0,0.65)',
+                        'padding': '14px 28px', 'borderRadius': '8px',
+                        'fontSize': '14px', 'fontWeight': '600', 'letterSpacing': '0.2px'}),
+    ]),
+    # Freehand draw canvas (overlaid on deck-container, managed by JS)
+    html.Canvas(id='freehand-canvas', style={
+        'position': 'fixed', 'top': '40px', 'left': '340px', 'right': '0', 'bottom': '0',
+        'pointerEvents': 'none', 'zIndex': '3', 'display': 'none',
+    }),
+    # Floating legend (bottom-right of map area)
+    html.Div(id='map-legend', style={
+        'position': 'fixed', 'bottom': '20px', 'right': '20px',
+        'zIndex': '10', 'background': 'rgba(16,18,28,0.88)',
+        'borderRadius': '8px', 'padding': '10px 14px',
+        'color': '#eee', 'fontSize': '10px', 'fontFamily': 'system-ui, sans-serif',
+        'minWidth': '160px', 'display': 'none',
+        'boxShadow': '0 2px 12px rgba(0,0,0,0.45)',
+        'border': '1px solid rgba(255,255,255,0.08)',
+        'lineHeight': '1.4',
+    }),
+
+    # ---- Collapsible right sidebar: pipeline configuration ----
+    html.Div([
+        html.Div('⚙ Pipeline Config',
+                 style={'fontWeight': '700', 'fontSize': '12px', 'color': '#334',
+                        'marginBottom': '2px', 'letterSpacing': '0.2px',
+                        'fontFamily': 'ui-monospace, Consolas, monospace'}),
+        html.Div('Parameters read at run time — changes take effect on next Filter / Calculate.',
+                 style={'fontSize': '9px', 'color': '#99a', 'marginBottom': '6px',
+                        'lineHeight': '1.3'}),
+
+        # ── AIS Cleaning ──────────────────────────────────────────────────
+        html.Div('AIS Cleaning', style=_RSB_SECTION),
+        _rsb_num('Minimum Speed Filter (min_speed_knots)', 'rsb-min-speed', 0.0,
+                 'Strip AIS fixes where SOG is below this threshold'),
+        _rsb_num('Time Gap to Split Segments (traj_gap_s)', 'rsb-traj-gap', 180.0,
+                 'Split a track into separate segments when AIS silence exceeds this'),
+        _rsb_num('Max Position Jump Speed (max_velocity_knots)', 'rsb-max-velocity', 36.0,
+                 'Flag fix as positional error if implied displacement speed exceeds this'),
+        _rsb_num('Max Implied Acceleration (max_acceleration_ms2)', 'rsb-max-accel', 10.0,
+                 'Flag SOG/COG as erroneous if implied acceleration between fixes exceeds this'),
+        _rsb_num('Max Draught-to-Beam Ratio (max_draught_to_width)', 'rsb-max-dw', 1.0,
+                 'Discard vessel if reported draught divided by beam exceeds this ratio'),
+        _rsb_num('Stationary Speed Threshold (low_sog_threshold_ms)', 'rsb-low-sog', 1.0,
+                 'SOG below this is treated as stationary — affects mixed interpolation and speed checks'),
+        _rsb_num('Position vs. Reported Speed Ratio (velocity_ratio_threshold)', 'rsb-vel-ratio', 2.0,
+                 'Flag fix if GPS-derived displacement speed exceeds this multiple of the reported SOG'),
+        _rsb_num('Min Speed Consistency Ratio (speed_consistency_ratio)', 'rsb-spd-ratio', 0.5,
+                 'Flag fix if GPS-derived speed falls below this fraction of the AIS velocity vector'),
+
+        # ── Interpolation ─────────────────────────────────────────────────
+        html.Div('Interpolation', style=_RSB_SECTION),
+        _rsb_dd('Interpolation Method (interp_method)', 'rsb-interp',
+                [{'label': 'linear — straight-line between raw fixes (default)', 'value': 'linear'},
+                 {'label': 'hermite — cubic spline using SOG/COG as velocity', 'value': 'hermite'},
+                 {'label': 'mixed — linear when both ends stationary', 'value': 'mixed'}],
+                'linear',
+                'Method used to fill gaps between consecutive raw AIS fixes'),
+        _rsb_num('Resampling Time Step (interp_interval_s)', 'rsb-interp-interval', 30.0,
+                 'Output time step after resampling the interpolated trajectory'),
+
+        # ── Vessel ────────────────────────────────────────────────────────
+        html.Div('Vessel', style=_RSB_SECTION),
+        _rsb_dd('Block Coefficient Method (cb_method)', 'rsb-cb-method',
+                [{'label': 'L_Le — waterline / bow-entry length ratio (default)', 'value': 'L_Le'},
+                 {'label': 'B_Le — beam / bow-entry length ratio', 'value': 'B_Le'},
+                 {'label': 'table — lookup Cb by vessel type', 'value': 'table'}],
+                'L_Le',
+                'Method used to estimate block coefficient Cb from vessel dimensions'),
+        _rsb_num('Waterline Length Factor (waterline_factor)', 'rsb-waterline', 0.8,
+                 'Waterline length = LOA × this factor (Kriebel requires Lw, not LOA)'),
+
+        # ── Wave Model ────────────────────────────────────────────────────
+        html.Div('Wave Model', style=_RSB_SECTION),
+        _rsb_dd('Wake Height Formula (formula)', 'rsb-formula',
+                [{'label': 'kriebel (2005) — default', 'value': 'kriebel'},
+                 {'label': 'bhowmik (1982)', 'value': 'bhowmik'},
+                 {'label': 'blaauw (1984)', 'value': 'blaauw'},
+                 {'label': 'gates (1977)', 'value': 'gates'},
+                 {'label': 'maynord (1987)', 'value': 'maynord'},
+                 {'label': 'pianc (modified)', 'value': 'pianc'},
+                 {'label': 'sorensen (1967)', 'value': 'sorensen'}],
+                'kriebel',
+                'Empirical formula used to compute wake wave height at the shore'),
+        _rsb_num('Local Gravity (gravity)', 'rsb-gravity', 9.78,
+                 'Gravitational acceleration — Singapore ≈ 9.78, international standard 9.81'),
+        _rsb_num('Max Vessel Speed for Model (max_sog_knots)', 'rsb-max-sog', 12.0,
+                 'Discard vessel events with SOG above this — outside the formula valid range'),
+        _rsb_num('Max Beam-to-Length Ratio (max_bl_ratio)', 'rsb-max-bl', 0.3,
+                 'Discard vessel if beam divided by length exceeds this — atypical hull shape'),
+
+        # ── Kriebel Applicability Limits ──────────────────────────────────
+        html.Div('Kriebel Limits', style=_RSB_SECTION),
+        _rsb_num('Min Modified Froude Number (min_Froude_M)', 'rsb-min-froude', 0.1,
+                 'Lower bound on Fr* — vessel must be in the wave-making regime'),
+        _rsb_num('Max Modified Froude Number (max_Froude_M)', 'rsb-max-froude', 0.5,
+                 'Upper bound on Fr* — avoids supercritical / planing regime'),
+        _rsb_num('Max BF Coefficient (max_bf)', 'rsb-max-bf', 0.4,
+                 'Upper bound on BF = β·(Fr*−0.1)² — no Kriebel calibration data exceeds 0.4'),
+
+        # ── Wave Impact ───────────────────────────────────────────────────
+        html.Div('Wave Impact', style=_RSB_SECTION),
+        _rsb_num('Max Wake Ray Distance (max_propagation_m)', 'rsb-max-prop', 2000.0,
+                 'Wake rays extending beyond this distance from the vessel are discarded'),
+        _rsb_num('Min Recorded Wave Height (wake_cutoff_m)', 'rsb-wake-cutoff', 0.01,
+                 'Minimum shore wave height to record — smaller events are dropped'),
+    ], id='right-sidebar'),
+
+    html.Button('◀', id='btn-rsb-toggle', n_clicks=0, title='Toggle config panel'),
+
     dcc.Interval(id='boot', max_intervals=1, interval=200),
     dcc.Interval(id='poll', interval=400, disabled=True),
     dcc.Store(id='_init'),
@@ -995,28 +1527,132 @@ app.layout = html.Div([
     dcc.Store(id='_pv_coast', data={'visible': False, 'path': None}),
     dcc.Store(id='_pv_land',  data={'visible': False, 'path': None}),
     dcc.Store(id='_pv_tide',  data={'visible': False, 'path': None}),
-    dcc.Store(id='_debug_filter', data={'mmsi': None, 'segment_id': None, 'nonce': 0}),
+    dcc.Store(id='_filter_structural', data={'mmsi': None, 'seg_ids': [], 'types': [], 'nonce': 0}),
+    dcc.Store(id='_dev_load_result'),
+    dcc.Store(id='_tide_items_meta', data=[]),  # items list for custom pill selector
 ])
+
+
+# ---------------------------------------------------------------------------
+# Working-directory callback: populates all file dropdowns
+# ---------------------------------------------------------------------------
+@app.callback(
+    Output('sel-workdir', 'options'),
+    Input('boot', 'n_intervals'),
+    prevent_initial_call=False,
+)
+def _populate_workdir_dirs(_):
+    return _scan_data_subdirs()
+
+
+@app.callback(
+    Output('sel-ais',   'options'),
+    Output('sel-bathy', 'options'),
+    Output('sel-coast', 'options'),
+    Output('sel-land',  'options'),
+    Output('sel-tide',  'options'),
+    Input('sel-workdir', 'value'),
+    prevent_initial_call=False,
+)
+def _update_file_dropdowns(workdir):
+    files = _scan_working_dir(workdir)
+    return (
+        _opt_list(files['ais']),
+        _opt_list(files['bathymetry']),
+        _opt_list(files['coastline']),
+        _opt_list(files['land']),
+        _opt_list(files['tide']),
+    )
+
+
+@app.callback(
+    Output('setup-overlay', 'style'),
+    Input('sel-workdir', 'value'),
+    prevent_initial_call=False,
+)
+def _toggle_setup_overlay(workdir):
+    shown = {'position': 'fixed', 'top': '40px', 'left': 0, 'right': 0, 'bottom': 0,
+             'background': 'rgba(0,0,0,0.45)', 'zIndex': 20, 'cursor': 'not-allowed',
+             'display': 'flex', 'alignItems': 'center', 'justifyContent': 'center'}
+    return {'display': 'none'} if workdir else shown
+
+
+@app.callback(
+    Output('new-folder-form', 'style'),
+    Input('btn-new-folder', 'n_clicks'),
+    Input('btn-cancel-folder', 'n_clicks'),
+    prevent_initial_call=True,
+)
+def _toggle_folder_form(n_new, n_cancel):
+    from dash import ctx
+    if ctx.triggered_id == 'btn-new-folder' and n_new:
+        return {'display': 'flex'}
+    return {'display': 'none'}
+
+
+@app.callback(
+    Output('sel-workdir', 'options', allow_duplicate=True),
+    Output('sel-workdir', 'value', allow_duplicate=True),
+    Output('new-folder-form', 'style', allow_duplicate=True),
+    Output('new-folder-status', 'children'),
+    Input('btn-create-folder', 'n_clicks'),
+    State('inp-new-folder', 'value'),
+    prevent_initial_call=True,
+)
+def _create_folder(n, name):
+    if not n or not name or not name.strip():
+        return no_update, no_update, no_update, 'Enter a folder name'
+    name = name.strip()
+    if any(c in name for c in ('/', '\\', '..', ':')):
+        return no_update, no_update, no_update, 'Invalid name'
+    base = DATA_ROOT / name
+    for sub in ('ais', 'coastline', 'land', 'bathymetry', 'tide', 'output'):
+        (base / sub).mkdir(parents=True, exist_ok=True)
+    return _scan_data_subdirs(), f'data/{name}', {'display': 'none'}, ''
 
 
 # ---------------------------------------------------------------------------
 # Server-side callbacks: run buttons + polling
 # ---------------------------------------------------------------------------
-def _build_config(ais, land, bathy, coast, tide, cb_method, interp_method='linear') -> dict:
-    ais_cfg = {'raw_csv': ais, 'land_shp': land, 'min_speed_knots': 0.0}
-    if interp_method:
-        ais_cfg['interp_method'] = interp_method
+def _build_config(ais, land, bathy, coast, tide, tide_item=None,
+                  min_speed=0.0, traj_gap=180.0, interp='linear', interp_interval=30.0,
+                  cb_method='L_Le', max_prop=2000.0, max_sog=12.0,
+                  max_velocity=36.0, max_accel=10.0, max_dw=1.0,
+                  low_sog=1.0, vel_ratio=2.0, spd_ratio=0.5,
+                  waterline=0.8, formula='kriebel', gravity=9.78,
+                  max_bl=0.3, min_froude=0.1, max_froude=0.5, max_bf=0.4,
+                  wake_cutoff=0.01) -> dict:
     cfg = {
-        'ais': ais_cfg,
-        'vessel': {'cb_method': cb_method} if cb_method else {},
-        'bathymetry': {'source': bathy},
+        'ais': {'raw_csv': ais, 'land_shp': land,
+                'min_speed_knots': float(min_speed or 0.0),
+                'traj_gap_s': float(traj_gap or 180.0),
+                'interp_method': interp or 'linear',
+                'interp_interval_s': float(interp_interval or 30.0),
+                'max_velocity_knots': float(max_velocity or 36.0),
+                'max_acceleration_ms2': float(max_accel or 10.0),
+                'max_draught_to_width': float(max_dw or 1.0),
+                'low_sog_threshold_ms': float(low_sog or 1.0),
+                'velocity_ratio_threshold': float(vel_ratio or 2.0),
+                'speed_consistency_ratio': float(spd_ratio or 0.5)},
+        'vessel': {'cb_method': cb_method or 'L_Le',
+                   'waterline_factor': float(waterline or 0.8)},
+        'bathymetry': {'source': bathy or 'placeholder.mesh'},
         'coastline': {'shapefile': coast},
-        'wave': {'formula': 'kriebel'},
+        'wave': {'max_sog_knots': float(max_sog or 12.0),
+                 'formula': formula or 'kriebel',
+                 'gravity': float(gravity or 9.78),
+                 'max_bl_ratio': float(max_bl or 0.3),
+                 'min_Froude_M': float(min_froude or 0.1),
+                 'max_Froude_M': float(max_froude or 0.5),
+                 'max_bf': float(max_bf or 0.4)},
+        'impact': {'max_propagation_m': float(max_prop or 2000.0),
+                   'wake_cutoff_m': float(wake_cutoff or 0.01)},
         'output': {'directory': 'output/', 'save_stage_csv': True},
     }
     if tide:
         cfg['bathymetry']['tide_dfs0'] = tide
-        cfg['bathymetry']['tide_item'] = 'Predicted tidal elevation'
+        if tide_item:
+            cfg['bathymetry']['tide_item'] = tide_item
     return cfg
 
 
@@ -1041,14 +1677,34 @@ def _kick(config_dict, stages, label):
     Input('btn-filter', 'n_clicks'),
     State('sel-ais', 'value'), State('sel-land', 'value'),
     State('sel-bathy', 'value'), State('sel-coast', 'value'),
-    State('sel-tide', 'value'),
-    State('sel-cb', 'value'), State('sel-interp', 'value'),
+    State('sel-tide', 'value'), State('sel-tide-item', 'value'),
+    State('rsb-min-speed', 'value'), State('rsb-traj-gap', 'value'),
+    State('rsb-interp', 'value'), State('rsb-interp-interval', 'value'),
+    State('rsb-cb-method', 'value'),
+    State('rsb-max-prop', 'value'), State('rsb-max-sog', 'value'),
+    State('rsb-max-velocity', 'value'), State('rsb-max-accel', 'value'),
+    State('rsb-max-dw', 'value'), State('rsb-low-sog', 'value'),
+    State('rsb-vel-ratio', 'value'), State('rsb-spd-ratio', 'value'),
+    State('rsb-waterline', 'value'), State('rsb-formula', 'value'),
+    State('rsb-gravity', 'value'), State('rsb-max-bl', 'value'),
+    State('rsb-min-froude', 'value'), State('rsb-max-froude', 'value'),
+    State('rsb-max-bf', 'value'), State('rsb-wake-cutoff', 'value'),
     prevent_initial_call=True,
 )
-def kick_filter(n, ais, land, bathy, coast, tide, cb, interp):
+def kick_filter(n, ais, land, bathy, coast, tide, tide_item,
+                min_speed, traj_gap, interp, interp_interval,
+                cb_method, max_prop, max_sog,
+                max_velocity, max_accel, max_dw, low_sog,
+                vel_ratio, spd_ratio, waterline, formula,
+                gravity, max_bl, min_froude, max_froude, max_bf, wake_cutoff):
     if not n or not ais or not land or not coast:
         return no_update, no_update, no_update
-    cfg = _build_config(ais, land, bathy, coast, tide, cb, interp)
+    cfg = _build_config(ais, land, bathy, coast, tide, tide_item,
+                        min_speed, traj_gap, interp, interp_interval,
+                        cb_method, max_prop, max_sog,
+                        max_velocity, max_accel, max_dw, low_sog,
+                        vel_ratio, spd_ratio, waterline, formula,
+                        gravity, max_bl, min_froude, max_froude, max_bf, wake_cutoff)
     if _kick(cfg, ['filter'], 'filter'):
         return False, True, True
     return no_update, no_update, no_update
@@ -1061,22 +1717,36 @@ def kick_filter(n, ais, land, bathy, coast, tide, cb, interp):
     Input('btn-waves', 'n_clicks'),
     State('sel-ais', 'value'), State('sel-land', 'value'),
     State('sel-bathy', 'value'), State('sel-coast', 'value'),
-    State('sel-tide', 'value'),
-    State('sel-cb', 'value'), State('sel-interp', 'value'),
+    State('sel-tide', 'value'), State('sel-tide-item', 'value'),
+    State('rsb-min-speed', 'value'), State('rsb-traj-gap', 'value'),
+    State('rsb-interp', 'value'), State('rsb-interp-interval', 'value'),
+    State('rsb-cb-method', 'value'),
+    State('rsb-max-prop', 'value'), State('rsb-max-sog', 'value'),
+    State('rsb-max-velocity', 'value'), State('rsb-max-accel', 'value'),
+    State('rsb-max-dw', 'value'), State('rsb-low-sog', 'value'),
+    State('rsb-vel-ratio', 'value'), State('rsb-spd-ratio', 'value'),
+    State('rsb-waterline', 'value'), State('rsb-formula', 'value'),
+    State('rsb-gravity', 'value'), State('rsb-max-bl', 'value'),
+    State('rsb-min-froude', 'value'), State('rsb-max-froude', 'value'),
+    State('rsb-max-bf', 'value'), State('rsb-wake-cutoff', 'value'),
     prevent_initial_call=True,
 )
-def kick_waves(n, ais, land, bathy, coast, tide, cb, interp):
-    """Run depth+vessel+wave_impact.
-
-    The worker checks (in order): in-memory LAST_RESULTS['df_filtered'],
-    then disk-cached ``{stem}_01_filtered.csv`` newer than the AIS file,
-    then falls back to running filter first.
-    """
-    if not n or not ais or not land or not coast or not bathy:
+def kick_waves(n, ais, land, bathy, coast, tide, tide_item,
+               min_speed, traj_gap, interp, interp_interval,
+               cb_method, max_prop, max_sog,
+               max_velocity, max_accel, max_dw, low_sog,
+               vel_ratio, spd_ratio, waterline, formula,
+               gravity, max_bl, min_froude, max_froude, max_bf, wake_cutoff):
+    if not n or not ais or not land or not coast:
         return no_update, no_update, no_update
-    cfg = _build_config(ais, land, bathy, coast, tide, cb, interp)
-    # Always request the wave stages — the worker decides whether to
-    # prepend 'filter' based on cache freshness checks.
+    if not bathy:
+        return no_update, no_update, no_update  # bathy required for depth step
+    cfg = _build_config(ais, land, bathy, coast, tide, tide_item,
+                        min_speed, traj_gap, interp, interp_interval,
+                        cb_method, max_prop, max_sog,
+                        max_velocity, max_accel, max_dw, low_sog,
+                        vel_ratio, spd_ratio, waterline, formula,
+                        gravity, max_bl, min_froude, max_froude, max_bf, wake_cutoff)
     if _kick(cfg, ['depth', 'vessel', 'wave_impact'], 'waves'):
         return False, True, True
     return no_update, no_update, no_update
@@ -1097,6 +1767,18 @@ def trigger_ais_import(n, path, prev):
     nonce = (prev or {}).get('nonce', 0) + 1
     # Auto-tick the preview tickbox so the imported data shows on map.
     return {'path': path, 'nonce': nonce}, ['1']
+
+
+@app.callback(
+    Output('btn-filter', 'disabled', allow_duplicate=True),
+    Output('btn-waves', 'disabled', allow_duplicate=True),
+    Input('_ais_import', 'data'),
+    prevent_initial_call=True,
+)
+def _enable_after_import(data):
+    if data and data.get('path'):
+        return False, False
+    return no_update, no_update
 
 
 @app.callback(
@@ -1163,8 +1845,68 @@ _make_pv_callback('_pv_land',  'sel-land',  'pv-land')
 _make_pv_callback('_pv_tide',  'sel-tide',  'pv-tide')
 
 
+@app.callback(
+    Output('sel-tide-item', 'options'),
+    Output('sel-tide-item', 'value'),
+    Output('sel-tide-item-row', 'style'),
+    Output('_tide_items_meta', 'data'),
+    Output('tide-item-pills', 'style'),
+    Input('sel-tide', 'value'),
+    prevent_initial_call=False,
+)
+def _populate_tide_items(path):
+    hidden_pills = {'display': 'none'}
+    if not path:
+        return [], None, {'display': 'none'}, [], hidden_pills
+    try:
+        data = _preview_tide(REPO / path)
+        opts = []
+        items_meta = []
+        for it in data['items']:
+            rng = ''
+            if it['value_min'] is not None and it['value_max'] is not None:
+                rng = f" [{it['value_min']:.2f}..{it['value_max']:.2f} {it['unit']}]"
+            opts.append({'label': f"{it['name']}{rng}", 'value': it['name']})
+            items_meta.append({'name': it['name'], 'unit': it.get('unit', ''),
+                                'label': f"{it['name']}{rng}"})
+        val = opts[0]['value'] if len(opts) == 1 else None
+        show_pills = {} if len(items_meta) > 0 else hidden_pills
+        return opts, val, {'display': 'none'}, items_meta, show_pills
+    except Exception:
+        return [], None, {'display': 'none'}, [], hidden_pills
+
+
 # AIS preview tickbox is decoupled from the dropdown — it just toggles
 # visibility of the already-imported AIS data.
+
+
+@app.callback(
+    Output('sel-dev-dir', 'options'),
+    Input('_init', 'data'),
+    prevent_initial_call=False,
+)
+def _populate_dev_dirs(_):
+    dirs = _scan_output_dirs()
+    return [{'label': d, 'value': d} for d in dirs]
+
+
+@app.callback(
+    Output('_dev_load_result', 'data'),
+    Output('btn-dev-load', 'disabled'),
+    Input('btn-dev-load', 'n_clicks'),
+    State('sel-dev-dir', 'value'),
+    prevent_initial_call=True,
+)
+def dev_load_click(n, directory):
+    if not n or not directory:
+        return no_update, no_update
+    try:
+        result = _dev_load(directory)
+        return result, False
+    except Exception as e:
+        return {'error': str(e)}, False
+
+
 @app.callback(
     Output('_pv_ais', 'data'),
     Input('pv-ais', 'value'),
@@ -1174,26 +1916,71 @@ def _pv_ais_toggle(pv_val):
     return {'visible': bool(pv_val)}
 
 
-# ---- Debug filter: isolate one (mmsi, segment_id) on the map ----
+# ---- Track filter: MMSI/segment/type selectors ----
 @app.callback(
-    Output('_debug_filter', 'data'),
-    Input('btn-debug-apply', 'n_clicks'),
-    Input('btn-debug-clear', 'n_clicks'),
-    State('inp-debug-mmsi', 'value'),
-    State('inp-debug-seg', 'value'),
-    State('_debug_filter', 'data'),
+    Output('fil-mmsi', 'options'),
+    Output('fil-type', 'options'),
+    Input('_track_version', 'data'),
+    prevent_initial_call=False,
+)
+def _populate_filter_options(_):
+    _TYPE_NAMES = {
+        20: 'WIG', 30: 'Fishing', 31: 'Towing', 32: 'Towing (large)', 33: 'Dredging',
+        34: 'Diving', 35: 'Military', 36: 'Sailing', 37: 'Pleasure craft',
+        40: 'HSC', 50: 'Pilot', 51: 'SAR', 52: 'Tug', 53: 'Port tender',
+        54: 'Anti-pollution', 55: 'Law enforcement', 60: 'Passenger',
+        70: 'Cargo', 71: 'Cargo (hazmat A)', 72: 'Cargo (hazmat B)',
+        73: 'Cargo (hazmat C)', 74: 'Cargo (hazmat D)', 79: 'Cargo (other)',
+        80: 'Tanker', 81: 'Tanker (hazmat A)', 89: 'Tanker (other)',
+        90: 'Other', -1: 'Unknown', 0: 'Unknown',
+    }
+    mmsi_opts, type_opts = [], []
+    if seg_meta:
+        mmsis = sorted(set(s['mmsi'] for s in seg_meta))
+        mmsi_opts = [{'label': str(m), 'value': m} for m in mmsis]
+    if len(df_vessels) > 0 and 'typecargo' in df_vessels.columns:
+        types = sorted(int(t) for t in df_vessels['typecargo'].dropna().unique())
+        type_opts = [{'label': f"{t} – {_TYPE_NAMES.get(t, 'type '+str(t))}", 'value': t}
+                     for t in types]
+    return mmsi_opts, type_opts
+
+
+@app.callback(
+    Output('fil-segs', 'options'),
+    Output('fil-segs', 'value'),
+    Input('fil-mmsi', 'value'),
+    prevent_initial_call=False,
+)
+def _populate_seg_options(mmsi):
+    if mmsi is None:
+        return [], None
+    segs = sorted(s['segment_id'] for s in seg_meta if s['mmsi'] == int(mmsi))
+    return [{'label': f'seg {s}', 'value': s} for s in segs], None
+
+
+@app.callback(
+    Output('_filter_structural', 'data'),
+    Input('btn-fil-apply', 'n_clicks'),
+    Input('btn-fil-clear', 'n_clicks'),
+    State('fil-mmsi', 'value'),
+    State('fil-segs', 'value'),
+    State('fil-type', 'value'),
+    State('_filter_structural', 'data'),
     prevent_initial_call=True,
 )
-def _set_debug_filter(apply_n, clear_n, mmsi, seg, prev):
+def _apply_track_filter(n_apply, n_clear, mmsi, segs, types, prev):
     from dash import ctx
-    nonce = ((apply_n or 0) + (clear_n or 0))
-    if ctx.triggered_id == 'btn-debug-clear':
-        return {'mmsi': None, 'segment_id': None, 'nonce': nonce}
-    # Coerce empty strings to None (number inputs return '' until typed).
+    nonce = ((prev or {}).get('nonce', 0) + 1)
+    if ctx.triggered_id == 'btn-fil-clear':
+        # Full reset: _clear flag tells JS to also reset cascade widget + client filters
+        return {'mmsi': None, 'seg_ids': [], 'types': [], 'nonce': nonce, '_clear': True}
+    # Apply: MMSI/seg are handled entirely client-side by the cascade widget.
+    # Only vessel types go through Dash. '_clear' flag is False so JS doesn't
+    # override the cascade selection.
     return {
-        'mmsi': int(mmsi) if mmsi not in (None, '') else None,
-        'segment_id': int(seg) if seg not in (None, '') else None,
-        'nonce': nonce,
+        'mmsi': None, 'seg_ids': [],
+        'types': [int(t) for t in (types or [])],
+        'nonce': nonce, '_clear': False,
     }
 
 
@@ -1349,17 +2136,23 @@ function(n) {
         let tMMSI = new Int32Array(0);
         let tSeg  = new Int32Array(0);
         let tN    = new Int32Array(0);
+        let tType = new Int32Array(0);
         let segLookup = new Map();
+        let mmsiToSegIdxs = new Map();
+        let typeToSegIdxs = new Map();
         let pointSog = new Float32Array(0);
         let pointCog = new Float32Array(0);
         let pointTime = new BigInt64Array(0);  // obstime as ns-since-epoch
+        // Cached filtered arrays (rebuilt when visibility changes)
+        let filteredCoords = new Float32Array(0);
+        let filteredStarts = new Int32Array([0]);
+        let filteredSegIdxs = [];  // segIdx for each entry in filteredStarts
 
         const initTrackArrays = (cT, mT, oT) => {
             const cLon = cT.getChild('lon').toArray();
             const cLat = cT.getChild('lat').toArray();
             cPos = new Float32Array(cLon.length * 2);
             for (let i = 0; i < cLon.length; i++) { cPos[i*2]=cLon[i]; cPos[i*2+1]=cLat[i]; }
-            // Per-point attributes for debug tooltip
             pointSog  = cT.getChild('sog')     ? cT.getChild('sog').toArray()     : new Float32Array(cLon.length);
             pointCog  = cT.getChild('cog')     ? cT.getChild('cog').toArray()     : new Float32Array(cLon.length);
             pointTime = cT.getChild('obstime') ? cT.getChild('obstime').toArray() : new BigInt64Array(cLon.length);
@@ -1367,8 +2160,21 @@ function(n) {
             tMMSI = mT.getChild('mmsi').toArray();
             tSeg  = mT.getChild('segment_id').toArray();
             tN    = mT.getChild('n_points').toArray();
+            tType = mT.getChild('typecargo') ? mT.getChild('typecargo').toArray() : new Int32Array(tMMSI.length);
             segLookup = new Map();
-            for (let i = 0; i < tMMSI.length; i++) segLookup.set(`${tMMSI[i]}|${tSeg[i]}`, i);
+            mmsiToSegIdxs = new Map();
+            typeToSegIdxs = new Map();
+            for (let i = 0; i < tMMSI.length; i++) {
+                segLookup.set(`${tMMSI[i]}|${tSeg[i]}`, i);
+                const m = Number(tMMSI[i]);
+                if (!mmsiToSegIdxs.has(m)) mmsiToSegIdxs.set(m, []);
+                mmsiToSegIdxs.get(m).push(i);
+                const t = Number(tType[i]);
+                if (!typeToSegIdxs.has(t)) typeToSegIdxs.set(t, []);
+                typeToSegIdxs.get(t).push(i);
+            }
+            // Re-resolve any existing filter after data reload
+            if (typeof window.__recomputeVisibility === 'function') window.__recomputeVisibility();
         };
 
         // ---- Wave data (populated after Step 2) ----
@@ -1401,16 +2207,363 @@ function(n) {
         }
 
         // ---- Preview state (set by clientside callbacks) ----
-        window.__previews = { ais: null, bathy: null, coast: null, tide: null };
+        window.__previews = { ais: null, bathy: null, coast: null, land: null, tide: null };
         // Singapore-wide initial view: bbox roughly 103.55–104.05 / 1.20–1.50.
         window._currentZoom = 10;
         window._hoveredWave = null;
+        window._pinnedWave  = null;  // click-locked wave highlight; null = none
         // Track whether we have data so layers gate themselves.
         window.__hasTracks = false;
         window.__hasWaves = false;
-        // Debug filter: when set to {mmsi, segment_id}, hide full tracks layer
-        // and show only the matching segment + each vertex as a pickable dot.
-        window.__debugFilter = { mmsi: null, segment_id: null };
+
+        // ---- Track colour by vessel type (full AIS type-code categorisation) ----
+        // Maps AIS typecargo code → semantic category per ITU/IALA AIS standard.
+        const _typeCategory = (c) => {
+            if (c <= 0 || c < 20) return 'unknown';  // 0=not available, 1-19=reserved
+            if (c < 30) return 'wig';          // 20-29 Wing in ground
+            if (c === 30) return 'fishing';
+            if (c <= 32) return 'towing';      // 31 towing, 32 towing large
+            if (c === 33) return 'dredging';
+            if (c === 34) return 'diving';
+            if (c === 35) return 'military';
+            if (c === 36) return 'sailing';
+            if (c === 37) return 'pleasure';
+            if (c < 40) return 'unknown';      // 38-39 reserved
+            if (c < 50) return 'hsc';          // 40-49 High speed craft
+            if (c === 50) return 'pilot';
+            if (c === 51) return 'sar';        // Search and rescue
+            if (c === 52) return 'tug';
+            if (c === 53) return 'port_tender';
+            if (c === 54) return 'anti_pollution';
+            if (c === 55) return 'law_enforcement';
+            if (c <= 57) return 'unknown';     // 56-57 spare local
+            if (c === 58) return 'medical';
+            if (c === 59) return 'noncombatant';
+            if (c < 70) return 'passenger';    // 60-69
+            if (c < 80) return 'cargo';        // 70-79
+            if (c < 90) return 'tanker';       // 80-89
+            if (c < 100) return 'other';       // 90-99
+            return 'unknown';
+        };
+        // Category → [R, G, B] — visually distinct, high contrast on dark basemap
+        const _CAT_COLORS = {
+            unknown:         [160, 160, 160],
+            wig:             [  0, 210, 230],  // cyan
+            fishing:         [ 30, 160,  60],  // dark green
+            towing:          [220, 160,  30],  // amber
+            dredging:        [130, 150,  60],  // olive
+            diving:          [ 60, 180, 160],  // teal
+            military:        [100, 130,  50],  // dark olive
+            sailing:         [120, 210,  80],  // lime
+            pleasure:        [220, 100, 180],  // pink
+            hsc:             [  0, 200, 240],  // bright cyan
+            pilot:           [240, 180,  50],  // amber-gold
+            sar:             [240,  40,  40],  // red
+            tug:             [200, 110,  40],  // brown-orange
+            port_tender:     [210, 170,  60],  // light amber
+            anti_pollution:  [ 60, 200,  80],  // bright green
+            law_enforcement: [ 40,  80, 220],  // dark blue
+            medical:         [220,  50,  80],  // crimson
+            noncombatant:    [140,  80, 180],  // purple-grey
+            passenger:       [ 50, 100, 240],  // blue
+            cargo:           [240, 150,  60],  // orange
+            tanker:          [230,  50,  50],  // red-orange
+            other:           [150,  70, 200],  // purple
+        };
+        const trackColor = (typeCode, alpha) => {
+            const rgb = _CAT_COLORS[_typeCategory(typeCode)] || [160, 160, 160];
+            return [rgb[0], rgb[1], rgb[2], alpha];
+        };
+
+        // ---- Wave colour by wave height -----------------------------------------
+        const _lrp = (a, b, t) => Math.round(a + (b - a) * t);
+        const waveColor = (i) => {
+            const h = wH[i];
+            if (isNaN(h) || h <= 0) return [80, 200, 120, 230];
+            if (h < 0.15) {
+                const t = h / 0.15;
+                return [_lrp(80, 255, t), _lrp(200, 220, t), _lrp(120, 0, t), 230];
+            }
+            if (h < 0.4) {
+                const t = (h - 0.15) / 0.25;
+                return [255, _lrp(220, 100, t), 0, 230];
+            }
+            const t = Math.min((h - 0.4) / 0.3, 1);
+            return [255, _lrp(100, 30, t), _lrp(0, 30, t), 230];
+        };
+
+        // ---- Multi-filter state ----
+        window.__filterState = { mmsi: null, seg_ids: [], types: [], freehand: null, similar: null };
+        window.__visibleSegIdxs = null; // null = show all; Set<segIdx> = filtered
+
+        // Rebuild the cached filtered coord/offset arrays from a list of segIdxs
+        const rebuildFilteredArrays = (visArr) => {
+            if (!visArr || visArr.length === 0) {
+                filteredCoords = new Float32Array(0);
+                filteredStarts = new Int32Array([0]);
+                filteredSegIdxs = [];
+                return;
+            }
+            const totalPts = visArr.reduce((s, i) => s + (startIndices[i+1] - startIndices[i]), 0);
+            filteredCoords = new Float32Array(totalPts * 2);
+            filteredStarts = new Int32Array(visArr.length + 1);
+            let ptr = 0;
+            for (let k = 0; k < visArr.length; k++) {
+                const si = visArr[k];
+                const s = startIndices[si], e = startIndices[si + 1];
+                filteredCoords.set(cPos.subarray(s * 2, e * 2), ptr * 2);
+                filteredStarts[k] = ptr;
+                ptr += (e - s);
+            }
+            filteredStarts[visArr.length] = ptr;
+            filteredSegIdxs = visArr;
+        };
+
+        window.__recomputeVisibility = () => {
+            const fs = window.__filterState;
+            const N = tMMSI.length;
+            const allNull = fs.mmsi == null &&
+                            (!fs.seg_ids || !fs.seg_ids.length) &&
+                            (!fs.types || !fs.types.length) &&
+                            fs.freehand == null && fs.similar == null;
+            if (N === 0 || allNull) {
+                window.__visibleSegIdxs = null;
+                rebuildFilteredArrays(null);
+                window.__rebuild();
+                return;
+            }
+            const sets = [];
+            // MMSI + segment filter
+            if (fs.mmsi != null) {
+                const candidates = mmsiToSegIdxs.get(Number(fs.mmsi));
+                if (candidates) {
+                    if (fs.seg_ids && fs.seg_ids.length > 0) {
+                        const segSet = new Set(fs.seg_ids.map(Number));
+                        sets.push(new Set(candidates.filter(i => segSet.has(Number(tSeg[i])))));
+                    } else {
+                        sets.push(new Set(candidates));
+                    }
+                } else {
+                    sets.push(new Set());
+                }
+            }
+            // Vessel type filter
+            if (fs.types && fs.types.length > 0) {
+                const typeSet = new Set();
+                for (const t of fs.types) {
+                    const idxs = typeToSegIdxs.get(Number(t));
+                    if (idxs) idxs.forEach(i => typeSet.add(i));
+                }
+                sets.push(typeSet);
+            }
+            // Freehand filter: [[mmsi, seg_id], ...]
+            if (fs.freehand != null) {
+                const fhSet = new Set();
+                for (const [m, s] of fs.freehand) {
+                    const i = segLookup.get(`${m}|${s}`);
+                    if (i != null) fhSet.add(i);
+                }
+                sets.push(fhSet);
+            }
+            // Similar filter: [[mmsi, seg_id], ...]
+            if (fs.similar != null) {
+                const simSet = new Set();
+                for (const [m, s] of fs.similar) {
+                    const i = segLookup.get(`${m}|${s}`);
+                    if (i != null) simSet.add(i);
+                }
+                sets.push(simSet);
+            }
+            if (sets.length === 0) {
+                window.__visibleSegIdxs = null;
+                rebuildFilteredArrays(null);
+            } else {
+                sets.sort((a, b) => a.size - b.size);
+                let result = sets[0];
+                for (let k = 1; k < sets.length; k++) {
+                    const next = new Set();
+                    for (const v of result) { if (sets[k].has(v)) next.add(v); }
+                    result = next;
+                }
+                window.__visibleSegIdxs = result;
+                rebuildFilteredArrays(Array.from(result));
+            }
+            window.__rebuild();
+            // Update status div directly (also updated via Dash callback for structural changes)
+            const stat = document.getElementById('fil-status');
+            if (stat) {
+                const vis = window.__visibleSegIdxs;
+                stat.textContent = vis === null
+                    ? (N > 0 ? `All ${N.toLocaleString()} tracks visible` : '')
+                    : `${vis.size.toLocaleString()} of ${N.toLocaleString()} tracks visible`;
+            }
+        };
+
+        window.__applyStructuralFilter = (structural) => {
+            if (!structural) return '';
+            if (structural._clear) {
+                // Full reset from "Clear all" button
+                window.__filterState.mmsi    = null;
+                window.__filterState.seg_ids = [];
+                window.__filterState.types   = [];
+                window.__filterState.freehand = null;
+                window.__filterState.similar  = null;
+                window.__cascadeMMSI = null;
+                window.__cascadeSegs = [];
+                if (typeof window.__updateCascadeTrigger === 'function') window.__updateCascadeTrigger();
+                const p = document.getElementById('sim-panel');
+                if (p) p.style.display = 'none';
+            } else {
+                // Partial update from "Apply filters" — only vessel types go through Dash.
+                // MMSI/seg are managed client-side by the cascade widget; don't override them.
+                window.__filterState.types = structural.types || [];
+            }
+            window.__recomputeVisibility();
+            const vis = window.__visibleSegIdxs;
+            const N = tMMSI.length;
+            return vis === null
+                ? (N > 0 ? `All ${N.toLocaleString()} tracks visible` : '')
+                : `${vis.size.toLocaleString()} of ${N.toLocaleString()} tracks visible`;
+        };
+
+        // ---- Segment-segment intersection helpers (for free-hand) ----
+        const ccw = (ax, ay, bx, by, cx, cy) => (cy-ay)*(bx-ax) > (by-ay)*(cx-ax);
+        const segsIntersect = (ax, ay, bx, by, cx, cy, dx, dy) =>
+            ccw(ax,ay,cx,cy,dx,dy) !== ccw(bx,by,cx,cy,dx,dy) &&
+            ccw(ax,ay,bx,by,cx,cy) !== ccw(ax,ay,bx,by,dx,dy);
+
+        // ---- Free-hand draw mode (with canvas trace overlay) ----
+        // Canvas is a fixed overlay matching the deck area; we show/draw on it during
+        // freehand mode and hide it when done.
+        const getOrCreateCanvas = () => {
+            let cv = document.getElementById('freehand-canvas');
+            if (!cv) {
+                cv = document.createElement('canvas');
+                cv.id = 'freehand-canvas';
+                cv.style.cssText = 'position:fixed;top:40px;left:340px;right:0;bottom:0;' +
+                    'pointer-events:none;z-index:3;display:none;';
+                document.body.appendChild(cv);
+            }
+            const container = document.getElementById('deck-container');
+            const r = container.getBoundingClientRect();
+            cv.width = r.width; cv.height = r.height;
+            return cv;
+        };
+        window.__freehandMode = false;
+        window.__enterFreehandMode = () => {
+            if (window.__freehandMode) return;
+            window.__freehandMode = true;
+            window.deckInstance.setProps({ controller: false });
+            window.__updateDeckCursor();
+            const btn = document.getElementById('btn-freehand');
+            if (btn) { btn.textContent = 'Drawing...'; btn.style.opacity = '0.65'; }
+            // Set up canvas
+            const cv = getOrCreateCanvas();
+            cv.style.display = 'block';
+            const ctx2d = cv.getContext('2d');
+            ctx2d.clearRect(0, 0, cv.width, cv.height);
+            ctx2d.strokeStyle = 'rgba(80,200,255,0.85)';
+            ctx2d.lineWidth = 2;
+            ctx2d.lineCap = 'round';
+            ctx2d.lineJoin = 'round';
+            ctx2d.setLineDash([6, 4]);
+            let pencil = [], isDrawing = false;
+            const rect = () => container.getBoundingClientRect();
+            const onDown = (e) => {
+                isDrawing = true;
+                const r = rect();
+                const px = e.clientX - r.left, py = e.clientY - r.top;
+                pencil = [[px, py]];
+                ctx2d.clearRect(0, 0, cv.width, cv.height);
+                ctx2d.beginPath();
+                ctx2d.moveTo(px, py);
+            };
+            const onMove = (e) => {
+                if (!isDrawing) return;
+                const r = rect();
+                const px = e.clientX - r.left, py = e.clientY - r.top;
+                pencil.push([px, py]);
+                ctx2d.lineTo(px, py);
+                ctx2d.stroke();
+            };
+            const onUp   = () => {
+                if (!isDrawing || pencil.length < 2) { cleanup(); return; }
+                isDrawing = false;
+                const vp = window.deckInstance.getViewports()[0];
+                const wp = pencil.map(([px, py]) => vp.unproject([px, py]));
+                // Pencil AABB
+                let pMinX=Infinity,pMaxX=-Infinity,pMinY=Infinity,pMaxY=-Infinity;
+                for (const [wx,wy] of wp) {
+                    if(wx<pMinX)pMinX=wx; if(wx>pMaxX)pMaxX=wx;
+                    if(wy<pMinY)pMinY=wy; if(wy>pMaxY)pMaxY=wy;
+                }
+                const hits = [];
+                for (let si = 0; si < tMMSI.length; si++) {
+                    const s = startIndices[si], e = startIndices[si + 1];
+                    // Segment AABB vs pencil AABB
+                    let sMinX=Infinity,sMaxX=-Infinity,sMinY=Infinity,sMaxY=-Infinity;
+                    for (let p = s; p < e; p++) {
+                        const x=cPos[p*2],y=cPos[p*2+1];
+                        if(x<sMinX)sMinX=x; if(x>sMaxX)sMaxX=x;
+                        if(y<sMinY)sMinY=y; if(y>sMaxY)sMaxY=y;
+                    }
+                    if (sMaxX<pMinX||sMinX>pMaxX||sMaxY<pMinY||sMinY>pMaxY) continue;
+                    let hit = false;
+                    for (let p = s; p < e-1 && !hit; p++) {
+                        const ax=cPos[p*2],ay=cPos[p*2+1],bx=cPos[(p+1)*2],by=cPos[(p+1)*2+1];
+                        for (let q = 0; q < wp.length-1 && !hit; q++) {
+                            if (segsIntersect(ax,ay,bx,by,wp[q][0],wp[q][1],wp[q+1][0],wp[q+1][1])) hit=true;
+                        }
+                    }
+                    if (hit) hits.push([Number(tMMSI[si]), Number(tSeg[si])]);
+                }
+                window.__filterState.freehand = hits.length > 0 ? hits : null;
+                window.__recomputeVisibility();
+                cleanup();
+            };
+            const cleanup = () => {
+                container.removeEventListener('pointerdown', onDown);
+                container.removeEventListener('pointermove', onMove);
+                container.removeEventListener('pointerup', onUp);
+                window.__freehandMode = false;
+                window.deckInstance.setProps({ controller: window.__shiftHeld });
+                window.__updateDeckCursor();
+                if (btn) { btn.textContent = 'Free-hand'; btn.style.opacity = ''; }
+                cv.style.display = 'none';
+                ctx2d.clearRect(0, 0, cv.width, cv.height);
+            };
+            container.addEventListener('pointerdown', onDown);
+            container.addEventListener('pointermove', onMove);
+            container.addEventListener('pointerup',   onUp);
+        };
+
+        // ---- Similar select mode ----
+        window.__similarArmed  = false;
+        window.__simPickedData = null;
+        window.__enterSimilarMode = () => {
+            window.__similarArmed = true;
+            const btn = document.getElementById('btn-similar');
+            if (btn) { btn.textContent = 'Pick a track...'; btn.style.opacity = '0.65'; }
+            return 'Click a track on the map to pick the reference';
+        };
+        window.__runSimilar = async (buffer_m, min_coverage) => {
+            const pick = window.__simPickedData;
+            if (!pick || pick.mmsi == null) return 'No track picked';
+            try {
+                const resp = await fetch('/api/similar_tracks', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ mmsi: pick.mmsi, segment_id: pick.seg, buffer_m, min_coverage }),
+                });
+                const j = await resp.json();
+                if (j.error) throw new Error(j.error);
+                window.__filterState.similar = j.mmsi_segs;
+                window.__recomputeVisibility();
+                const panel = document.getElementById('sim-panel');
+                if (panel) panel.style.display = 'none';
+                return `Similar: ${j.mmsi_segs.length} tracks found`;
+            } catch(e) { return 'Similar error: ' + e.message; }
+        };
 
         const buildLayers = (zoom, hoveredIdx) => {
             const useRaster = zoom < """ + str(ZOOM_RASTER_THRESHOLD) + r""";
@@ -1437,77 +2590,42 @@ function(n) {
                     pickable: false, opacity: 0.65,
                 }));
             }
-            const df = window.__debugFilter || {};
-            const debugActive = df.mmsi != null && df.segment_id != null;
-
-            if (window.__hasTracks && !useRaster && tMMSI.length > 0 && !debugActive) {
-                layers.push(new deck.PathLayer({
-                    id: 'tracks',
-                    data: { length: tMMSI.length, startIndices,
-                            attributes: { getPath: { value: cPos, size: 2 } } },
-                    pickable: true, _pathType: 'open',
-                    getColor: [200, 30, 0, 110],
-                    getWidth: 1, widthUnits: 'pixels', widthMinPixels: 1,
-                    onHover: ({x, y, index}) => {
-                        if (index < 0) { hideTip(); return; }
-                        showTip(x, y, `<b>TRACK</b><br>MMSI: ${tMMSI[index]}<br>seg: ${tSeg[index]}<br>n: ${tN[index]}`);
-                    },
-                }));
-            }
-
-            // Debug filter: isolate one (mmsi, segment_id) — show segment line + every vertex as a pickable dot.
-            if (debugActive && window.__hasTracks) {
-                const segIdx = segLookup.get(`${df.mmsi}|${df.segment_id}`);
-                if (segIdx != null && segIdx < startIndices.length - 1) {
-                    const segStart = startIndices[segIdx];
-                    const segEnd   = startIndices[segIdx + 1];
-                    const segCoords = cPos.subarray(segStart * 2, segEnd * 2);
+            // Filter-aware tracks rendering
+            if (window.__hasTracks && !useRaster && tMMSI.length > 0) {
+                const vis = window.__visibleSegIdxs;
+                if (vis === null) {
+                    // No filter → show all, colour by vessel type
                     layers.push(new deck.PathLayer({
-                        id: 'debug-segment-line',
-                        data: {
-                            length: 1,
-                            startIndices: [0, segEnd - segStart],
-                            attributes: { getPath: { value: segCoords, size: 2 } },
-                        },
-                        _pathType: 'open',
-                        getColor: [255, 180, 0, 240],
-                        getWidth: 2, widthUnits: 'pixels', widthMinPixels: 2,
-                        pickable: false,
-                    }));
-                    layers.push(new deck.ScatterplotLayer({
-                        id: 'debug-segment-points',
-                        data: { length: segEnd - segStart,
-                                attributes: { getPosition: { value: segCoords, size: 2 } } },
-                        pickable: true, stroked: true, filled: true,
-                        getRadius: 5, radiusUnits: 'pixels',
-                        radiusMinPixels: 4, radiusMaxPixels: 8,
-                        getFillColor: [255, 60, 0, 220],
-                        getLineColor: [255, 255, 255, 240],
-                        lineWidthMinPixels: 1,
+                        id: 'tracks',
+                        data: { length: tMMSI.length, startIndices,
+                                attributes: { getPath: { value: cPos, size: 2 } } },
+                        pickable: true, _pathType: 'open',
+                        getColor: (_, {index}) => trackColor(tType[index], 120),
+                        getWidth: 1, widthUnits: 'pixels', widthMinPixels: 1,
+                        updateTriggers: { getColor: [tType] },
                         onHover: ({x, y, index}) => {
-                            if (index < 0) {
-                                hideTip();
-                                document.getElementById('click-info').textContent = '';
-                                return;
-                            }
-                            const lon = segCoords[index*2];
-                            const lat = segCoords[index*2+1];
-                            const globalIdx = segStart + index;
-                            const timeNs = pointTime[globalIdx] != null ? Number(pointTime[globalIdx]) : NaN;
-                            const dt = isNaN(timeNs) ? '?' : new Date(timeNs / 1e6).toISOString().replace('T', ' ').slice(0, 19);
-                            const sogVal = pointSog[globalIdx] != null ? pointSog[globalIdx].toFixed(1) : '?';
-                            const cogVal = pointCog[globalIdx] != null ? pointCog[globalIdx].toFixed(0) : '?';
-                            document.getElementById('click-info').textContent =
-                                `POINT ${index}/${segEnd - segStart - 1} | MMSI ${df.mmsi} seg ${df.segment_id} | ${dt} | SOG ${sogVal} kn COG ${cogVal}°`;
-                            showTip(x, y,
-                                `<b>POINT ${index}/${segEnd - segStart - 1}</b><br>` +
-                                `MMSI ${df.mmsi}  seg ${df.segment_id}<br>` +
-                                `${dt}<br>` +
-                                `SOG: ${sogVal} kn  COG: ${cogVal}°<br>` +
-                                `lon: ${lon.toFixed(6)}  lat: ${lat.toFixed(6)}`);
+                            if (index < 0) { hideTip(); return; }
+                            showTip(x, y, `<b>TRACK</b><br>MMSI: ${tMMSI[index]}<br>seg: ${tSeg[index]}<br>n: ${tN[index]}<br>type: ${tType[index]}`);
+                        },
+                    }));
+                } else if (vis.size > 0 && filteredSegIdxs.length > 0) {
+                    // Show only visible segments, colour by vessel type
+                    layers.push(new deck.PathLayer({
+                        id: 'tracks',
+                        data: { length: filteredSegIdxs.length, startIndices: filteredStarts,
+                                attributes: { getPath: { value: filteredCoords, size: 2 } } },
+                        pickable: true, _pathType: 'open',
+                        getColor: (_, {index}) => trackColor(tType[filteredSegIdxs[index]], 220),
+                        getWidth: 1.5, widthUnits: 'pixels', widthMinPixels: 1,
+                        updateTriggers: { getColor: [filteredSegIdxs] },
+                        onHover: ({x, y, index}) => {
+                            if (index < 0) { hideTip(); return; }
+                            const si = filteredSegIdxs[index];
+                            showTip(x, y, `<b>TRACK</b><br>MMSI: ${tMMSI[si]}<br>seg: ${tSeg[si]}<br>n: ${tN[si]}<br>type: ${tType[si]}`);
                         },
                     }));
                 }
+                // else: vis.size === 0 → nothing added → all hidden
             }
             if (window.__hasWaves && wMMSI.length > 0) {
                 layers.push(new deck.ScatterplotLayer({
@@ -1517,21 +2635,24 @@ function(n) {
                     pickable: true, stroked: true,
                     getRadius: 30, radiusUnits: 'meters',
                     radiusMinPixels: 4, radiusMaxPixels: 12,
-                    getFillColor: [255, 140, 0, 230],
-                    getLineColor: [255, 255, 255, 220],
+                    getFillColor: (_, {index}) => waveColor(index),
+                    getLineColor: [255, 255, 255, 180],
                     lineWidthMinPixels: 1,
+                    updateTriggers: { getFillColor: [wH] },
                     onHover: ({x, y, index}) => {
                         if (index < 0) {
                             hideTip();
                             if (window._hoveredWave !== null) {
                                 window._hoveredWave = null;
-                                window.deckInstance.setProps({ layers: buildLayers(window._currentZoom, null) });
+                                if (window._pinnedWave === null)
+                                    window.deckInstance.setProps({ layers: buildLayers(window._currentZoom, null) });
                             }
                             return;
                         }
                         const f = (v, d) => (v == null || isNaN(v)) ? '?' : v.toFixed(d);
+                        const pinned = window._pinnedWave === index ? ' 📌' : '';
                         showTip(x, y,
-                            `<b>WAVE -> MMSI ${wMMSI[index]}</b><br>` +
+                            `<b>WAVE → MMSI ${wMMSI[index]}${pinned}</b><br>` +
                             `<b>H</b>: ${f(wH[index], 3)} m &nbsp;<b>T</b>: ${f(wTp[index], 2)} s &nbsp;<b>Side</b>: ${wSide(index)}<br>` +
                             `<b>SOG</b>: ${f(wSog[index], 1)} kn &nbsp;<b>COG</b>: ${f(wCog[index], 0)}°<br>` +
                             `<b>L×W×T</b>: ${f(wLen[index], 0)}×${f(wWid[index], 0)}×${f(wDraught[index], 1)} m<br>` +
@@ -1539,15 +2660,17 @@ function(n) {
                         );
                         if (window._hoveredWave !== index) {
                             window._hoveredWave = index;
-                            window.deckInstance.setProps({ layers: buildLayers(window._currentZoom, index) });
+                            if (window._pinnedWave === null)
+                                window.deckInstance.setProps({ layers: buildLayers(window._currentZoom, index) });
                         }
                     },
                 }));
             }
 
-            // Wave hover highlights (cyan)
-            if (window.__hasWaves && hoveredIdx != null && hoveredIdx >= 0 && hoveredIdx < wMMSI.length) {
-                const segIdx = segLookup.get(`${wMMSI[hoveredIdx]}|${wSegId[hoveredIdx]}`);
+            // Wave highlight (cyan): pinned overrides hover
+            const highlightIdx = window._pinnedWave != null ? window._pinnedWave : hoveredIdx;
+            if (window.__hasWaves && highlightIdx != null && highlightIdx >= 0 && highlightIdx < wMMSI.length) {
+                const segIdx = segLookup.get(`${wMMSI[highlightIdx]}|${wSegId[highlightIdx]}`);
                 if (segIdx != null && segIdx < startIndices.length - 1) {
                     const segStart = startIndices[segIdx];
                     const segEnd   = startIndices[segIdx + 1];
@@ -1564,8 +2687,8 @@ function(n) {
                         pickable: false,
                     }));
                 }
-                const vp = [wVesselLon[hoveredIdx], wVesselLat[hoveredIdx]];
-                const wp = [wPos[hoveredIdx*2], wPos[hoveredIdx*2+1]];
+                const vp = [wVesselLon[highlightIdx], wVesselLat[highlightIdx]];
+                const wp = [wPos[highlightIdx*2], wPos[highlightIdx*2+1]];
                 if (!isNaN(vp[0])) {
                     layers.push(new deck.ScatterplotLayer({
                         id: 'vessel-highlight',
@@ -1602,7 +2725,6 @@ function(n) {
                 }));
             }
             if (pv.coast && pv.coast.geojson) {
-                // GeoJsonLayer handles Polygon/MultiPolygon/LineString natively.
                 layers.push(new deck.GeoJsonLayer({
                     id: 'pv-coast',
                     data: pv.coast.geojson,
@@ -1610,6 +2732,17 @@ function(n) {
                     getFillColor: [60, 130, 220, 40],
                     getLineColor: [20, 80, 180, 230],
                     getLineWidth: 2, lineWidthMinPixels: 2,
+                    pickable: false,
+                }));
+            }
+            if (pv.land && pv.land.geojson) {
+                layers.push(new deck.GeoJsonLayer({
+                    id: 'pv-land',
+                    data: pv.land.geojson,
+                    stroked: true, filled: true,
+                    getFillColor: [230, 150, 50, 50],
+                    getLineColor: [200, 100, 20, 200],
+                    getLineWidth: 1, lineWidthMinPixels: 1,
                     pickable: false,
                 }));
             }
@@ -1645,20 +2778,63 @@ function(n) {
 
         // Singapore-wide initial view (covers ~103.55-104.05 / 1.20-1.50).
         const initialZoom = 10;
+        const CURSOR_PENCIL = `url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='22' height='22' viewBox='0 0 22 22'%3E%3Cpath fill='%23ffffff' stroke='%23222222' stroke-width='1.3' stroke-linejoin='round' d='M3 19L15 2l4 4L5 21z'/%3E%3Cpath fill='%23cccccc' stroke='%23555555' stroke-width='1' d='M3 19l4 2-5-5z'/%3E%3Ccircle cx='18' cy='5' r='1' fill='%2380c0ff'/%3E%3C/svg%3E") 0 22, crosshair`;
+        window.__shiftHeld = false;
+        // Single source of truth for cursor — used by deck.gl getCursor AND manual updates
+        const getCursorForState = (isDragging = false) => {
+            if (window.__freehandMode) return CURSOR_PENCIL;
+            if (window.__shiftHeld) return isDragging ? 'grabbing' : 'grab';
+            return 'default';
+        };
         window.deckInstance = new deck.Deck({
             parent: container,
             width: '100%', height: '100%',
             initialViewState: { longitude: 103.82, latitude: 1.32, zoom: initialZoom, pitch: 0, bearing: 0 },
-            controller: true,
+            controller: false,
             layers: buildLayers(initialZoom, null),
+            getCursor: ({isDragging}) => getCursorForState(isDragging),
             onClick: ({layer, index}) => {
+                // Similar pick mode: capture the clicked track
+                if (window.__similarArmed && layer && layer.id === 'tracks' && index >= 0) {
+                    window.__similarArmed = false;
+                    const si = (window.__visibleSegIdxs !== null && filteredSegIdxs.length > 0)
+                        ? filteredSegIdxs[index] : index;
+                    const mmsi = Number(tMMSI[si]);
+                    const seg  = Number(tSeg[si]);
+                    window.__simPickedData = { mmsi, seg };
+                    const lbl = document.getElementById('sim-picked-label');
+                    if (lbl) lbl.textContent = `Picked: MMSI ${mmsi} / seg ${seg}`;
+                    const panel = document.getElementById('sim-panel');
+                    if (panel) panel.style.display = 'block';
+                    const btn = document.getElementById('btn-similar');
+                    if (btn) { btn.textContent = 'Similar'; btn.style.opacity = ''; }
+                    return;
+                }
                 if (!layer || index < 0) {
+                    // Click on empty space: unpin wave highlight
+                    if (window._pinnedWave !== null) {
+                        window._pinnedWave = null;
+                        window.deckInstance.setProps({ layers: buildLayers(window._currentZoom, window._hoveredWave) });
+                    }
                     document.getElementById('click-info').textContent = '';
                     return;
                 }
                 let msg = `${layer.id}#${index}`;
-                if (layer.id === 'waves') msg = `wave MMSI=${wMMSI[index]} H=${wH[index].toFixed(3)}`;
-                else if (layer.id === 'tracks') msg = `track MMSI=${tMMSI[index]} seg=${tSeg[index]}`;
+                if (layer.id === 'waves') {
+                    // Toggle pin: click same wave to unpin, click different to pin
+                    if (window._pinnedWave === index) {
+                        window._pinnedWave = null;
+                        msg = `unpinned wave MMSI=${wMMSI[index]}`;
+                    } else {
+                        window._pinnedWave = index;
+                        msg = `📌 wave MMSI=${wMMSI[index]} H=${wH[index].toFixed(3)}m`;
+                    }
+                    window.deckInstance.setProps({ layers: buildLayers(window._currentZoom, window._hoveredWave) });
+                } else if (layer.id === 'tracks') {
+                    const si = (window.__visibleSegIdxs !== null && filteredSegIdxs.length > 0)
+                        ? filteredSegIdxs[index] : index;
+                    msg = `track MMSI=${tMMSI[si]} seg=${tSeg[si]}`;
+                }
                 document.getElementById('click-info').textContent = '| ' + msg;
             },
             onViewStateChange: (params) => {
@@ -1667,11 +2843,232 @@ function(n) {
                 return params.viewState;
             },
         });
+        // Force initial cursor (deck.gl defaults to 'grab' without this)
+        container.style.cursor = 'default';
+        // Manual cursor update — call this whenever state changes outside a mouse event
+        window.__updateDeckCursor = (isDragging = false) => {
+            container.style.cursor = getCursorForState(isDragging);
+        };
+        // Shift held = pan/zoom mode
+        window.addEventListener('keydown', (e) => {
+            if (e.key !== 'Shift' || window.__shiftHeld || window.__freehandMode) return;
+            if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA') return;
+            window.__shiftHeld = true;
+            window.deckInstance.setProps({ controller: { dragRotate: false } });
+            window.__updateDeckCursor();
+        });
+        window.addEventListener('keyup', (e) => {
+            if (e.key !== 'Shift' || !window.__shiftHeld) return;
+            window.__shiftHeld = false;
+            if (!window.__freehandMode) window.deckInstance.setProps({ controller: false });
+            window.__updateDeckCursor();
+        });
+        container.addEventListener('mousedown', () => {
+            if (window.__shiftHeld && !window.__freehandMode) window.__updateDeckCursor(true);
+        });
+        window.addEventListener('mouseup', () => {
+            if (!window.__freehandMode) window.__updateDeckCursor(false);
+        });
         const rebuildOnView = debounce((z) => {
             window.deckInstance.setProps({ layers: buildLayers(z, window._hoveredWave) });
             status.textContent = `zoom=${z.toFixed(1)}`;
         }, 250);
         window.__rebuild = () => window.deckInstance.setProps({ layers: buildLayers(window._currentZoom, window._hoveredWave) });
+
+        // ---- Floating legend ----
+        const updateLegend = () => {
+            const leg = document.getElementById('map-legend');
+            if (!leg) return;
+            if (!window.__hasTracks && !window.__hasWaves) { leg.style.display = 'none'; return; }
+            leg.style.display = 'block';
+            const rows = [];
+            if (window.__hasTracks) {
+                rows.push('<div style="font-weight:700;font-size:10px;color:#aac;margin-bottom:5px;letter-spacing:.4px">VESSEL TYPE</div>');
+                const categories = [
+                    ['cargo',     'Cargo'],
+                    ['tanker',    'Tanker'],
+                    ['passenger', 'Passenger'],
+                    ['tug',       'Tug'],
+                    ['fishing',   'Fishing'],
+                    ['hsc',       'High-speed craft'],
+                    ['sar',       'SAR'],
+                    ['sailing',   'Sailing'],
+                    ['pleasure',  'Pleasure'],
+                    ['other',     'Other'],
+                    ['unknown',   'Unknown'],
+                ];
+                categories.forEach(([cat, label]) => {
+                    const c = _CAT_COLORS[cat] || [160,160,160];
+                    const hex = `#${c.map(x=>x.toString(16).padStart(2,'0')).join('')}`;
+                    rows.push(
+                        `<div style="display:flex;align-items:center;gap:6px;margin:2px 0">` +
+                        `<span style="width:14px;height:6px;border-radius:2px;background:${hex};flex-shrink:0"></span>` +
+                        `<span style="font-size:10px">${label}</span></div>`
+                    );
+                });
+            }
+            if (window.__hasWaves) {
+                if (window.__hasTracks) rows.push('<hr style="border:none;border-top:1px solid rgba(255,255,255,0.1);margin:7px 0">');
+                rows.push('<div style="font-weight:700;font-size:10px;color:#aac;margin-bottom:5px;letter-spacing:.4px">WAVE HEIGHT</div>');
+                const waveStops = [
+                    ['#50c878', '< 0.05 m'],
+                    ['#ffdc00', '0.05 – 0.15 m'],
+                    ['#ff6400', '0.15 – 0.4 m'],
+                    ['#ff1e1e', '> 0.4 m'],
+                ];
+                const grad = 'linear-gradient(to bottom, #50c878, #ffdc00, #ff6400, #ff1e1e)';
+                rows.push(
+                    `<div style="display:flex;gap:6px;align-items:stretch">` +
+                    `<div style="width:14px;border-radius:3px;background:${grad};flex-shrink:0"></div>` +
+                    `<div style="display:flex;flex-direction:column;justify-content:space-between;font-size:9px;color:#ccc">` +
+                    waveStops.map(([_c, lbl]) => `<span>${lbl}</span>`).join('') +
+                    `</div></div>`
+                );
+            }
+            leg.innerHTML = rows.join('');
+        };
+        window.__updateLegend = updateLegend;
+
+        // ---- Cascading MMSI → Segment picker ----
+        // State is module-level so clear button and track reload can reset it.
+        window.__cascadeMMSI = null;
+        window.__cascadeSegs = [];
+
+        const updateCascadeTrigger = () => {
+            const trigger = document.getElementById('cascade-mmsi-trigger');
+            if (!trigger) return;
+            if (window.__cascadeMMSI === null) {
+                trigger.textContent = 'All tracks';
+                trigger.className = 'cascade-trigger';
+            } else if (window.__cascadeSegs.length === 0) {
+                trigger.textContent = `MMSI ${window.__cascadeMMSI} · all segs`;
+                trigger.className = 'cascade-trigger cascade-active';
+            } else {
+                const s = window.__cascadeSegs.length === 1
+                    ? `seg ${window.__cascadeSegs[0]}`
+                    : `${window.__cascadeSegs.length} segs`;
+                trigger.textContent = `MMSI ${window.__cascadeMMSI} · ${s}`;
+                trigger.className = 'cascade-trigger cascade-active';
+            }
+        };
+
+        const applyCascadeToFilter = () => {
+            window.__filterState.mmsi    = window.__cascadeMMSI;
+            window.__filterState.seg_ids = [...window.__cascadeSegs];
+            window.__recomputeVisibility();
+            updateCascadeTrigger();
+        };
+
+        const buildCascadePanel = () => {
+            const panel = document.getElementById('cascade-mmsi-panel');
+            if (!panel) return;
+            panel.innerHTML = '';
+            // Left column: MMSI list
+            const leftCol = document.createElement('div');
+            leftCol.className = 'cascade-col';
+            // Right column: segments (populated on MMSI hover)
+            const rightCol = document.createElement('div');
+            rightCol.className = 'cascade-col cascade-seg-col';
+            rightCol.style.display = 'none';
+
+            const mmsiArr = [];
+            mmsiToSegIdxs.forEach((_, mmsi) => mmsiArr.push(Number(mmsi)));
+            mmsiArr.sort((a, b) => a - b);
+
+            if (mmsiArr.length === 0) {
+                leftCol.innerHTML = '<div class="cascade-empty">No tracks loaded</div>';
+                panel.appendChild(leftCol);
+                return;
+            }
+
+            // "All tracks" row
+            const allRow = document.createElement('div');
+            allRow.className = 'cascade-item' + (window.__cascadeMMSI === null ? ' cascade-selected' : '');
+            allRow.textContent = 'All tracks';
+            allRow.addEventListener('click', (e) => {
+                e.stopPropagation();
+                window.__cascadeMMSI = null;
+                window.__cascadeSegs = [];
+                applyCascadeToFilter();
+                panel.style.display = 'none';
+            });
+            leftCol.appendChild(allRow);
+
+            mmsiArr.forEach(mmsi => {
+                const segsForMMSI = (mmsiToSegIdxs.get(mmsi) || []).map(i => Number(tSeg[i])).sort((a,b)=>a-b);
+                const row = document.createElement('div');
+                const isSelMMSI = window.__cascadeMMSI === mmsi;
+                row.className = 'cascade-item' + (isSelMMSI ? ' cascade-selected' : '');
+                row.innerHTML = `<span>${mmsi}</span><span class="cascade-arrow">${segsForMMSI.length > 1 ? '▶' : ''}</span>`;
+                row.title = `${segsForMMSI.length} segment${segsForMMSI.length !== 1 ? 's' : ''}`;
+
+                const showSegs = () => {
+                    rightCol.innerHTML = '';
+                    rightCol.style.display = 'block';
+                    // "All segments" option
+                    const allSeg = document.createElement('div');
+                    const isAllSeg = isSelMMSI && window.__cascadeSegs.length === 0;
+                    allSeg.className = 'cascade-item' + (isAllSeg ? ' cascade-selected' : '');
+                    allSeg.textContent = `All ${segsForMMSI.length} segs`;
+                    allSeg.addEventListener('click', (e) => {
+                        e.stopPropagation();
+                        window.__cascadeMMSI = mmsi;
+                        window.__cascadeSegs = [];
+                        applyCascadeToFilter();
+                        panel.style.display = 'none';
+                    });
+                    rightCol.appendChild(allSeg);
+                    segsForMMSI.forEach(seg => {
+                        const sRow = document.createElement('div');
+                        const isSelSeg = isSelMMSI && window.__cascadeSegs.includes(seg);
+                        sRow.className = 'cascade-item' + (isSelSeg ? ' cascade-selected' : '');
+                        sRow.textContent = `seg ${seg}`;
+                        sRow.addEventListener('click', (e) => {
+                            e.stopPropagation();
+                            window.__cascadeMMSI = mmsi;
+                            window.__cascadeSegs = [seg];
+                            applyCascadeToFilter();
+                            panel.style.display = 'none';
+                        });
+                        rightCol.appendChild(sRow);
+                    });
+                };
+
+                row.addEventListener('mouseenter', showSegs);
+                row.addEventListener('click', (e) => {
+                    e.stopPropagation();
+                    window.__cascadeMMSI = mmsi;
+                    window.__cascadeSegs = [];
+                    applyCascadeToFilter();
+                    panel.style.display = 'none';
+                });
+                leftCol.appendChild(row);
+            });
+
+            panel.appendChild(leftCol);
+            panel.appendChild(rightCol);
+        };
+
+        const initCascade = () => {
+            const trigger = document.getElementById('cascade-mmsi-trigger');
+            const panel = document.getElementById('cascade-mmsi-panel');
+            if (!trigger || !panel) return;
+            trigger.addEventListener('click', (e) => {
+                e.stopPropagation();
+                if (panel.style.display === 'none') {
+                    buildCascadePanel();
+                    panel.style.display = 'flex';
+                } else {
+                    panel.style.display = 'none';
+                }
+            });
+            document.addEventListener('click', () => {
+                if (panel) panel.style.display = 'none';
+            });
+        };
+        initCascade();
+        window.__buildCascadeMMSI = buildCascadePanel;
+        window.__updateCascadeTrigger = updateCascadeTrigger;
 
         // Post-pipeline refresh hooks: show the same progress overlay as before, then rebuild layers,
         // then show a "Rendering..." pill until deck.gl has painted at least one frame.
@@ -1683,7 +3080,9 @@ function(n) {
             rebuildWaveArrays(window.tableFromIPC(buf));
             window.__hasWaves = wMMSI.length > 0;
             window._hoveredWave = null;
+            window._pinnedWave  = null;
             window.__rebuild();
+            if (typeof window.__updateLegend === 'function') window.__updateLegend();
             await waitForPaint();
             setRenderStatus(`Waves ready (${wMMSI.length.toLocaleString()})`, true);
             clearRenderStatus(1500);
@@ -1701,7 +3100,10 @@ function(n) {
                 window.tableFromIPC(o),
             );
             window.__hasTracks = tMMSI.length > 0;
+            // Reset cascade selection display when new track data arrives
+            if (typeof window.__updateCascadeTrigger === 'function') window.__updateCascadeTrigger();
             window.__rebuild();
+            if (typeof window.__updateLegend === 'function') window.__updateLegend();
             await waitForPaint();
             setRenderStatus(`Tracks ready (${tMMSI.length.toLocaleString()} segments)`, true);
             clearRenderStatus(1500);
@@ -1712,12 +3114,15 @@ function(n) {
         window.__importAis = async (path) => {
             if (!path) return 'no file selected';
             try {
-                const [buf] = await fetchAssetsWithProgress([
-                    { key: 'ais',  url: '/api/preview/ais.arrow?path=' + encodeURIComponent(path),
-                      label: 'AIS positions' },
-                ], 'Importing AIS data');
+                const resp = await fetch('/api/preview/ais.arrow?path=' + encodeURIComponent(path));
+                if (!resp.ok) {
+                    const err = await resp.json().catch(() => ({}));
+                    throw new Error(err.error || `HTTP ${resp.status}`);
+                }
+                const total = +resp.headers.get('content-length') || 0;
+                const buf = await resp.arrayBuffer();
                 setRenderStatus('Rendering AIS points...', false);
-                const t = window.tableFromIPC(buf);
+                const t = window.tableFromIPC(new Uint8Array(buf));
                 const lon = t.getChild('longitude').toArray();
                 const lat = t.getChild('latitude').toArray();
                 const pos = new Float32Array(lon.length * 2);
@@ -1743,14 +3148,17 @@ function(n) {
                 await waitForPaint();
                 setRenderStatus(`AIS ready (${lon.length.toLocaleString()} points)`, true);
                 clearRenderStatus(1500);
-                let report = `imported ${lon.length.toLocaleString()} points`;
                 try {
                     const meta = await fetch('/api/preview/ais.bbox?path=' + encodeURIComponent(path)).then(r => r.json());
                     if (meta.time_min) {
-                        report += `\ntime: ${meta.time_min}  →  ${meta.time_max}`;
+                        window.__previews.ais.timeMin = meta.time_min;
+                        window.__previews.ais.timeMax = meta.time_max;
                     }
                 } catch (e) { /* nonfatal */ }
-                return report;
+                const range = window.__previews.ais.timeMin
+                    ? `\ntime: ${window.__previews.ais.timeMin}  →  ${window.__previews.ais.timeMax}`
+                    : '';
+                return `imported ${lon.length.toLocaleString()} points${range}`;
             } catch (e) {
                 clearRenderStatus(0);
                 return 'ERROR: ' + e.message;
@@ -1760,9 +3168,11 @@ function(n) {
             if (window.__previews.ais) {
                 window.__previews.ais.visible = !!visible;
                 window.__rebuild();
-                return window.__previews.ais.visible
-                    ? `showing ${(window.__previews.ais.pos.length/2).toLocaleString()} points`
-                    : 'hidden';
+                if (!window.__previews.ais.visible) return 'hidden';
+                const range = window.__previews.ais.timeMin
+                    ? `\ntime: ${window.__previews.ais.timeMin}  →  ${window.__previews.ais.timeMax}`
+                    : '';
+                return `showing ${(window.__previews.ais.pos.length/2).toLocaleString()} points${range}`;
             }
             return visible ? 'import first' : '';
         };
@@ -1815,49 +3225,28 @@ function(n) {
                     window._currentZoom = z;
                 }
                 window.__rebuild();
-                const nFeat = gj.features ? gj.features.length : 0;
-                return `${nFeat} feature(s)`;
+                return '';
             } catch (e) {
                 window.__previews.coast = null; window.__rebuild();
                 return 'ERROR: ' + e.message;
             }
         };
-        // ---- Debug filter setter ----
-        window.__setDebugFilter = (state) => {
-            window.__debugFilter = state || { mmsi: null, segment_id: null };
-            const df = window.__debugFilter;
-            if (df.mmsi == null || df.segment_id == null) {
+        window.__setPreviewLand = async (state) => {
+            if (!state || !state.visible || !state.path) {
+                window.__previews.land = null; window.__rebuild(); return '';
+            }
+            try {
+                const gj = await fetch('/api/preview/coast.geojson?path=' + encodeURIComponent(state.path)).then(r => r.json());
+                if (gj.error) throw new Error(gj.error);
+                window.__previews.land = { geojson: gj };
+                // No auto-zoom — land mask covers all of Singapore and zooming
+                // out that far would lose the project-area context.
                 window.__rebuild();
-                return 'showing all tracks';
+                return '';
+            } catch (e) {
+                window.__previews.land = null; window.__rebuild();
+                return 'ERROR: ' + e.message;
             }
-            if (!segLookup) return 'no track data yet — run Filter first';
-            const segIdx = segLookup.get(`${df.mmsi}|${df.segment_id}`);
-            if (segIdx == null || segIdx >= startIndices.length - 1) {
-                window.__rebuild();
-                return `not found: MMSI=${df.mmsi}, segment=${df.segment_id}`;
-            }
-            const segStart = startIndices[segIdx];
-            const segEnd   = startIndices[segIdx + 1];
-            const n = segEnd - segStart;
-            // Fit camera to the segment's bbox.
-            let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
-            for (let i = segStart; i < segEnd; i++) {
-                const x = cPos[i*2], y = cPos[i*2+1];
-                if (x < minX) minX = x; if (x > maxX) maxX = x;
-                if (y < minY) minY = y; if (y > maxY) maxY = y;
-            }
-            if (isFinite(minX)) {
-                const lonC = (minX + maxX) / 2, latC = (minY + maxY) / 2;
-                const span = Math.max(maxX - minX, maxY - minY, 0.0005);
-                const z = Math.max(12, Math.min(18, 11 - Math.log2(span)));
-                window.deckInstance.setProps({
-                    initialViewState: { longitude: lonC, latitude: latC,
-                                        zoom: z, pitch: 0, bearing: 0 },
-                });
-                window._currentZoom = z;
-            }
-            window.__rebuild();
-            return `MMSI ${df.mmsi} seg ${df.segment_id}: ${n} vertices  (hover dots for lon/lat)`;
         };
 
         window.__setPreviewTide = async (state) => {
@@ -1907,7 +3296,14 @@ async function(version) {
     if (!version || version === window.__lastTrackVersion) return window.dash_clientside.no_update;
     window.__lastTrackVersion = version;
     if (typeof window.__refreshTrackCaches === 'function') {
-        try { await window.__refreshTrackCaches(version); } catch (e) { console.error(e); }
+        try {
+            await window.__refreshTrackCaches(version);
+            // Hide raw AIS import dots after filter — filtered data is now in the track layer
+            if (window.__previews?.ais) {
+                window.__previews.ais.visible = false;
+                if (typeof window.__rebuild === 'function') window.__rebuild();
+            }
+        } catch (e) { console.error(e); }
     }
     return null;
 }
@@ -1922,6 +3318,15 @@ app.clientside_callback(TRACK_RELOAD_JS,
     Output('_init', 'data', allow_duplicate=True),
     Input('_track_version', 'data'),
     prevent_initial_call=True)
+
+
+@app.callback(
+    Output('pv-ais', 'value', allow_duplicate=True),
+    Input('_track_version', 'data'),
+    prevent_initial_call=True,
+)
+def _clear_ais_preview_after_filter(_):
+    return []
 
 
 # ---- Preview clientside hooks: each updates a preview-info span and the deck.gl layers
@@ -1941,8 +3346,91 @@ async function(state) {
 _make_preview_clientside('_pv_ais',   'pv-ais-info',   '__setPreviewAis')
 _make_preview_clientside('_pv_bathy', 'pv-bathy-info', '__setPreviewBathy')
 _make_preview_clientside('_pv_coast', 'pv-coast-info', '__setPreviewCoast')
-_make_preview_clientside('_pv_land',  'pv-land-info',  '__setPreviewCoast')
+_make_preview_clientside('_pv_land',  'pv-land-info',  '__setPreviewLand')
 _make_preview_clientside('_pv_tide',  'pv-tide-info',  '__setPreviewTide')
+
+
+# Tide item pills: render items as clickable pills in the custom div
+app.clientside_callback(
+    r"""
+    function(items) {
+        const inner = document.getElementById('tide-item-pills-inner');
+        if (!inner) return window.dash_clientside.no_update;
+        inner.innerHTML = '';
+        if (!items || !items.length) return window.dash_clientside.no_update;
+        items.forEach(it => {
+            const pill = document.createElement('span');
+            pill.className = 'tide-item-pill';
+            pill.textContent = it.name;
+            pill.title = it.label;
+            pill.addEventListener('click', () => {
+                inner.querySelectorAll('.tide-item-pill').forEach(p => p.classList.remove('selected'));
+                pill.classList.add('selected');
+                window.__tideItemPick = it.name;
+                const btn = document.getElementById('_tide-item-btn');
+                if (btn) { btn.click(); }
+            });
+            inner.appendChild(pill);
+        });
+        // Auto-select first if only one item
+        if (items.length === 1) {
+            inner.querySelector('.tide-item-pill').click();
+        }
+        return window.dash_clientside.no_update;
+    }
+    """,
+    Output('tide-item-pills-inner', 'children'),
+    Input('_tide_items_meta', 'data'),
+    prevent_initial_call=True,
+)
+
+
+# Hidden button click → capture window.__tideItemPick into Store
+app.clientside_callback(
+    r"""
+    function(n, prev) {
+        if (!n) return window.dash_clientside.no_update;
+        const val = window.__tideItemPick || null;
+        const nonce = ((prev || {}).nonce || 0) + 1;
+        return { value: val, nonce };
+    }
+    """,
+    Output('_tide_item_pick', 'data'),
+    Input('_tide-item-btn', 'n_clicks'),
+    State('_tide_item_pick', 'data'),
+    prevent_initial_call=True,
+)
+
+
+@app.callback(
+    Output('sel-tide-item', 'value', allow_duplicate=True),
+    Input('_tide_item_pick', 'data'),
+    prevent_initial_call=True,
+)
+def _sync_tide_item_from_pick(data):
+    if data and data.get('value'):
+        return data['value']
+    return no_update
+
+
+# Dev-load result → bump version stores so client refetches Arrow data.
+app.clientside_callback(
+    r"""
+    async function(result) {
+        const nu = window.dash_clientside.no_update;
+        if (!result) return [nu, nu, ''];
+        if (result.error) return [nu, nu, 'Error: ' + result.error];
+        const status = `Loaded: ${(result.n_segs||0).toLocaleString()} segments, `
+                     + `${(result.n_waves||0).toLocaleString()} waves  ← ${result.source}`;
+        return [result.track_version, result.wave_version, status];
+    }
+    """,
+    Output('_track_version', 'data', allow_duplicate=True),
+    Output('_wave_version',  'data', allow_duplicate=True),
+    Output('dev-load-status', 'children'),
+    Input('_dev_load_result', 'data'),
+    prevent_initial_call=True,
+)
 
 
 # AIS import clientside callback — triggered by the Import button via _ais_import Store.
@@ -1961,16 +3449,83 @@ app.clientside_callback(
 )
 
 
-# Debug filter clientside callback — calls __setDebugFilter and surfaces the info text.
+# Structural filter (MMSI / segment IDs / vessel types) → recompute visibility
 app.clientside_callback(
     r"""
-    function(state) {
-        if (typeof window.__setDebugFilter !== 'function') return 'init pending...';
-        return window.__setDebugFilter(state) || '';
+    function(structural) {
+        if (typeof window.__applyStructuralFilter !== 'function') return window.dash_clientside.no_update;
+        return window.__applyStructuralFilter(structural) || '';
     }
     """,
-    Output('debug-info', 'children'),
-    Input('_debug_filter', 'data'),
+    Output('fil-status', 'children'),
+    Input('_filter_structural', 'data'),
+    prevent_initial_call=True,
+)
+
+# Freehand button → enter draw mode
+app.clientside_callback(
+    r"""
+    function(n) {
+        if (!n) return window.dash_clientside.no_update;
+        if (typeof window.__enterFreehandMode === 'function') window.__enterFreehandMode();
+        return window.dash_clientside.no_update;
+    }
+    """,
+    Output('fil-status', 'children', allow_duplicate=True),
+    Input('btn-freehand', 'n_clicks'),
+    prevent_initial_call=True,
+)
+
+# Similar button → enter pick mode
+app.clientside_callback(
+    r"""
+    function(n) {
+        if (!n) return window.dash_clientside.no_update;
+        if (typeof window.__enterSimilarMode === 'function') {
+            const msg = window.__enterSimilarMode();
+            return msg || window.dash_clientside.no_update;
+        }
+        return window.dash_clientside.no_update;
+    }
+    """,
+    Output('fil-status', 'children', allow_duplicate=True),
+    Input('btn-similar', 'n_clicks'),
+    prevent_initial_call=True,
+)
+
+# Similar confirm → POST to server, apply result
+app.clientside_callback(
+    r"""
+    async function(n, buffer_m, min_cov) {
+        if (!n) return window.dash_clientside.no_update;
+        if (typeof window.__runSimilar === 'function') {
+            const result = await window.__runSimilar(buffer_m || 200, min_cov || 0.5);
+            return result || '';
+        }
+        return 'init pending';
+    }
+    """,
+    Output('fil-status', 'children', allow_duplicate=True),
+    Input('btn-sim-confirm', 'n_clicks'),
+    State('sim-buffer-m', 'value'),
+    State('sim-coverage', 'value'),
+    prevent_initial_call=True,
+)
+
+# Similar cancel
+app.clientside_callback(
+    r"""
+    function(n) {
+        if (!n) return window.dash_clientside.no_update;
+        const p = document.getElementById('sim-panel');
+        if (p) p.style.display = 'none';
+        if (window.__filterState) { window.__filterState.similar = null; }
+        if (typeof window.__recomputeVisibility === 'function') window.__recomputeVisibility();
+        return 'Similar filter cleared';
+    }
+    """,
+    Output('fil-status', 'children', allow_duplicate=True),
+    Input('btn-sim-cancel', 'n_clicks'),
     prevent_initial_call=True,
 )
 

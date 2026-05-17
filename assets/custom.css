@@ -1,0 +1,295 @@
+/* Compact dropdowns — match row-buttons height (~28px) */
+button.compact-dropdown {
+    height: 30px !important;
+    min-height: 30px !important;
+    padding: 0 8px !important;
+    font-size: 11px !important;
+    line-height: 28px !important;
+}
+
+button.compact-dropdown .dash-dropdown-grid-container,
+button.compact-dropdown .dash-dropdown-trigger {
+    min-height: 30px !important;
+    line-height: 28px !important;
+    font-size: 11px !important;
+}
+
+/* Space label→dropdown same as the row-with-preview gap */
+#sidebar label + .dash-dropdown-wrapper {
+    margin-top: 4px;
+}
+.dash-dropdown-wrapper {
+    min-height: 30px !important;
+}
+
+/* Expanded menu options */
+.dash-dropdown-menu li,
+.dash-dropdown-option,
+.dash-dropdown-menu [role="option"] {
+    font-size: 11px !important;
+    line-height: 22px !important;
+    min-height: 24px !important;
+    padding: 2px 8px !important;
+}
+
+/* ── Sidebar buttons ─────────────────────────────────────────────────────── */
+#sidebar button {
+    border-radius: 5px !important;
+    font-weight: 600 !important;
+    letter-spacing: 0.2px !important;
+    text-shadow: 0 1px 1px rgba(0,0,0,0.18) !important;
+    transition: background 0.15s, box-shadow 0.15s !important;
+    border: 1px solid #4a85b5 !important;
+    background: linear-gradient(180deg, #6aabda, #4a85b5) !important;
+}
+#sidebar button:hover {
+    background: linear-gradient(180deg, #5a9bca, #3a75a5) !important;
+    box-shadow: 0 2px 6px rgba(0,80,140,0.25) !important;
+}
+#sidebar button:active {
+    background: linear-gradient(180deg, #3a75a5, #2a6595) !important;
+    box-shadow: inset 0 1px 3px rgba(0,0,0,0.2) !important;
+}
+#sidebar button:disabled {
+    background: #b8c8d8 !important;
+    border-color: #a0b4c4 !important;
+    box-shadow: none !important;
+    text-shadow: none !important;
+    cursor: wait !important;
+}
+
+/* Secondary (outline-fill) buttons: Import, Filter, Isolate, Show all */
+#sidebar .secondary-btn {
+    background: #eef2f7 !important;
+    color: #3a6080 !important;
+    border: 1px solid #a8c0d8 !important;
+    text-shadow: none !important;
+}
+#sidebar .secondary-btn:hover {
+    background: #dce8f2 !important;
+    box-shadow: 0 2px 5px rgba(0,80,140,0.15) !important;
+}
+#sidebar .secondary-btn:active {
+    background: #c8daea !important;
+    box-shadow: inset 0 1px 3px rgba(0,0,0,0.12) !important;
+}
+
+/* Calculate waves — teal accent to signal final action */
+#btn-waves {
+    background: linear-gradient(180deg, #5abaaa, #3a9a8a) !important;
+    border-color: #3a9a8a !important;
+}
+#btn-waves:hover {
+    background: linear-gradient(180deg, #4aaa9a, #2a8a7a) !important;
+    box-shadow: 0 2px 6px rgba(0,120,100,0.3) !important;
+}
+
+/* ── Filter: promote to primary action ───────────────────────────────────── */
+#btn-filter {
+    background: linear-gradient(180deg, #6aabda, #4a85b5) !important;
+    color: white !important;
+    border-color: #4a85b5 !important;
+    text-shadow: 0 1px 1px rgba(0,0,0,0.18) !important;
+}
+#btn-filter:hover {
+    background: linear-gradient(180deg, #5a9bca, #3a75a5) !important;
+    box-shadow: 0 2px 6px rgba(0,80,140,0.25) !important;
+}
+#btn-filter:active {
+    background: linear-gradient(180deg, #3a75a5, #2a6595) !important;
+}
+
+/* ── Section dividers ────────────────────────────────────────────────────── */
+#sidebar hr {
+    border: none !important;
+    border-top: 1px solid #d0dcea !important;
+    margin: 14px -12px !important;
+    opacity: 1 !important;
+}
+
+/* ── Debug section: muted warm tone ─────────────────────────────────────── */
+/* Use #sidebar prefix to out-specificity #sidebar .secondary-btn */
+#sidebar #btn-debug-apply {
+    background: #f2ede4 !important;
+    color: #7a6040 !important;
+    border-color: #c8b488 !important;
+    text-shadow: none !important;
+}
+#sidebar #btn-debug-apply:hover {
+    background: #e8e0d0 !important;
+    box-shadow: 0 2px 5px rgba(120,80,0,0.12) !important;
+}
+#sidebar #btn-debug-apply:active {
+    background: #ddd0bc !important;
+}
+#sidebar #btn-debug-clear {
+    background: #f0f0f0 !important;
+    color: #666 !important;
+    border-color: #c4c4c4 !important;
+    text-shadow: none !important;
+}
+#sidebar #btn-debug-clear:hover {
+    background: #e4e4e4 !important;
+    box-shadow: 0 2px 4px rgba(0,0,0,0.1) !important;
+}
+
+/* Debug number inputs */
+#inp-debug-mmsi,
+#inp-debug-seg {
+    border: 1px solid #c8d4e0 !important;
+    border-radius: 4px !important;
+    background: #f8fafc !important;
+    color: #334 !important;
+    outline: none !important;
+    transition: border-color 0.15s !important;
+}
+#inp-debug-mmsi:focus,
+#inp-debug-seg:focus {
+    border-color: #7aaace !important;
+    box-shadow: 0 0 0 2px rgba(100,160,210,0.18) !important;
+}
+
+/* ── Right sidebar inputs ────────────────────────────────────────────────── */
+#right-sidebar input[type="number"] {
+    width: 100%;
+    font-size: 11px !important;
+    padding: 4px 6px !important;
+    box-sizing: border-box !important;
+    border: 1px solid #c8d4e0 !important;
+    border-radius: 4px !important;
+    background: #f8fafc !important;
+    color: #334 !important;
+    transition: border-color 0.15s !important;
+}
+#right-sidebar input[type="number"]:focus {
+    border-color: #7aaace !important;
+    box-shadow: 0 0 0 2px rgba(100,160,210,0.18) !important;
+    outline: none !important;
+}
+#right-sidebar .dash-dropdown-wrapper {
+    min-height: 26px !important;
+}
+
+/* ── Progress section ────────────────────────────────────────────────────── */
+#progress-log {
+    border-radius: 5px !important;
+    border: 1px solid #1a1a2a !important;
+    box-shadow: inset 0 2px 8px rgba(0,0,0,0.3) !important;
+    margin-top: 6px !important;
+}
+
+/* ── Remove browser spinners from number inputs ──────────────────────────── */
+input[type="number"]::-webkit-inner-spin-button,
+input[type="number"]::-webkit-outer-spin-button {
+    -webkit-appearance: none !important;
+    margin: 0 !important;
+}
+input[type="number"] {
+    -moz-appearance: textfield !important;
+}
+
+/* ── Hide AIS point count info and tide item text list ───────────────────── */
+#pv-ais-info { display: none !important; }
+#pv-tide-info { display: none !important; }
+
+/* ── Tide item pills ─────────────────────────────────────────────────────── */
+.tide-item-pill {
+    display: inline-block;
+    padding: 2px 8px;
+    background: #e8f0f8;
+    color: #3a6080;
+    border: 1px solid #b0cce0;
+    border-radius: 10px;
+    font-size: 10px;
+    cursor: pointer;
+    transition: background 0.12s, border-color 0.12s;
+    white-space: nowrap;
+}
+.tide-item-pill:hover {
+    background: #d0e4f4;
+    border-color: #7aaace;
+}
+.tide-item-pill.selected {
+    background: #4a85b5;
+    color: white;
+    border-color: #3a75a5;
+}
+
+/* ── Cascading MMSI → Segment picker ─────────────────────────────────────── */
+.cascade-trigger {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 4px 8px;
+    background: #f4f7fb;
+    border: 1px solid #b0c4d8;
+    border-radius: 4px;
+    font-size: 10px;
+    color: #334;
+    cursor: pointer;
+    min-height: 26px;
+    transition: border-color 0.12s, background 0.12s;
+    user-select: none;
+}
+.cascade-trigger::after {
+    content: '▾';
+    font-size: 10px;
+    color: #7a9ab8;
+    margin-left: 4px;
+    flex-shrink: 0;
+}
+.cascade-trigger:hover {
+    background: #e8f0f8;
+    border-color: #7aaace;
+}
+.cascade-trigger.cascade-active {
+    background: #dceaf6;
+    border-color: #4a85b5;
+    color: #2a5580;
+    font-weight: 600;
+}
+
+/* Cascade flyout panel */
+.cascade-panel {
+    position: absolute;
+    top: 100%;
+    left: 0;
+    min-width: 160px;
+    max-height: 240px;
+    background: white;
+    border: 1px solid #b0c4d8;
+    border-radius: 4px;
+    box-shadow: 0 4px 14px rgba(0,40,100,0.14);
+    z-index: 1000;
+    display: flex;
+    flex-direction: row;
+    overflow: hidden;
+}
+.cascade-col {
+    min-width: 150px;
+    max-width: 190px;
+    overflow-y: auto;
+    border-right: 1px solid #e4eaf2;
+    max-height: 240px;
+}
+.cascade-col:last-child { border-right: none; }
+.cascade-seg-col { background: #f8fafd; }
+.cascade-item {
+    padding: 4px 10px;
+    font-size: 10px;
+    color: #334;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    white-space: nowrap;
+    transition: background 0.1s;
+}
+.cascade-item:hover { background: #e4eef8; }
+.cascade-item.cascade-selected {
+    background: #d0e4f4;
+    color: #1a4a80;
+    font-weight: 600;
+}
+.cascade-arrow { color: #a0b8cc; font-size: 9px; margin-left: 6px; }
+.cascade-empty { padding: 6px 10px; font-size: 10px; color: #999; }

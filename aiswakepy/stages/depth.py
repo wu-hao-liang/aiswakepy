@@ -76,12 +76,17 @@ def assign_depth(
 
     df["WaterDepth"] = depths
 
-    # Drop NaN depths (outside mesh or outside tide range)
-    df = df.dropna(subset=["WaterDepth"])
+    # Sort for meaningful adjacency when setting force-break flags.
+    df = df.sort_values(["mmsi", "obstime"]).reset_index(drop=True)
 
-    # Under-keel clearance filter
-    df = df[df["WaterDepth"] >= df["draught"] + underkeel_margin_m]
+    # Combined removal mask: NaN depth OR insufficient clearance.
+    remove = df["WaterDepth"].isna().to_numpy().copy()
+    remove |= (df["WaterDepth"] < df["draught"] + underkeel_margin_m).to_numpy()
 
+    from aiswakepy.stages.filter import _set_force_breaks
+    _set_force_breaks(df, remove)
+
+    df = df[~remove]
     result = df.reset_index(drop=True)
     spinner.done(rows=len(result))
     return result

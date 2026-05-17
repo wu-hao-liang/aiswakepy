@@ -94,6 +94,12 @@ def run_pipeline(
             tide_item=config.bathymetry.tide_item,
             underkeel_margin_m=config.bathymetry.underkeel_margin_m,
         )
+        # Re-segment after depth/clearance point removal.
+        from aiswakepy.stages.filter import segment_trajectories
+        results["df_depth"] = segment_trajectories(
+            results["df_depth"], gap_s=config.ais.traj_gap_s,
+            use_force_break=True,
+        )
         print(
             f"  \u2192 {len(results['df_depth'])} rows after depth filter "
             f"({time.perf_counter() - t0:.1f}s)"
@@ -135,7 +141,7 @@ def run_pipeline(
         results["df_wave_impact"] = compute_wave_impact(
             df_vessel=df_in,
             coastline_shp=config.coastline.shapefile,
-            formula="kriebel",
+            formula=config.wave.formula,
             max_propagation_m=config.impact.max_propagation_m,
             wake_cutoff_m=config.impact.wake_cutoff_m,
             g=config.wave.gravity,

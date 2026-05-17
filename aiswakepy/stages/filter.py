@@ -762,6 +762,26 @@ def filter_study_area(
     return result
 
 
+def _set_force_breaks(df: pd.DataFrame, remove_mask: np.ndarray) -> None:
+    """Flag the surviving point after each removed point as a forced segment break.
+
+    Modifies ``df`` in place, adding or updating the ``_force_break`` column.
+    Only considers same-MMSI adjacency (cross-vessel boundaries are ignored —
+    ``segment_trajectories`` already splits on MMSI change).
+    """
+    if not remove_mask.any():
+        return
+    force = np.zeros(len(df), dtype=bool)
+    force[1:] = remove_mask[:-1]
+    mmsi_arr = df["mmsi"].to_numpy()
+    same_mmsi = np.zeros(len(df), dtype=bool)
+    same_mmsi[1:] = mmsi_arr[1:] == mmsi_arr[:-1]
+    force = force & same_mmsi
+    if "_force_break" in df.columns:
+        force = force | df["_force_break"].to_numpy(dtype=bool)
+    df["_force_break"] = force
+
+
 # ---------------------------------------------------------------------------
 # 6. Land masking (pre-segmentation)
 # ---------------------------------------------------------------------------
@@ -801,18 +821,7 @@ def mask_land(df: pd.DataFrame, land_shp: str | Path,
     in_land = joined["index_right"].notna().to_numpy()
 
     if track_breaks:
-        # Flag the surviving point immediately after each land point.
-        force = np.zeros(len(df), dtype=bool)
-        force[1:] = in_land[:-1]
-        # Don't flag cross-MMSI adjacency.
-        mmsi_arr = df["mmsi"].to_numpy()
-        same_mmsi = np.zeros(len(df), dtype=bool)
-        same_mmsi[1:] = mmsi_arr[1:] == mmsi_arr[:-1]
-        force = force & same_mmsi
-        # Combine with any existing flags from a previous mask_land call.
-        if "_force_break" in df.columns:
-            force = force | df["_force_break"].to_numpy(dtype=bool)
-        df["_force_break"] = force
+        _set_force_breaks(df, in_land)
 
     result = df[~in_land].reset_index(drop=True)
     spinner.done(rows=len(result))
