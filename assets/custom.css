@@ -188,78 +188,66 @@ input[type="number"] {
     -moz-appearance: textfield !important;
 }
 
-/* ── Hide AIS point count info and tide item text list ───────────────────── */
+/* ── Hide AIS point count info, tide item text list, and bathy preview text ── */
 #pv-ais-info { display: none !important; }
 #pv-tide-info { display: none !important; }
+#pv-bathy-info { display: none !important; }
 
-/* ── Tide item pills ─────────────────────────────────────────────────────── */
-.tide-item-pill {
-    display: inline-block;
-    padding: 2px 8px;
-    background: #e8f0f8;
-    color: #3a6080;
-    border: 1px solid #b0cce0;
-    border-radius: 10px;
-    font-size: 10px;
-    cursor: pointer;
-    transition: background 0.12s, border-color 0.12s;
-    white-space: nowrap;
-}
-.tide-item-pill:hover {
-    background: #d0e4f4;
-    border-color: #7aaace;
-}
-.tide-item-pill.selected {
-    background: #4a85b5;
-    color: white;
-    border-color: #3a75a5;
-}
-
-/* ── Cascading MMSI → Segment picker ─────────────────────────────────────── */
+/* ── Cascade trigger: identical to Dash dropdown (30px / 5px / 11px) ─────── */
 .cascade-trigger {
     display: flex;
     align-items: center;
     justify-content: space-between;
-    padding: 4px 8px;
-    background: #f4f7fb;
-    border: 1px solid #b0c4d8;
-    border-radius: 4px;
-    font-size: 10px;
-    color: #334;
+    padding: 0px 8px;
+    background: linear-gradient(180deg, #6aabda, #4a85b5);
+    border: 1px solid #4a85b5;
+    border-radius: 5px;
+    font-size: 11px;
+    color: rgba(255,255,255,0.80);     /* placeholder-like opacity when unselected */
     cursor: pointer;
-    min-height: 26px;
-    transition: border-color 0.12s, background 0.12s;
+    height: 30px;
+    min-height: 30px;
+    transition: background 0.12s, border-color 0.12s;
     user-select: none;
+    font-weight: 500;
+    text-shadow: 0 1px 1px rgba(0,0,0,0.15);
+    box-sizing: border-box;
 }
 .cascade-trigger::after {
-    content: '▾';
-    font-size: 10px;
-    color: #7a9ab8;
-    margin-left: 4px;
+    content: '';
+    display: inline-block;
+    width: 15px;
+    height: 15px;
     flex-shrink: 0;
+    margin-left: 4px;
+    /* Exact same SVG path as .dash-dropdown-trigger-icon */
+    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='15' height='15' viewBox='0 0 15 15'%3E%3Cpath d='M4.18179 6.18181C4.35753 6.00608 4.64245 6.00608 4.81819 6.18181L7.49999 8.86362L10.1818 6.18181C10.3575 6.00608 10.6424 6.00608 10.8182 6.18181C10.9939 6.35755 10.9939 6.64247 10.8182 6.81821L7.81819 9.81821C7.73379 9.9026 7.61934 9.95001 7.49999 9.95001C7.38064 9.95001 7.26618 9.9026 7.18179 9.81821L4.18179 6.81821C4.00605 6.64247 4.00605 6.35755 4.18179 6.18181Z' fill='rgba(0,9,38,0.9)' fill-rule='evenodd' clip-rule='evenodd'/%3E%3C/svg%3E");
+    background-repeat: no-repeat;
+    background-position: center;
+    background-size: 15px 15px;
 }
 .cascade-trigger:hover {
-    background: #e8f0f8;
-    border-color: #7aaace;
+    background: linear-gradient(180deg, #5a9bca, #3a75a5);
+    border-color: #3a75a5;
 }
 .cascade-trigger.cascade-active {
-    background: #dceaf6;
+    background: linear-gradient(180deg, #6aabda, #4a85b5);
     border-color: #4a85b5;
-    color: #2a5580;
+    color: white;                       /* full white when something selected */
     font-weight: 600;
 }
 
-/* Cascade flyout panel */
+/* Cascade flyout panel — dark to match trigger */
 .cascade-panel {
     position: absolute;
     top: 100%;
     left: 0;
     min-width: 160px;
     max-height: 240px;
-    background: white;
-    border: 1px solid #b0c4d8;
+    background: #1e2d3d;
+    border: 1px solid #4a85b5;
     border-radius: 4px;
-    box-shadow: 0 4px 14px rgba(0,40,100,0.14);
+    box-shadow: 0 4px 16px rgba(0,30,70,0.45);
     z-index: 1000;
     display: flex;
     flex-direction: row;
@@ -269,15 +257,16 @@ input[type="number"] {
     min-width: 150px;
     max-width: 190px;
     overflow-y: auto;
-    border-right: 1px solid #e4eaf2;
+    border-right: 1px solid rgba(255,255,255,0.08);
     max-height: 240px;
+    background: #1e2d3d;
 }
 .cascade-col:last-child { border-right: none; }
-.cascade-seg-col { background: #f8fafd; }
+.cascade-seg-col { background: #18242f; }
 .cascade-item {
     padding: 4px 10px;
     font-size: 10px;
-    color: #334;
+    color: #b8cede;
     cursor: pointer;
     display: flex;
     align-items: center;
@@ -285,11 +274,129 @@ input[type="number"] {
     white-space: nowrap;
     transition: background 0.1s;
 }
-.cascade-item:hover { background: #e4eef8; }
+.cascade-item:hover { background: #2a3d54; }
 .cascade-item.cascade-selected {
-    background: #d0e4f4;
-    color: #1a4a80;
+    background: #1a4a80;
+    color: #ddeeff;
     font-weight: 600;
 }
-.cascade-arrow { color: #a0b8cc; font-size: 9px; margin-left: 6px; }
-.cascade-empty { padding: 6px 10px; font-size: 10px; color: #999; }
+.cascade-arrow { color: #5a80a8; font-size: 9px; margin-left: 6px; }
+.cascade-empty { padding: 6px 10px; font-size: 10px; color: #5a80a8; }
+
+/* ── dcc.Dropdown trigger: fix vertical centering of text + arrow ─────────── */
+.compact-dropdown .dash-dropdown-wrapper {
+    height: 30px !important;
+    min-height: 30px !important;
+    display: block !important;
+}
+.compact-dropdown .dash-dropdown-trigger {
+    display: flex !important;
+    align-items: center !important;
+    justify-content: space-between !important;
+    height: 30px !important;
+    min-height: 30px !important;
+    font-size: 11px !important;
+    box-sizing: border-box !important;
+}
+.compact-dropdown .dash-dropdown-value {
+    flex: 1 !important;
+    text-align: left !important;
+    overflow: hidden !important;
+    text-overflow: ellipsis !important;
+    white-space: nowrap !important;
+    color: #fff !important;
+}
+/* Multi-select tag items rendered inline with comma separators */
+.compact-dropdown .dash-dropdown-value-item { display: inline !important; }
+.compact-dropdown .dash-dropdown-value-item + .dash-dropdown-value-item::before {
+    content: ", ";
+}
+
+/* Subtle "N selected" badge */
+.compact-dropdown .dash-dropdown-value-count {
+    font-size: 9px !important;
+    color: rgba(255,255,255,0.78) !important;
+    background: rgba(0,0,0,0.20) !important;
+    padding: 2px 7px !important;
+    border-radius: 9px !important;
+    margin: 0 6px 0 4px !important;
+    flex-shrink: 0 !important;
+    line-height: 1.2 !important;
+}
+
+/* Subtle clear-selection (×) button */
+.compact-dropdown .dash-dropdown-clear {
+    display: flex !important;
+    align-items: center !important;
+    opacity: 0.55 !important;
+    margin-right: 4px !important;
+    flex-shrink: 0 !important;
+    color: #fff !important;
+}
+.compact-dropdown .dash-dropdown-clear:hover { opacity: 1 !important; }
+.compact-dropdown .dash-dropdown-clear svg { width: 12px !important; height: 12px !important; }
+
+/* Chevron — always visible and right-aligned (match cascade-trigger color) */
+.compact-dropdown .dash-dropdown-trigger-icon {
+    flex-shrink: 0 !important;
+    color: rgba(0,9,38,0.9) !important;
+    width: 14px !important;
+    height: 14px !important;
+}
+
+/* Free-hand & Similar buttons — left-aligned text with consistent padding */
+#btn-freehand,
+#btn-similar {
+    text-align: left !important;
+    padding-left: 14px !important;
+    padding-right: 14px !important;
+}
+
+/* ── Multi-select dropdown: move built-in Select-All/Deselect-All to bottom ─ */
+.dash-dropdown-content {
+    display: flex !important;
+    flex-direction: column !important;
+}
+.dash-dropdown-content .dash-dropdown-search-container { order: 1; }
+.dash-dropdown-content .dash-options-list             { order: 2; flex: 1; overflow-y: auto; }
+.dash-dropdown-content .dash-dropdown-actions         { order: 3; }
+
+.dash-dropdown-actions {
+    border-top: 1px solid rgba(80,130,200,0.18) !important;
+    background: #f4f7fb !important;
+    padding: 6px 8px 6px !important;
+    gap: 6px !important;
+}
+.dash-dropdown-action-button {
+    flex: 1 !important;
+    font-size: 10px !important;
+    padding: 4px 0 !important;
+    border-radius: 4px !important;
+    font-weight: 600 !important;
+    cursor: pointer !important;
+}
+.dash-dropdown-action-button:nth-child(1) {
+    background: linear-gradient(180deg,#6aabda,#4a85b5) !important;
+    color: #fff !important;
+    border: 1px solid #4a85b5 !important;
+}
+.dash-dropdown-action-button:nth-child(1):hover {
+    background: linear-gradient(180deg,#5a9bca,#3a75a5) !important;
+}
+.dash-dropdown-action-button:nth-child(2) {
+    background: #eef2f7 !important;
+    color: #3a6080 !important;
+    border: 1px solid #a8c0d8 !important;
+}
+.dash-dropdown-action-button:nth-child(2):hover {
+    background: #dce8f2 !important;
+}
+/* Apply button — teal accent (injected via JS as 3rd child) */
+.dash-dropdown-action-button.apply-action-btn {
+    background: linear-gradient(180deg, #5abaaa, #3a9a8a) !important;
+    color: #fff !important;
+    border: 1px solid #3a9a8a !important;
+}
+.dash-dropdown-action-button.apply-action-btn:hover {
+    background: linear-gradient(180deg, #4aaa9a, #2a8a7a) !important;
+}
