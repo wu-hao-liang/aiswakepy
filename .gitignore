@@ -45,6 +45,8 @@ desktop.ini
 
 # Claude Code
 .claude/
+.mcp.json
+.playwright-mcp/
 
 # IDEs
 .vscode/
