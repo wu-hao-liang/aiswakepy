@@ -8,9 +8,10 @@ Python pipeline for AIS-based ship-wake wave height calculation (Kriebel & Seeli
 
 ## Setup
 - Package manager: `uv` — always use `uv add` or `uv add --dev`, **NEVER pip**
-- Run tests: `uv run pytest tests/ -q`  (145 tests, all pass)
+- Run tests: `uv run pytest tests/ -q`  (~141 passed, 2 skipped)
 - Run pipeline: `uv run python main.py --config config.json`
 - Validate against MATLAB: `uv run python validate_pipeline.py`
+- Run Dash app: `uv run python dash_app.py`
 
 ## Before starting work
 1. Read `PRD.md` — product requirements and physics specification (v1 complete; §6 lists open items)
@@ -19,26 +20,44 @@ Python pipeline for AIS-based ship-wake wave height calculation (Kriebel & Seeli
 
 ## Package structure
 ```
+dash_app.py                Dash + deck.gl interactive app (pipeline runner + map)
+scripts/
+└── capture_map.py         Headless map screenshot utility
 aiswakepy/
 ├── __init__.py
 ├── config.py              Pydantic config schema
 ├── pipeline.py            run_pipeline() orchestrator
+├── _progress.py           Spinner helper for per-item progress
 ├── models/
 │   ├── kriebel.py         Kriebel & Seelig (2005) empirical model
-│   └── formula.py         PIANC Modified empirical model (feature branch)
+│   ├── pianc.py           PIANC Modified empirical model
+│   ├── sorensen.py        Sørensen empirical model
+│   ├── bhowmik.py         Bhowmik empirical model
+│   ├── blaauw.py          Blaauw empirical model
+│   ├── gates.py           Gates empirical model
+│   └── maynord.py         Maynord empirical model
 ├── stages/
 │   ├── filter.py          AIS load → 12-step cleaning pipeline → mask_land
 │   ├── depth.py           assign bathymetry depth + tidal adjustment
 │   ├── vessel.py          Kriebel wave params + propagation (Theta, T, WakeDir)
 │   └── wave_impact.py     Ray-coastline intersection, wave decay, shore output
 ├── comparison/
-│   └── ossi.py            Load OSSI gauge data; match AIS events to measurements
+│   ├── ossi.py            Load OSSI gauge data; match AIS events to measurements
+│   └── plots.py           Comparison plots
 ├── geo/
 │   ├── bathymetry.py      KDTree mesh lookup
-│   └── coastline.py       Shapefile load, STRtree
+│   ├── coastline.py       Shapefile load, STRtree
+│   └── geodesy.py         Geodetic utilities
+├── vessel/
+│   ├── block_coeff.py     Block coefficient lookup
+│   └── ShipDataEDnew.csv  Ship type reference data
 └── viz/
-    └── wave_map.py        Wave height / period map plots
+    ├── wave_map.py        Wave height / period map plots
+    └── vessel_diagram.py  Vessel schematic diagram
 ```
+
+## Dash server
+The Dash app runs in a `screen` session managed by the developer. **Never kill or restart the server** — always leave server lifecycle (start/stop/restart) to the developer.
 
 ## Key conventions
 - **Progress bars**: use `rich.progress`, NOT tqdm

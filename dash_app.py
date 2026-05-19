@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import functools
 import io
+import json
+import os
 import sys
 import threading
 import time
@@ -275,6 +277,13 @@ print('caches initialised empty - tracks/waves appear after the corresponding pi
 
 
 # ---------------------------------------------------------------------------
+# Server deployment config (UNC paths, host-specific settings)
+# ---------------------------------------------------------------------------
+_srv_cfg_path = REPO / 'server_config.json'
+_srv_cfg: dict = json.loads(_srv_cfg_path.read_text()) if _srv_cfg_path.exists() else {}
+DATA_UNC_ROOT: str = _srv_cfg.get('data_unc_root', '')
+
+# ---------------------------------------------------------------------------
 # Data directory inventory
 # ---------------------------------------------------------------------------
 DATA_ROOT = REPO / 'data'
@@ -317,6 +326,16 @@ def _scan_working_dir(workdir: str | None) -> dict:
         'land':       sorted(rel(p) for p in (base / 'land').glob('*.shp')),
         'tide':       sorted(rel(p) for p in (base / 'tide').glob('*.dfs0')),
     }
+
+
+def _ais_time_range_str() -> str:
+    if 'obstime' not in df_vessels.columns or len(df_vessels) == 0:
+        return ''
+    ts = df_vessels['obstime']
+    lo, hi = ts.min(), ts.max()
+    if pd.isna(lo):
+        return ''
+    return f"{lo.strftime('%Y-%m-%d')} – {hi.strftime('%Y-%m-%d')} |"
 
 
 # ---------------------------------------------------------------------------
@@ -727,6 +746,22 @@ INDEX_TEMPLATE = """<!DOCTYPE html>
         window.dispatchEvent(new Event('arrow-ready'));
     </script>
     <script>
+        window.__copyText = function(text) {
+            function fallback() {
+                var ta = document.createElement('textarea');
+                ta.value = text;
+                ta.style.cssText = 'position:fixed;top:0;left:0;opacity:0;';
+                document.body.appendChild(ta);
+                ta.focus(); ta.select();
+                try { document.execCommand('copy'); } catch(e) {}
+                document.body.removeChild(ta);
+            }
+            if (navigator.clipboard) {
+                navigator.clipboard.writeText(text).catch(fallback);
+            } else {
+                fallback();
+            }
+        };
         window.__showCopyToast = function(mmsi, clientX, clientY) {
             var t = document.getElementById('copy-toast');
             if (!t) return;
@@ -754,19 +789,6 @@ INDEX_TEMPLATE = """<!DOCTYPE html>
                 var leg = document.getElementById('map-legend');
                 if (leg) leg.style.right = open ? '500px' : '20px';
             });
-        })();
-        (function initProgressScroll() {
-            var log = document.getElementById('progress-log');
-            if (!log) { setTimeout(initProgressScroll, 80); return; }
-            var pending = false;
-            new MutationObserver(function() {
-                if (pending) return;
-                pending = true;
-                requestAnimationFrame(function() {
-                    pending = false;
-                    log.scrollTop = log.scrollHeight;
-                });
-            }).observe(log, { childList: true });
         })();
         (function initApplyBtn() {
             // Dash 4 renders the actions row asynchronously via Radix popper;
@@ -807,11 +829,24 @@ INDEX_TEMPLATE = """<!DOCTYPE html>
                          padding: 0 10px 0 12px; box-sizing: border-box; z-index: 25;
                          font: 12px monospace; background: #eef; border-bottom: 1px solid #ccd;
                          display: flex; align-items: center; gap: 10px; }
-        #workdir-wrapper { width: 240px; flex-shrink: 0; }
+        #workdir-wrapper { min-width: 160px; flex: 0 1 auto; display: flex; align-items: center; gap: 4px; }
+        #workdir-wrapper .Select, #workdir-wrapper .dash-dropdown { flex: 1; min-width: 0; }
         #workdir-wrapper .dash-dropdown-wrapper { min-height: 26px !important; }
-        #banner-meta { margin-left: auto; white-space: nowrap; overflow: hidden;
+        #btn-rescan-workdir { flex-shrink: 0; width: 22px; height: 26px; padding: 0;
+                              font-size: 13px; line-height: 1; cursor: pointer;
+                              background: #e8eef8; border: 1px solid #a8c0d8;
+                              border-radius: 4px; color: #3a6080; box-sizing: border-box; }
+        #btn-rescan-workdir:hover { background: #d4e4f4; }
+        #workdir-unc-display { font: 11px monospace; color: #446; background: #eef;
+                               border: 1px solid #ccd; border-radius: 3px;
+                               padding: 3px 6px; margin-bottom: 8px;
+                               user-select: all; cursor: text; word-break: break-all;
+                               display: none; }
+        #workdir-unc-display.visible { display: block; }
+        #banner-meta { white-space: nowrap; overflow: hidden; flex-shrink: 0;
                        text-overflow: ellipsis; text-align: right; font-size: 11px; }
-        #banner-title { position: absolute; left: 50%; transform: translateX(-50%);
+        #banner-title { flex: 1; min-width: 0; text-align: center; overflow: hidden;
+                        text-overflow: ellipsis;
                         font-weight: 800; font-size: 13px; letter-spacing: 2.5px;
                         color: #334; pointer-events: none; white-space: nowrap;
                         font-family: system-ui, sans-serif; }
@@ -894,13 +929,14 @@ INDEX_TEMPLATE = """<!DOCTYPE html>
                       opacity: 0; transition: opacity 0.25s ease; }
         #copy-toast.visible { opacity: 1; }
         #ctrl-hint { position: fixed; bottom: 20px; left: 350px; z-index: 5;
-                     pointer-events: none; background: rgba(8,14,30,0.60);
-                     border-radius: 7px; padding: 9px 14px;
-                     border: 1px solid rgba(80,130,200,0.25); }
-        #ctrl-hint-title { font-size: 16px; font-weight: 800;
-                           color: rgba(210,230,255,0.92); letter-spacing: 0.4px;
+                     pointer-events: none; background: rgba(16,18,28,0.88);
+                     border-radius: 8px; padding: 10px 14px;
+                     border: 1px solid rgba(255,255,255,0.08);
+                     box-shadow: 0 2px 12px rgba(0,0,0,0.45); }
+        #ctrl-hint-title { font-size: 13px; font-weight: 800;
+                           color: #eee; letter-spacing: 0.4px;
                            line-height: 1.2; }
-        #ctrl-hint-body { font-size: 11px; color: rgba(180,210,250,0.75);
+        #ctrl-hint-body { font-size: 10px; color: rgba(200,220,255,0.75);
                           margin-top: 4px; line-height: 1.7; }
         #tooltip { position: fixed; pointer-events: none; padding: 6px 10px;
                    background: rgba(0,0,0,0.85); color: white; font: 12px monospace;
@@ -1143,18 +1179,19 @@ def _r_dev_load():
 
 def _safe_repo_path(rel: str) -> Path:
     """Resolve a user-supplied relative path to an absolute path under REPO,
-    raising if it tries to escape the repo root (defence against path traversal)."""
+    raising if it tries to escape the repo root (defence against path traversal).
+    Uses normpath rather than resolve so symlinked subdirectories (e.g. data/)
+    are allowed — resolve() would follow the symlink outside the repo root."""
     if not rel:
         raise ValueError('empty path')
-    abs_path = (REPO / rel).resolve()
-    repo_root = REPO.resolve()
+    norm = Path(os.path.normpath(REPO / rel))
     try:
-        abs_path.relative_to(repo_root)
+        norm.relative_to(REPO)
     except ValueError:
         raise ValueError(f'path {rel!r} escapes repo root')
-    if not abs_path.exists():
+    if not norm.exists():
         raise FileNotFoundError(rel)
-    return abs_path
+    return norm
 
 
 @app.server.route('/api/preview/ais.arrow')
@@ -1310,16 +1347,18 @@ app.layout = html.Div([
             dcc.Dropdown(id='sel-workdir', options=[], value=None, clearable=False,
                          placeholder='Select a data/ subfolder...',
                          className='compact-dropdown',
-                         style={'fontSize': '10px', 'minWidth': '200px'}),
+                         style={'fontSize': '10px'}),
+            html.Button('↻', id='btn-rescan-workdir', n_clicks=0,
+                        title='Re-scan working directory for new files'),
         ], id='workdir-wrapper'),
-        html.Button('＋ Folder', id='btn-new-folder', n_clicks=0,
+        html.Button('New Folder', id='btn-new-folder', n_clicks=0,
                     title='Create a new project folder in data/',
                     style={'padding': '3px 10px', 'fontSize': '11px', 'background': '#e8f0f8',
                            'border': '1px solid #a8c0d8', 'borderRadius': '4px',
                            'cursor': 'pointer', 'color': '#3a6080', 'whiteSpace': 'nowrap',
                            'flexShrink': '0', 'fontWeight': '600',
                            'lineHeight': '1.4', 'height': '26px', 'boxSizing': 'border-box'}),
-        html.Button('↓ Load Existing Results', id='btn-dev-load', n_clicks=0,
+        html.Button('Load Results', id='btn-dev-load', n_clicks=0,
                     title='Load pre-computed output from the selected working directory',
                     style={'padding': '3px 10px', 'fontSize': '11px', 'background': '#f2ede4',
                            'border': '1px solid #c8b488', 'borderRadius': '4px',
@@ -1332,6 +1371,7 @@ app.layout = html.Div([
                          'maxWidth': '220px'}),
         html.Div('AISWAKEPY', id='banner-title'),
         html.Div([
+            html.Span(id='ais-time-range', style={'color': '#558', 'marginRight': '4px'}),
             html.Span(id='cnt-vessels', children=f'vessels {len(df_vessels):,}'),
             ' | ', html.Span(id='cnt-segs',    children=f'segments {len(seg_meta):,}'),
             ' | ', html.Span(id='cnt-waves',   children=f'waves {len(df_waves):,}'),
@@ -1341,6 +1381,8 @@ app.layout = html.Div([
     ], id='status-banner'),
 
     html.Div([
+
+        html.Div(id='workdir-unc-display'),
 
         # ---- AIS Data ----
         html.Label('AIS Data'),
@@ -1622,6 +1664,8 @@ app.layout = html.Div([
         }),
     ], id='btn-rsb-toggle', n_clicks=0, title='Toggle pipeline configuration panel'),
 
+    dcc.Store(id='_rescan_count', data=0),
+    dcc.Store(id='_log_scroll', data=0),
     dcc.Interval(id='boot', max_intervals=1, interval=200),
     dcc.Interval(id='poll', interval=400, disabled=True),
     dcc.Store(id='_init'),
@@ -1652,6 +1696,20 @@ def _populate_workdir_dirs(_):
     return _scan_data_subdirs()
 
 
+app.clientside_callback(
+    """
+    function(children) {
+        var el = document.getElementById('progress-log');
+        if (el) requestAnimationFrame(function(){ el.scrollTop = el.scrollHeight; });
+        return window.dash_clientside.no_update;
+    }
+    """,
+    Output('_log_scroll', 'data'),
+    Input('progress-log', 'children'),
+    prevent_initial_call=True,
+)
+
+
 @app.callback(
     Output('sel-ais',   'options'),
     Output('sel-bathy', 'options'),
@@ -1659,9 +1717,10 @@ def _populate_workdir_dirs(_):
     Output('sel-land',  'options'),
     Output('sel-tide',  'options'),
     Input('sel-workdir', 'value'),
+    Input('_rescan_count', 'data'),
     prevent_initial_call=False,
 )
-def _update_file_dropdowns(workdir):
+def _update_file_dropdowns(workdir, _rescan):
     files = _scan_working_dir(workdir)
     return (
         _opt_list(files['ais']),
@@ -1670,6 +1729,31 @@ def _update_file_dropdowns(workdir):
         _opt_list(files['land']),
         _opt_list(files['tide']),
     )
+
+
+@app.callback(
+    Output('_rescan_count', 'data'),
+    Input('btn-rescan-workdir', 'n_clicks'),
+    State('_rescan_count', 'data'),
+    prevent_initial_call=True,
+)
+def _rescan_workdir(_, count):
+    return (count or 0) + 1
+
+
+@app.callback(
+    Output('workdir-unc-display', 'children'),
+    Output('workdir-unc-display', 'className'),
+    Input('sel-workdir', 'value'),
+    Input('_rescan_count', 'data'),
+    prevent_initial_call=False,
+)
+def _update_unc_display(workdir, _rescan):
+    if not workdir or not DATA_UNC_ROOT:
+        return '', ''
+    subdir = workdir.removeprefix(f'{DATA_ROOT.name}/')
+    unc = DATA_UNC_ROOT.rstrip('\\') + '\\' + subdir.replace('/', '\\')
+    return unc, 'visible'
 
 
 @app.callback(
@@ -1914,6 +1998,7 @@ def _enable_after_import(data):
     Output('cnt-waves',   'children'),
     Output('cnt-segs',    'children'),
     Output('cnt-vessels', 'children'),
+    Output('ais-time-range', 'children'),
     Input('poll', 'n_intervals'),
     State('_wave_version', 'data'), State('_track_version', 'data'),
     prevent_initial_call=True,
@@ -1932,17 +2017,17 @@ def tick(_, prev_wave_v, prev_track_v):
         return (
             f"{log_text}\n\nERROR: {s['error']}",
             elapsed, True, False, False,
-            prev_wave_v, prev_track_v, *counts,
+            prev_wave_v, prev_track_v, *counts, no_update,
         )
     if s['running']:
         return (
             log_text, elapsed, False, True, True,
-            prev_wave_v, prev_track_v, no_update, no_update, no_update,
+            prev_wave_v, prev_track_v, no_update, no_update, no_update, no_update,
         )
     # Finished — push fresh versions so client refetches Arrows.
     return (
         log_text, elapsed, True, False, False,
-        s['wave_version'], s['track_version'], *counts,
+        s['wave_version'], s['track_version'], *counts, _ais_time_range_str(),
     )
 
 
@@ -2200,6 +2285,11 @@ function(n) {
         };
         async function fetchOne(asset) {
             const r = await fetch(asset.url);
+            if (!r.ok) {
+                let msg = `HTTP ${r.status}`;
+                try { const e = await r.json(); if (e.error) msg = e.error; } catch (_) {}
+                throw new Error(`${asset.label}: ${msg}`);
+            }
             state[asset.key].total = +r.headers.get('content-length') || 0;
             const reader = r.body.getReader();
             const chunks = [];
@@ -3051,7 +3141,7 @@ function(n) {
                     if (panel) panel.style.display = 'block';
                     const btn = document.getElementById('btn-similar');
                     if (btn) { btn.textContent = 'Select one representative track'; btn.style.opacity = ''; }
-                    navigator.clipboard?.writeText(String(mmsi)).catch(() => {});
+                    window.__copyText(String(mmsi));
                     if (typeof window.__showCopyToast === 'function') window.__showCopyToast(mmsi, event?.srcEvent?.clientX, event?.srcEvent?.clientY);
                     return;
                 }
@@ -3084,7 +3174,7 @@ function(n) {
                     msg = `track MMSI=${tMMSI[si]} seg=${tSeg[si]}`;
                 }
                 if (copyMmsi != null) {
-                    navigator.clipboard?.writeText(String(copyMmsi)).catch(() => {});
+                    window.__copyText(String(copyMmsi));
                     if (typeof window.__showCopyToast === 'function') window.__showCopyToast(copyMmsi, event?.srcEvent?.clientX, event?.srcEvent?.clientY);
                 }
                 document.getElementById('click-info').textContent = '| ' + msg;
@@ -3587,15 +3677,12 @@ function(n) {
         window.__importAis = async (path) => {
             if (!path) return 'no file selected';
             try {
-                const resp = await fetch('/api/preview/ais.arrow?path=' + encodeURIComponent(path));
-                if (!resp.ok) {
-                    const err = await resp.json().catch(() => ({}));
-                    throw new Error(err.error || `HTTP ${resp.status}`);
-                }
-                const total = +resp.headers.get('content-length') || 0;
-                const buf = await resp.arrayBuffer();
+                const [buf] = await window.__fetchAssetsWithProgress(
+                    [{ key: 'ais', label: 'AIS preview', url: '/api/preview/ais.arrow?path=' + encodeURIComponent(path) }],
+                    'Importing AIS data',
+                );
                 setRenderStatus('Rendering AIS points...', false);
-                const t = window.tableFromIPC(new Uint8Array(buf));
+                const t = window.tableFromIPC(buf);
                 const lon = t.getChild('longitude').toArray();
                 const lat = t.getChild('latitude').toArray();
                 const pos = interleaveLonLat(lon, lat);
