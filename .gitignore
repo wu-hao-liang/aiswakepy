@@ -27,13 +27,12 @@ htmlcov/
 coverage.xml
 
 # Example data — large binary and input files not tracked in git
-examples/bathymetry/
-examples/tide/
-examples/ais/
-examples/coastline/
-examples/matlab_reference/
+examples/
 data/
 ref/
+
+# Submodule — not tracked in this repo
+trackio/
 
 # Pipeline outputs
 output/
