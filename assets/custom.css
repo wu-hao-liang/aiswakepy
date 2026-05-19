@@ -192,6 +192,8 @@ input[type="number"] {
 #pv-ais-info { display: none !important; }
 #pv-tide-info { display: none !important; }
 #pv-bathy-info { display: none !important; }
+/* Remove top gap when coastline/land info divs are empty (no shapefile loaded yet) */
+#pv-coast-info:empty, #pv-land-info:empty { margin-top: 0 !important; }
 
 /* ── Cascade trigger: identical to Dash dropdown (30px / 5px / 11px) ─────── */
 .cascade-trigger {
@@ -297,6 +299,8 @@ input[type="number"] {
     min-height: 30px !important;
     font-size: 11px !important;
     box-sizing: border-box !important;
+    padding-left: 0 !important;
+    padding-right: 0 !important;
 }
 .compact-dropdown .dash-dropdown-value {
     flex: 1 !important;
@@ -344,12 +348,26 @@ input[type="number"] {
     height: 14px !important;
 }
 
-/* Free-hand & Similar buttons — left-aligned text with consistent padding */
+/* Work-directory dropdown sits on the light status-banner background — */
+/* override the white text intended for sidebar (dark) dropdowns.       */
+#workdir-wrapper .compact-dropdown .dash-dropdown-value,
+#workdir-wrapper .compact-dropdown .dash-dropdown-placeholder {
+    color: #223 !important;
+}
+#workdir-wrapper .compact-dropdown .dash-dropdown-clear {
+    color: #557 !important;
+}
+
+/* Free-hand & Similar: label provides spacing, so zero out the row-buttons margin */
+.row-buttons:has(#btn-freehand),
+.row-buttons:has(#btn-similar) {
+    margin-top: 0 !important;
+}
+/* Left-aligned text for these action buttons */
 #btn-freehand,
 #btn-similar {
     text-align: left !important;
-    padding-left: 14px !important;
-    padding-right: 14px !important;
+    padding-left: 8px !important;
 }
 
 /* ── Multi-select dropdown: move built-in Select-All/Deselect-All to bottom ─ */

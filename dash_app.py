@@ -1247,9 +1247,9 @@ def _opt_list(items: list[str]) -> list[dict]:
 def _picker_with_preview(label: str, dropdown_id: str, preview_id: str,
                          info_id: str, options: list, value, clearable=False,
                          placeholder='', preview_disabled=False):
-    """Dropdown row with a preview tickbox on the side (no refresh button)."""
+    """Dropdown row with a preview tickbox on the side. Returns a flat list for * unpacking."""
     preview_opts = [{'label': 'preview', 'value': '1', 'disabled': preview_disabled}]
-    return html.Div([
+    return [
         html.Label(label),
         html.Div([
             dcc.Dropdown(id=dropdown_id, options=_opt_list(options),
@@ -1261,7 +1261,7 @@ def _picker_with_preview(label: str, dropdown_id: str, preview_id: str,
             ),
         ], className='row-with-preview'),
         html.Div(id=info_id, className='preview-info'),
-    ])
+    ]
 
 
 _RSB_SECTION = {'fontSize': '11px', 'fontWeight': '700', 'color': '#8899bb',
@@ -1358,25 +1358,25 @@ app.layout = html.Div([
         html.Div(id='pv-ais-info', className='preview-info'),
 
         # ---- Coastline & Land mask ----
-        _picker_with_preview('Coastline (block/calculate waves)', 'sel-coast', 'pv-coast',
-                             'pv-coast-info', [], None, clearable=False,
-                             placeholder='Select shapefile...'),
-        _picker_with_preview('Land (filter AIS data)', 'sel-land', 'pv-land',
-                             'pv-land-info', [], None, clearable=False,
-                             placeholder='Select shapefile...'),
+        *_picker_with_preview('Coastline (block/calculate waves)', 'sel-coast', 'pv-coast',
+                              'pv-coast-info', [], None, clearable=False,
+                              placeholder='Select shapefile...'),
+        *_picker_with_preview('Land (filter AIS data)', 'sel-land', 'pv-land',
+                              'pv-land-info', [], None, clearable=False,
+                              placeholder='Select shapefile...'),
         html.Div([
             html.Button('Filter and Generate Tracks', id='btn-filter', n_clicks=0, disabled=True,
                         title='Run Stage 1: AIS cleaning + interpolation',
                         className='secondary-btn'),
         ], className='row-buttons'),
 
-        _picker_with_preview('Bathymetry', 'sel-bathy', 'pv-bathy',
-                             'pv-bathy-info', [], None, clearable=False,
-                             placeholder='Select .dfsu or .mesh file...',
-                             preview_disabled=True),
+        *_picker_with_preview('Bathymetry', 'sel-bathy', 'pv-bathy',
+                              'pv-bathy-info', [], None, clearable=False,
+                              placeholder='Select .dfsu or .mesh file...',
+                              preview_disabled=True),
         # Tide DFS0 — cascade picker (file × elevation item), styled like the
         # MMSI / Segment widget so the two pickers feel identical.
-        html.Label('Tide', style={'margin': '4px 0 2px'}),
+        html.Label('Tide'),
         html.Div([
             html.Div('No tide file', id='cascade-tide-trigger', className='cascade-trigger'),
             html.Div(id='cascade-tide-panel', className='cascade-panel',
@@ -1410,22 +1410,22 @@ app.layout = html.Div([
         dcc.Dropdown(id='fil-segs', options=[], value=None, multi=True,
                      style={'display': 'none'}),
         # Cascading MMSI → Segment picker (populated by JS from track data)
-        html.Label('MMSI / Track Segment', style={'margin': '4px 0 2px'}),
+        html.Label('MMSI / Track Segment'),
         html.Div([
             html.Div('All tracks', id='cascade-mmsi-trigger', className='cascade-trigger'),
             html.Div(id='cascade-mmsi-panel', className='cascade-panel',
                      style={'display': 'none'}),
         ], id='cascade-mmsi-seg', style={'position': 'relative', 'marginBottom': '4px'}),
-        html.Label('Vessel Type', style={'margin': '4px 0 2px'}),
+        html.Label('Vessel Type'),
         dcc.Dropdown(id='fil-type', options=[], value=None, multi=True, clearable=True,
                      placeholder='All types', searchable=True,
                      className='compact-dropdown', style={'fontSize': '10px'}),
-        html.Label('Free-hand selection', style={'margin': '8px 0 2px', 'display': 'block'}),
+        html.Label('Free-hand selection'),
         html.Div([
             html.Button('Draw line across tracks', id='btn-freehand', n_clicks=0,
                         title='Draw a line on the map — selects all crossed tracks'),
         ], className='row-buttons'),
-        html.Label('Similar selection', style={'margin': '8px 0 2px', 'display': 'block'}),
+        html.Label('Similar selection'),
         html.Div([
             html.Button('Select one representative track', id='btn-similar', n_clicks=0,
                         title='Pick a track then find tracks with similar routing'),
