@@ -843,6 +843,28 @@ INDEX_TEMPLATE = """<!DOCTYPE html>
                                user-select: all; cursor: text; word-break: break-all;
                                display: none; }
         #workdir-unc-display.visible { display: block; }
+        /* Amber speech bubble (left edge aligned with Load Results centerline)
+           with an upward-pointing tail at the top-left, drawing attention to
+           the workdir/Load-Results area. */
+        #workdir-hint { position: fixed; top: 52px; left: 419px;
+                        padding: 16px 22px; background: #ffd54f; color: #2a1a05;
+                        border: 2px solid #c98800; border-radius: 10px;
+                        font-size: 16px; font-weight: 700; line-height: 1.4;
+                        box-shadow: 0 6px 24px rgba(0,0,0,0.55);
+                        z-index: 30; max-width: 380px;
+                        animation: workdir-hint-pulse 1.6s ease-in-out infinite; }
+        #workdir-hint::before { content: ''; position: absolute; top: -12px; left: 36px;
+                                 border-left: 12px solid transparent;
+                                 border-right: 12px solid transparent;
+                                 border-bottom: 12px solid #c98800; }
+        #workdir-hint::after  { content: ''; position: absolute; top: -9px; left: 38px;
+                                 border-left: 10px solid transparent;
+                                 border-right: 10px solid transparent;
+                                 border-bottom: 10px solid #ffd54f; }
+        @keyframes workdir-hint-pulse {
+            0%, 100% { transform: translateY(0); }
+            50%      { transform: translateY(-4px); }
+        }
         #banner-meta { white-space: nowrap; overflow: hidden; flex-shrink: 0;
                        text-overflow: ellipsis; text-align: right; font-size: 11px; }
         #banner-title { flex: 1; min-width: 0; text-align: center; overflow: hidden;
@@ -955,11 +977,11 @@ INDEX_TEMPLATE = """<!DOCTYPE html>
         #progress-fill { height: 100%; background: linear-gradient(90deg, #58c, #4ad);
                          width: 0%; transition: width 0.1s linear; }
         #progress-elapsed { font-size: 11px; color: #666; text-align: right; }
-        /* Small bottom-right pill for "Rendering..." / "Ready" between transfer and first paint */
-        #render-status { position: fixed; bottom: 20px; right: 20px;
-                         background: #4ad; color: white; padding: 8px 16px;
-                         border-radius: 4px; font: 12px monospace;
-                         box-shadow: 0 2px 8px rgba(0,0,0,0.25); z-index: 150;
+        /* Centred pill for "Rendering..." / "Ready" between transfer and first paint */
+        #render-status { position: fixed; top: 50%; left: 50%; transform: translate(-50%, -50%);
+                         background: #4ad; color: white; padding: 12px 28px;
+                         border-radius: 8px; font: 13px monospace;
+                         box-shadow: 0 4px 16px rgba(0,0,0,0.35); z-index: 150;
                          transition: opacity 0.3s; }
         #render-status.done { background: #4a4; }
         #render-status.fade { opacity: 0; }
@@ -1136,15 +1158,19 @@ def _dev_load(directory: str) -> dict:
             break
 
     _build_vessel_caches(df_v)
+    # Seed LAST_RESULTS so a subsequent "Calculate Waves" run skips the filter stage.
+    LAST_RESULTS['df_filtered'] = df_v
     if df_w is not None:
         # Normalise DateTime to datetime64 so the obstime join key matches
         if 'DateTime' in df_w.columns and df_w['DateTime'].dtype == object:
             df_w['DateTime'] = pd.to_datetime(df_w['DateTime'], errors='coerce')
         enriched = _ensure_vessel_columns(df_w, df_v) if len(df_v) > 0 else df_w
         _build_wave_caches(enriched)
+        LAST_RESULTS['df_wave_impact'] = enriched
     else:
         # Reset wave caches to empty
         _build_wave_caches(df_waves.iloc[:0].copy())
+        LAST_RESULTS.pop('df_wave_impact', None)
 
     with _pipeline_lock:
         PIPELINE_STATE['track_version'] += 1
@@ -1535,12 +1561,9 @@ app.layout = html.Div([
         html.Span(id='new-folder-status', style={'fontSize': '10px', 'color': '#c44'}),
     ]),
     # Setup overlay — blocks UI until a working directory is selected
-    html.Div(id='setup-overlay', children=[
-        html.Div('Select a working directory to begin',
-                 style={'color': 'white', 'background': 'rgba(0,0,0,0.65)',
-                        'padding': '14px 28px', 'borderRadius': '8px',
-                        'fontSize': '14px', 'fontWeight': '600', 'letterSpacing': '0.2px'}),
-    ]),
+    html.Div(id='setup-overlay'),
+    # Speech bubble pointing to the workdir dropdown when no folder selected.
+    html.Div('Select or create a data folder to begin', id='workdir-hint'),
     # MMSI copy toast — appears briefly after Ctrl+click copies MMSI
     html.Div('', id='copy-toast'),
     # Ctrl hint — permanent floating label at bottom-left of canvas
@@ -1758,14 +1781,17 @@ def _update_unc_display(workdir, _rescan):
 
 @app.callback(
     Output('setup-overlay', 'style'),
+    Output('workdir-hint', 'style'),
     Input('sel-workdir', 'value'),
     prevent_initial_call=False,
 )
 def _toggle_setup_overlay(workdir):
-    shown = {'position': 'fixed', 'top': '40px', 'left': 0, 'right': 0, 'bottom': 0,
-             'background': 'rgba(0,0,0,0.45)', 'zIndex': 20, 'cursor': 'not-allowed',
-             'display': 'flex', 'alignItems': 'center', 'justifyContent': 'center'}
-    return {'display': 'none'} if workdir else shown
+    overlay_shown = {'position': 'fixed', 'top': '40px', 'left': 0, 'right': 0, 'bottom': 0,
+                     'background': 'rgba(0,0,0,0.45)', 'zIndex': 20, 'cursor': 'not-allowed',
+                     'display': 'flex', 'alignItems': 'center', 'justifyContent': 'center'}
+    if workdir:
+        return {'display': 'none'}, {'display': 'none'}
+    return overlay_shown, {}
 
 
 @app.callback(
@@ -1812,7 +1838,7 @@ def _build_config(ais, land, bathy, coast, tide, tide_item=None,
                   low_sog=1.0, vel_ratio=2.0, spd_ratio=0.5,
                   waterline=0.8, formula='kriebel', gravity=9.78,
                   max_bl=0.3, min_froude=0.1, max_froude=0.5, max_bf=0.4,
-                  wake_cutoff=0.01) -> dict:
+                  wake_cutoff=0.01, workdir=None) -> dict:
     cfg = {
         'ais': {'raw_csv': ais, 'land_shp': land,
                 'min_speed_knots': float(min_speed or 0.0),
@@ -1838,7 +1864,8 @@ def _build_config(ais, land, bathy, coast, tide, tide_item=None,
                  'max_bf': float(max_bf or 0.4)},
         'impact': {'max_propagation_m': float(max_prop or 2000.0),
                    'wake_cutoff_m': float(wake_cutoff or 0.01)},
-        'output': {'directory': 'output/', 'save_stage_csv': True},
+        'output': {'directory': f'{workdir}/output/' if workdir else 'output/',
+                   'save_stage_csv': True},
     }
     if tide:
         cfg['bathymetry']['tide_dfs0'] = tide
@@ -1881,6 +1908,7 @@ def _kick(config_dict, stages, label):
     State('rsb-gravity', 'value'), State('rsb-max-bl', 'value'),
     State('rsb-min-froude', 'value'), State('rsb-max-froude', 'value'),
     State('rsb-max-bf', 'value'), State('rsb-wake-cutoff', 'value'),
+    State('sel-workdir', 'value'),
     prevent_initial_call=True,
 )
 def kick_filter(n, ais, land, bathy, coast, tide, tide_item,
@@ -1888,7 +1916,8 @@ def kick_filter(n, ais, land, bathy, coast, tide, tide_item,
                 cb_method, max_prop, max_sog,
                 max_velocity, max_accel, max_dw, low_sog,
                 vel_ratio, spd_ratio, waterline, formula,
-                gravity, max_bl, min_froude, max_froude, max_bf, wake_cutoff):
+                gravity, max_bl, min_froude, max_froude, max_bf, wake_cutoff,
+                workdir):
     if not n:
         return no_update, no_update, no_update, no_update
     missing = []
@@ -1903,7 +1932,8 @@ def kick_filter(n, ais, land, bathy, coast, tide, tide_item,
                         cb_method, max_prop, max_sog,
                         max_velocity, max_accel, max_dw, low_sog,
                         vel_ratio, spd_ratio, waterline, formula,
-                        gravity, max_bl, min_froude, max_froude, max_bf, wake_cutoff)
+                        gravity, max_bl, min_froude, max_froude, max_bf, wake_cutoff,
+                        workdir=workdir)
     if _kick(cfg, ['filter'], 'filter'):
         return False, True, True, no_update
     return no_update, no_update, no_update, no_update
@@ -1929,6 +1959,7 @@ def kick_filter(n, ais, land, bathy, coast, tide, tide_item,
     State('rsb-gravity', 'value'), State('rsb-max-bl', 'value'),
     State('rsb-min-froude', 'value'), State('rsb-max-froude', 'value'),
     State('rsb-max-bf', 'value'), State('rsb-wake-cutoff', 'value'),
+    State('sel-workdir', 'value'),
     prevent_initial_call=True,
 )
 def kick_waves(n, ais, land, bathy, coast, tide, tide_item,
@@ -1936,7 +1967,8 @@ def kick_waves(n, ais, land, bathy, coast, tide, tide_item,
                cb_method, max_prop, max_sog,
                max_velocity, max_accel, max_dw, low_sog,
                vel_ratio, spd_ratio, waterline, formula,
-               gravity, max_bl, min_froude, max_froude, max_bf, wake_cutoff):
+               gravity, max_bl, min_froude, max_froude, max_bf, wake_cutoff,
+               workdir):
     if not n:
         return no_update, no_update, no_update, no_update
     missing = []
@@ -1952,7 +1984,8 @@ def kick_waves(n, ais, land, bathy, coast, tide, tide_item,
                         cb_method, max_prop, max_sog,
                         max_velocity, max_accel, max_dw, low_sog,
                         vel_ratio, spd_ratio, waterline, formula,
-                        gravity, max_bl, min_froude, max_froude, max_bf, wake_cutoff)
+                        gravity, max_bl, min_froude, max_froude, max_bf, wake_cutoff,
+                        workdir=workdir)
     if _kick(cfg, ['depth', 'vessel', 'wave_impact'], 'waves'):
         return False, True, True, no_update
     return no_update, no_update, no_update, no_update
@@ -3232,32 +3265,33 @@ function(n) {
             const leg = document.getElementById('map-legend');
             if (!leg) return;
             const hasBathy = !!(window.__previews && window.__previews.bathy);
-            leg.style.display = 'block';
+            const hasTracks = !!window.__hasTracks;
             const rows = [];
-            // Vessel type legend — always shown, ranked large → small
-            rows.push('<div style="font-weight:700;font-size:10px;color:#aac;margin-bottom:5px;letter-spacing:.4px">VESSEL TYPE</div>');
-            const categories = [
-                ['tanker',    'Tanker'],
-                ['cargo',     'Cargo'],
-                ['passenger', 'Passenger'],
-                ['hsc',       'High-speed craft'],
-                ['tug',       'Tug'],
-                ['sar',       'SAR'],
-                ['fishing',   'Fishing'],
-                ['sailing',   'Sailing'],
-                ['pleasure',  'Pleasure'],
-                ['other',     'Other'],
-                ['unknown',   'Unknown'],
-            ];
-            categories.forEach(([cat, label]) => {
-                const c = _CAT_COLORS[cat] || [160,160,160];
-                const hex = `#${c.map(x=>x.toString(16).padStart(2,'0')).join('')}`;
-                rows.push(
-                    `<div style="display:flex;align-items:center;gap:6px;margin:2px 0">` +
-                    `<span style="width:14px;height:6px;border-radius:2px;background:${hex};flex-shrink:0"></span>` +
-                    `<span style="font-size:10px">${label}</span></div>`
-                );
-            });
+            if (hasTracks) {
+                rows.push('<div style="font-weight:700;font-size:10px;color:#aac;margin-bottom:5px;letter-spacing:.4px">VESSEL TYPE</div>');
+                const categories = [
+                    ['tanker',    'Tanker'],
+                    ['cargo',     'Cargo'],
+                    ['passenger', 'Passenger'],
+                    ['hsc',       'High-speed craft'],
+                    ['tug',       'Tug'],
+                    ['sar',       'SAR'],
+                    ['fishing',   'Fishing'],
+                    ['sailing',   'Sailing'],
+                    ['pleasure',  'Pleasure'],
+                    ['other',     'Other'],
+                    ['unknown',   'Unknown'],
+                ];
+                categories.forEach(([cat, label]) => {
+                    const c = _CAT_COLORS[cat] || [160,160,160];
+                    const hex = `#${c.map(x=>x.toString(16).padStart(2,'0')).join('')}`;
+                    rows.push(
+                        `<div style="display:flex;align-items:center;gap:6px;margin:2px 0">` +
+                        `<span style="width:14px;height:6px;border-radius:2px;background:${hex};flex-shrink:0"></span>` +
+                        `<span style="font-size:10px">${label}</span></div>`
+                    );
+                });
+            }
             if (window.__hasWaves) {
                 rows.push('<hr style="border:none;border-top:1px solid rgba(255,255,255,0.1);margin:7px 0">');
                 rows.push('<div style="font-weight:700;font-size:10px;color:#aac;margin-bottom:5px;letter-spacing:.4px">WAVE HEIGHT (m)</div>');
@@ -3325,6 +3359,8 @@ function(n) {
                     `</div></div>`
                 );
             }
+            if (rows.length === 0) { leg.style.display = 'none'; return; }
+            leg.style.display = 'block';
             leg.innerHTML = rows.join('');
         };
         window.__updateLegend = updateLegend;
