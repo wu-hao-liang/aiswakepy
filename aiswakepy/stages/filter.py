@@ -847,6 +847,11 @@ def filter_ais(
     low_sog_threshold_ms: float = 1.0,
     velocity_ratio_threshold: float = 2.0,
     speed_consistency_ratio: float = 0.5,
+    # --- Depth-clearance check, applied AFTER interpolation/land masking ---
+    bathy_path: str | Path | None = None,
+    tide_dfs0_path: str | Path | None = None,
+    tide_item: str | None = None,
+    underkeel_margin_m: float = 1.0,
 ) -> pd.DataFrame:
     """Run the full AIS filtering pipeline and return a cleaned DataFrame.
 
@@ -858,6 +863,13 @@ def filter_ais(
     ``velocity_ratio_threshold`` controls the velocity-consistency check in
     error-coord detection.
 
+    When ``bathy_path`` is provided, the under-keel clearance check is folded
+    into the post-interpolation tail of the pipeline (between the final
+    ``mask_land`` pair and the last ``segment_trajectories``). A point with a
+    bad ``draught`` value but a valid lon/lat in water is therefore still
+    available as a position constraint for the interpolation step; only the
+    final, interpolated frame is checked against bathymetry + tide.
+
     Pipeline order (see module docstring for full list):
     1-5.    Load, dedupe, uniformize, drop zero dims, drop invalid draught.
     6.      ``mask_land`` ×2 — remove raw land points before segmentation.
@@ -868,7 +880,9 @@ def filter_ais(
     12.     ``interpolate_trajectories`` — uniform time-grid.
     13a.    ``mask_land`` (land) — drop post-interpolation land points.
     13b.    ``mask_land`` (coastline) — drop points inside coastline.
-    13c.    ``segment_trajectories`` — re-segment after land point removal.
+    13c.    ``assign_depth`` — add WaterDepth, drop under-keel violations
+            (skipped when ``bathy_path is None``).
+    13d.    ``segment_trajectories`` — re-segment after land + depth removals.
     14.     ``filter_study_area`` — optional polygon filter.
     """
     df = load_ais(csv_path)
@@ -897,12 +911,25 @@ def filter_ais(
     # 12. Interpolation to uniform time grid.
     df = interpolate_trajectories(df, interval_s=interval_s, method=interp_method,
                                   low_sog_threshold_ms=low_sog_threshold_ms)
-    # 13. Post-interpolation land check — spline may have strayed onto land.
+    # 13. Post-interpolation cleanup. Land + depth checks all flag _force_break
+    # on surviving points so the single segment_trajectories at the end picks
+    # up every break in one pass.
     # 13a. Drop points on land and flag breaks.
     df = mask_land(df, land_shp, track_breaks=True)
     # 13b. Drop points inside coastline and flag breaks.
     df = mask_land(df, coastline_shp, track_breaks=True)
-    # 13c. Re-segment with force-break flags.
+    # 13c. Add WaterDepth and drop points failing the under-keel clearance
+    # check (skipped when no bathymetry is provided — e.g. unit tests).
+    if bathy_path is not None:
+        from aiswakepy.stages.depth import assign_depth
+        df = assign_depth(
+            df,
+            bathy_path=bathy_path,
+            tide_dfs0_path=tide_dfs0_path,
+            tide_item=tide_item,
+            underkeel_margin_m=underkeel_margin_m,
+        )
+    # 13d. Re-segment with force-break flags so land + depth gaps split tracks.
     df = segment_trajectories(df, gap_s=gap_s, use_force_break=True)
     # 14. Study-area filter — optional, last.
     df = filter_study_area(df, polygon_shp=study_area_shp)

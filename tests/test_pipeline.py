@@ -67,19 +67,31 @@ def _make_config(tmp_path: Path, ais_path: Path, shp_path: Path) -> dict:
 
 
 def test_pipeline_filter_only(tmp_path):
-    """Run only the filter stage."""
+    """Run only the filter stage. The depth check inside filter_ais needs a
+    stubbed bathymetry because BathymetryConfig.source is required by the
+    schema."""
     poly = Polygon([(103.87, 1.27), (103.95, 1.27), (103.95, 1.32), (103.87, 1.32)])
     shp = _write_shp(tmp_path, poly)
     ais = _write_ais_csv(tmp_path)
     cfg = _make_config(tmp_path, ais, shp)
 
-    results = run_pipeline(cfg, stages=["filter"])
+    stub = _make_bathy_stub(15.0)
+    import aiswakepy.stages.depth as depth_mod
+    original = depth_mod.load_bathymetry
+    depth_mod.load_bathymetry = lambda _: stub
+    try:
+        results = run_pipeline(cfg, stages=["filter"])
+    finally:
+        depth_mod.load_bathymetry = original
+
     assert "df_filtered" in results
     assert len(results["df_filtered"]) > 0
+    # depth check folded into filter — WaterDepth column should now be present
+    assert "WaterDepth" in results["df_filtered"].columns
 
 
 def test_pipeline_filter_vessel_with_stub(tmp_path):
-    """Run filter + depth (stubbed) + vessel stages."""
+    """Run filter + vessel stages (depth is folded into filter)."""
     poly = Polygon([(103.86, 1.27), (103.95, 1.27), (103.95, 1.32), (103.86, 1.32)])
     shp = _write_shp(tmp_path, poly)
     ais = _write_ais_csv(tmp_path)
@@ -91,7 +103,7 @@ def test_pipeline_filter_vessel_with_stub(tmp_path):
     original = depth_mod.load_bathymetry
     depth_mod.load_bathymetry = lambda _: stub
     try:
-        results = run_pipeline(cfg, stages=["filter", "depth", "vessel"])
+        results = run_pipeline(cfg, stages=["filter", "vessel"])
     finally:
         depth_mod.load_bathymetry = original
 
@@ -112,7 +124,7 @@ def test_pipeline_full_with_stub(tmp_path):
     original = depth_mod.load_bathymetry
     depth_mod.load_bathymetry = lambda _: stub
     try:
-        results = run_pipeline(cfg, stages=["filter", "depth", "vessel", "wave_impact", "viz"])
+        results = run_pipeline(cfg, stages=["filter", "vessel", "wave_impact", "viz"])
     finally:
         depth_mod.load_bathymetry = original
 
@@ -124,13 +136,13 @@ def test_pipeline_full_with_stub(tmp_path):
 
 
 def test_pipeline_missing_stage_dependency(tmp_path):
-    """Running 'depth' without 'filter' should raise."""
+    """Running 'vessel' without 'filter' should raise."""
     poly = Polygon([(103.84, 1.27), (103.92, 1.27), (103.92, 1.32), (103.84, 1.32)])
     shp = _write_shp(tmp_path, poly)
     ais = _write_ais_csv(tmp_path)
     cfg = _make_config(tmp_path, ais, shp)
     with pytest.raises(RuntimeError, match="filter"):
-        run_pipeline(cfg, stages=["depth"])
+        run_pipeline(cfg, stages=["vessel"])
 
 
 def test_cli_help():

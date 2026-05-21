@@ -10,8 +10,8 @@ import pandas as pd
 
 from aiswakepy.config import ShipwakeConfig, load_config
 
-Stage = Literal["filter", "depth", "vessel", "wave_impact", "viz"]
-ALL_STAGES: list[Stage] = ["filter", "depth", "vessel", "wave_impact", "viz"]
+Stage = Literal["filter", "vessel", "wave_impact", "viz"]
+ALL_STAGES: list[Stage] = ["filter", "vessel", "wave_impact", "viz"]
 
 
 def run_pipeline(
@@ -56,7 +56,7 @@ def run_pipeline(
 
     if "filter" in stages:
         from aiswakepy.stages.filter import filter_ais
-        print("Stage 1/4: AIS filtering...")
+        print("Stage 1/3: AIS filtering + interpolation + depth check...")
         t0 = time.perf_counter()
         results["df_filtered"] = filter_ais(
             csv_path=config.ais.raw_csv,
@@ -73,6 +73,14 @@ def run_pipeline(
             low_sog_threshold_ms=config.ais.low_sog_threshold_ms,
             velocity_ratio_threshold=config.ais.velocity_ratio_threshold,
             speed_consistency_ratio=config.ais.speed_consistency_ratio,
+            # Depth-clearance check is folded into the filter tail so a point
+            # with bad draught but valid lon/lat can still constrain the
+            # interpolation step; only the final, interpolated frame is checked
+            # against bathymetry + tide.
+            bathy_path=config.bathymetry.source,
+            tide_dfs0_path=config.bathymetry.tide_dfs0,
+            tide_item=config.bathymetry.tide_item,
+            underkeel_margin_m=config.bathymetry.underkeel_margin_m,
         )
         print(
             f"  \u2192 {len(results['df_filtered'])} rows after filtering "
@@ -80,44 +88,18 @@ def run_pipeline(
         )
         _save_stage_csv(results["df_filtered"], "01_filtered")
 
-    if "depth" in stages:
-        from aiswakepy.stages.depth import assign_depth
-        print("Stage 2/4: Depth assignment...")
-        t0 = time.perf_counter()
-        df_in = results.get("df_filtered")
-        if df_in is None:
-            raise RuntimeError("Stage 'depth' requires 'filter' to have run first")
-        results["df_depth"] = assign_depth(
-            df=df_in,
-            bathy_path=config.bathymetry.source,
-            tide_dfs0_path=config.bathymetry.tide_dfs0,
-            tide_item=config.bathymetry.tide_item,
-            underkeel_margin_m=config.bathymetry.underkeel_margin_m,
-        )
-        # Re-segment after depth/clearance point removal.
-        from aiswakepy.stages.filter import segment_trajectories
-        results["df_depth"] = segment_trajectories(
-            results["df_depth"], gap_s=config.ais.traj_gap_s,
-            use_force_break=True,
-        )
-        print(
-            f"  \u2192 {len(results['df_depth'])} rows after depth filter "
-            f"({time.perf_counter() - t0:.1f}s)"
-        )
-        _save_stage_csv(results["df_depth"], "02_depth")
-
     if "vessel" in stages:
         from aiswakepy.stages.vessel import compute_vessel_params
         w = config.wave
         print(
-            f"Stage 3/4: Vessel parameters...\n"
+            f"Stage 2/3: Vessel parameters...\n"
             f"  filters: SOG\u2264{w.max_sog_knots}kn"
             f"  B/L\u2264{w.max_bl_ratio}"
         )
         t0 = time.perf_counter()
-        df_in = results.get("df_depth")
+        df_in = results.get("df_filtered")
         if df_in is None:
-            raise RuntimeError("Stage 'vessel' requires 'depth' to have run first")
+            raise RuntimeError("Stage 'vessel' requires 'filter' to have run first")
         results["df_vessel"] = compute_vessel_params(
             df=df_in,
             cb_method=config.vessel.cb_method,
@@ -133,7 +115,7 @@ def run_pipeline(
 
     if "wave_impact" in stages:
         from aiswakepy.stages.wave_impact import compute_wave_impact
-        print("Stage 4/4: Wave impact...")
+        print("Stage 3/3: Wave impact...")
         t0 = time.perf_counter()
         df_in = results.get("df_vessel")
         if df_in is None:

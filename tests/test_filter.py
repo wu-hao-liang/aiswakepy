@@ -424,3 +424,42 @@ def test_filter_ais_integration(tmp_path):
         & (df["latitude"] >= 1.287) & (df["latitude"] <= 1.2898)
     )
     assert not inside.any()
+
+
+def test_filter_ais_with_depth(tmp_path, monkeypatch):
+    """filter_ais embeds the depth-clearance check when bathy_path is given.
+
+    With a stubbed bathy mesh returning 20m everywhere, a vessel with 8m
+    draught + 1m underkeel margin (= 9m required) is kept. With a stub
+    returning 5m everywhere, all points are dropped (5 < 8 + 1 = 9).
+    """
+    rows = [
+        _base_row(mmsi=1, lon=103.8500, lat=1.2900, t="2024-01-01 00:00:00", draught=8.0),
+        _base_row(mmsi=1, lon=103.8509, lat=1.2900, t="2024-01-01 00:01:00", draught=8.0),
+        _base_row(mmsi=1, lon=103.8518, lat=1.2900, t="2024-01-01 00:02:00", draught=8.0),
+    ]
+    csv_path = tmp_path / "ais.csv"
+    csv_path.write_text(_make_ais_csv(rows))
+    poly = Polygon([(103.95, 1.30), (103.96, 1.30), (103.96, 1.31), (103.95, 1.31)])
+    shp = _write_coast_shp(tmp_path, poly)
+
+    from unittest.mock import MagicMock
+    def _stub_bathy(depth_value):
+        stub = MagicMock()
+        stub.get_depth.side_effect = lambda lons, lats: np.full(len(lons), depth_value)
+        return stub
+
+    import aiswakepy.stages.depth as depth_mod
+
+    # Deep water: 20 m → all points retain.
+    monkeypatch.setattr(depth_mod, "load_bathymetry", lambda _: _stub_bathy(20.0))
+    df_deep = filter_ais(csv_path, shp, shp, gap_s=600,
+                         bathy_path="stub.mesh", underkeel_margin_m=1.0)
+    assert "WaterDepth" in df_deep.columns
+    assert len(df_deep) > 0
+
+    # Shallow water: 5 m → underkeel violation drops everything.
+    monkeypatch.setattr(depth_mod, "load_bathymetry", lambda _: _stub_bathy(5.0))
+    df_shallow = filter_ais(csv_path, shp, shp, gap_s=600,
+                            bathy_path="stub.mesh", underkeel_margin_m=1.0)
+    assert len(df_shallow) == 0
