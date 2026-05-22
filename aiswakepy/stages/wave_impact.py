@@ -314,7 +314,7 @@ def compute_wave_impact(
         "MMSI", "ShLongitude", "ShLatitude", "WaveHeight", "WavePeriod",
         "E_max", "E_tot", "DistLoc_km", "DateTime", "Froude_D",
         "VesselLongitude", "VesselLatitude", "VesselCOG", "VesselDraught",
-        "VesselWidth", "VesselLength", "SOG", "Side", "segment_id",
+        "VesselWidth", "VesselLength", "SOG", "Side", "segment_id", "typecargo",
     ]
 
     if df_vessel.empty:
@@ -382,6 +382,7 @@ def compute_wave_impact(
                 "SOG":              row.sog,
                 "Side":             side,
                 "segment_id":       int(row.segment_id),
+                "typecargo":        int(getattr(row, "typecargo", 0)),
             })
             hit_vessel_rows.append(i)
             hit_dist_perp.append(dist_perp)

@@ -27,6 +27,12 @@ from flask import Response, jsonify, request
 
 from aiswakepy.config import load_config
 from aiswakepy.pipeline import run_pipeline
+from aiswakepy.viz.report import (
+    plot_wave_height_report,
+    plot_wave_period_report,
+    top_vessels_table,
+    plot_vessel_track_scatter,
+)
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -372,6 +378,7 @@ PIPELINE_STATE = {
     'n_waves': None,
     'n_filtered': None,
     'last_step': None,    # 'filter' or 'waves'
+    'cfg': None,          # last config_dict used (for report plots in _export_filtered)
 }
 
 
@@ -422,6 +429,58 @@ class _LineCapture(io.TextIOBase):
             pass
 
 
+def _generate_report_plots(
+    cfg_dict: dict,
+    df_vessel: pd.DataFrame,
+    df_wave_impact: pd.DataFrame,
+    out_dir: Path | None = None,
+) -> None:
+    """Generate the four report outputs and save to out_dir.
+
+    Called after pipeline completes (full results) and after export (filtered
+    results).  Failures are caught and printed so they never crash the caller.
+    """
+    if out_dir is None:
+        out_dir = Path(cfg_dict.get('output', {}).get('directory', 'output/'))
+    out_dir = Path(out_dir)
+    coastline_shp = cfg_dict.get('coastline', {}).get('shapefile', '')
+
+    try:
+        tbl = top_vessels_table(df_wave_impact, n=10,
+                                output_path=out_dir / 'top10_vessels.csv')
+        print(f'  ✓ report: top10_vessels.csv  ({len(tbl)} rows)')
+    except Exception as e:
+        print(f'  WARN: top_vessels_table failed: {e}')
+
+    try:
+        plot_vessel_track_scatter(df_vessel, df_wave_impact,
+                                  output_path=out_dir / 'vessel_track_scatter.png')
+        print(f'  ✓ report: vessel_track_scatter.png')
+    except Exception as e:
+        print(f'  WARN: plot_vessel_track_scatter failed: {e}')
+
+    if not coastline_shp:
+        print('  WARN: coastline_shp not set — skipping wave maps')
+        return
+
+    wave_height_name = cfg_dict.get('output', {}).get('wave_height_map_name', 'WaveHeightMap.png')
+    wave_period_name = cfg_dict.get('output', {}).get('wave_period_map_name', 'WavePeriodMap.png')
+
+    try:
+        plot_wave_height_report(df_wave_impact, coastline_shp,
+                                output_path=out_dir / wave_height_name)
+        print(f'  ✓ report: {wave_height_name}')
+    except Exception as e:
+        print(f'  WARN: plot_wave_height_report failed: {e}')
+
+    try:
+        plot_wave_period_report(df_wave_impact, coastline_shp,
+                                output_path=out_dir / wave_period_name)
+        print(f'  ✓ report: {wave_period_name}')
+    except Exception as e:
+        print(f'  WARN: plot_wave_period_report failed: {e}')
+
+
 def _pipeline_thread(config_dict: dict, stages: list[str], step_label: str) -> None:
     """Worker thread. Runs the requested stages and refreshes only the affected caches.
 
@@ -430,6 +489,7 @@ def _pipeline_thread(config_dict: dict, stages: list[str], step_label: str) -> N
     updating) while the slow groupby + Arrow encoding is in progress.
     """
     global LAST_RESULTS
+    PIPELINE_STATE['cfg'] = config_dict
     old_stdout = sys.stdout
     sys.stdout = _LineCapture(old_stdout)
     try:
@@ -461,7 +521,7 @@ def _pipeline_thread(config_dict: dict, stages: list[str], step_label: str) -> N
             try:
                 out_dir.mkdir(parents=True, exist_ok=True)
                 vessels_for_tracks.to_parquet(out_dir / 'vessels.parquet', index=False)
-                print(f'  ✓ saved dev cache: vessels.parquet')
+                print(f'  ✓ saved results: vessels.parquet')
             except Exception as e:
                 print(f'  WARN: could not save vessels.parquet: {e}')
             with _pipeline_lock:
@@ -473,14 +533,14 @@ def _pipeline_thread(config_dict: dict, stages: list[str], step_label: str) -> N
             t0 = time.perf_counter()
             # Fresh runs already have the columns _ensure_vessel_columns would
             # back-fill, so no join needed here. The helper is kept around for
-            # _dev_load (legacy CSV imports).
+            # _load_results also handles legacy CSV imports.
             _build_wave_caches(results['df_wave_impact'])
             print(f'  -> {len(results["df_wave_impact"]):,} wave events '
                   f'({time.perf_counter()-t0:.1f}s)')
             # Save wave parquet for dev-loading
             try:
                 results['df_wave_impact'].to_parquet(out_dir / 'waves.parquet', index=False)
-                print(f'  ✓ saved dev cache: waves.parquet')
+                print(f'  ✓ saved results: waves.parquet')
             except Exception as e:
                 print(f'  WARN: could not save waves.parquet: {e}')
             try:
@@ -491,6 +551,14 @@ def _pipeline_thread(config_dict: dict, stages: list[str], step_label: str) -> N
             with _pipeline_lock:
                 PIPELINE_STATE['wave_version'] += 1
                 PIPELINE_STATE['n_waves'] = len(results['df_wave_impact'])
+
+            print('Generating report plots...')
+            _generate_report_plots(
+                config_dict,
+                vessels_for_tracks if vessels_for_tracks is not None else pd.DataFrame(),
+                results['df_wave_impact'],
+                out_dir=out_dir,
+            )
 
         with _pipeline_lock:
             PIPELINE_STATE['finished_at'] = time.time()
@@ -860,7 +928,8 @@ INDEX_TEMPLATE = """<!DOCTYPE html>
             50%      { transform: translateY(-4px); }
         }
         #banner-meta { white-space: nowrap; overflow: hidden; flex-shrink: 0;
-                       text-overflow: ellipsis; text-align: right; font-size: 11px; }
+                       text-overflow: ellipsis; text-align: right; font-size: 11px;
+                       margin-left: auto; }
         #banner-title { position: absolute; left: 50%; transform: translateX(-50%);
                         font-weight: 800; font-size: 13px; letter-spacing: 2.5px;
                         color: #334; pointer-events: none; white-space: nowrap;
@@ -1100,10 +1169,10 @@ def _r_raster(): return Response(PNG_BYTES, mimetype='image/png')
 
 
 # ---------------------------------------------------------------------------
-# Dev-load: scan for output dirs + load pre-computed data without pipeline run
+# Load Results: scan for output dirs and load pre-computed results
 # ---------------------------------------------------------------------------
 def _scan_output_dirs() -> list[str]:
-    """Return relative paths to directories that contain loadable dev-cache data."""
+    """Return relative paths to directories that contain loadable results (parquet files)."""
     candidates = []
     # Standard output/ at repo root
     if (REPO / 'output').is_dir():
@@ -1117,8 +1186,8 @@ def _scan_output_dirs() -> list[str]:
     return candidates
 
 
-def _dev_load(directory: str) -> dict:
-    """Load pre-computed vessel/wave data from *directory* and rebuild IPC caches.
+def _load_results(directory: str) -> dict:
+    """Load pre-computed vessel/wave results from *directory* and rebuild IPC caches.
 
     Resolution order per asset:
       Tracks → vessels.parquet → *_03_vessel.csv → *_01_filtered.csv
@@ -1139,7 +1208,7 @@ def _dev_load(directory: str) -> dict:
         *sorted(p.glob('*_01_filtered.csv')),
     ]:
         if src.exists():
-            print(f'  dev-load vessels: {src.name}')
+            print(f'  loading vessels: {src.name}')
             df_v = pd.read_parquet(src) if src.suffix == '.parquet' else pd.read_csv(src)
             if 'obstime' in df_v.columns:
                 df_v['obstime'] = pd.to_datetime(df_v['obstime'])
@@ -1155,7 +1224,7 @@ def _dev_load(directory: str) -> dict:
         p / 'shore_impact.csv',
     ]:
         if src.exists():
-            print(f'  dev-load waves: {src.name}')
+            print(f'  loading waves: {src.name}')
             df_w = pd.read_parquet(src) if src.suffix == '.parquet' else pd.read_csv(src)
             break
 
@@ -1199,14 +1268,14 @@ def _dev_load(directory: str) -> dict:
     }
 
 
-@app.server.route('/api/dev_load', methods=['POST'])
-def _r_dev_load():
+@app.server.route('/api/load_results', methods=['POST'])
+def _r_load_results():
     body = request.get_json(force=True, silent=True) or {}
     directory = body.get('directory', '')
     if not directory:
         return jsonify({'error': 'directory required'}), 400
     try:
-        result = _dev_load(directory)
+        result = _load_results(directory)
         return jsonify(result)
     except Exception as e:
         import traceback
@@ -1323,6 +1392,16 @@ def _export_filtered(body: dict) -> dict:
 
         # ---- 4. Wave↔track link sidecar ----
         _write_wave_track_link(df_waves_out, out_dir)
+
+        # ---- 5. Report plots for filtered results ----
+        cfg_snap = PIPELINE_STATE.get('cfg')
+        if cfg_snap and n_waves_out > 0 and n_tracks_out > 0:
+            try:
+                _generate_report_plots(cfg_snap, df_tracks_out, df_waves_out, out_dir=out_dir)
+            except Exception as e:
+                import traceback
+                traceback.print_exc()
+                print(f'WARN: report plots failed for export: {e}')
 
         return {
             'workdir': f'data/{dest_name}',
@@ -1530,14 +1609,15 @@ app.layout = html.Div([
                            'cursor': 'pointer', 'color': '#3a6080', 'whiteSpace': 'nowrap',
                            'flexShrink': '0', 'fontWeight': '600',
                            'lineHeight': '1.4', 'height': '26px', 'boxSizing': 'border-box'}),
-        html.Button('Load Results', id='btn-dev-load', n_clicks=0,
+        html.Button('Load Results', id='btn-load-results', n_clicks=0,
                     title='Load pre-computed output from the selected working directory',
                     style={'padding': '3px 10px', 'fontSize': '11px', 'background': '#f2ede4',
                            'border': '1px solid #c8b488', 'borderRadius': '4px',
                            'cursor': 'pointer', 'color': '#7a6040', 'whiteSpace': 'nowrap',
                            'flexShrink': '0', 'fontWeight': '600',
                            'lineHeight': '1.4', 'height': '26px', 'boxSizing': 'border-box'}),
-        html.Span('', id='dev-load-status', style={'display': 'none'}),
+        html.Span('', id='load-results-status',
+                  style={'fontSize': '11px', 'color': '#c44', 'marginLeft': '2px'}),
         html.Div('AISWAKEPY', id='banner-title'),
         html.Div([
             html.Span(id='ais-time-range', style={'color': '#558', 'marginRight': '4px'}),
@@ -1609,7 +1689,7 @@ app.layout = html.Div([
             dcc.Dropdown(id='sel-tide-item', options=[], value=None, clearable=False),
             html.Button(id='_tide-file-btn', n_clicks=0),
             html.Button(id='_tide-item-btn', n_clicks=0),
-            dcc.Dropdown(id='sel-dev-dir', options=[], value=None, clearable=True),
+            dcc.Dropdown(id='sel-results-dir', options=[], value=None, clearable=True),
         ]),
         dcc.Store(id='_tide_file_pick', data={'value': None, 'nonce': 0}),
         dcc.Store(id='_tide_item_pick', data={'value': None, 'nonce': 0}),
@@ -1872,7 +1952,7 @@ app.layout = html.Div([
     dcc.Store(id='_pv_coast', data={'visible': False, 'path': None}),
     dcc.Store(id='_pv_land',  data={'visible': False, 'path': None}),
     dcc.Store(id='_filter_structural', data={'mmsi': None, 'seg_ids': [], 'types': [], 'nonce': 0}),
-    dcc.Store(id='_dev_load_result'),
+    dcc.Store(id='_load_result'),
     dcc.Store(id='_tide_items_meta', data=[]),
     dcc.Store(id='_tide_files_meta', data=[]),
     dcc.Store(id='_wave_n', data=0),
@@ -1937,7 +2017,7 @@ def _update_file_dropdowns(workdir, _rescan):
     Output('sel-tide',      'value', allow_duplicate=True),
     Output('sel-tide-item', 'value', allow_duplicate=True),
     Output('pv-ais',        'value', allow_duplicate=True),
-    Output('dev-load-status', 'children', allow_duplicate=True),
+    Output('load-results-status', 'children', allow_duplicate=True),
     Output('export-status',   'children', allow_duplicate=True),
     Output('inp-export-dest', 'value', allow_duplicate=True),
     Output('export-dest-form', 'style', allow_duplicate=True),
@@ -2294,28 +2374,31 @@ def _populate_tide_items(path):
 
 
 @app.callback(
-    Output('sel-dev-dir', 'options'),
+    Output('sel-results-dir', 'options'),
     Input('_init', 'data'),
     prevent_initial_call=False,
 )
-def _populate_dev_dirs(_):
+def _populate_results_dirs(_):
     dirs = _scan_output_dirs()
     return [{'label': d, 'value': d} for d in dirs]
 
 
 @app.callback(
-    Output('_dev_load_result', 'data'),
-    Output('btn-dev-load', 'disabled'),
-    Input('btn-dev-load', 'n_clicks'),
+    Output('_load_result', 'data'),
+    Output('btn-load-results', 'disabled'),
+    Input('btn-load-results', 'n_clicks'),
     State('sel-workdir', 'value'),
     prevent_initial_call=True,
 )
-def dev_load_click(n, workdir):
+def load_results_click(n, workdir):
     if not n or not workdir:
         return no_update, no_update
     directory = f'{workdir}/output'
+    out_path = REPO / directory
+    if not (out_path / 'vessels.parquet').exists():
+        return {'error': 'Cannot find results — run Calculate Waves first'}, False
     try:
-        result = _dev_load(directory)
+        result = _load_results(directory)
         return result, False
     except Exception as e:
         return {'error': str(e)}, False
@@ -2374,13 +2457,14 @@ def _populate_seg_options(mmsi):
 @app.callback(
     Output('_filter_structural', 'data', allow_duplicate=True),
     Output('fil-type', 'value', allow_duplicate=True),
+    Output('btn-fil-export', 'disabled', allow_duplicate=True),
     Input('btn-fil-clear', 'n_clicks'),
     State('_filter_structural', 'data'),
     prevent_initial_call=True,
 )
 def _clear_track_filter(_, prev):
     nonce = ((prev or {}).get('nonce', 0) + 1)
-    return {'mmsi': None, 'seg_ids': [], 'types': [], 'nonce': nonce, '_clear': True}, None
+    return {'mmsi': None, 'seg_ids': [], 'types': [], 'nonce': nonce, '_clear': True}, None, True
 
 
 # Vessel type applies immediately on dropdown change
@@ -2947,6 +3031,25 @@ function(n) {
                 if (typeof window.__updateCascadeTrigger === 'function') window.__updateCascadeTrigger();
                 const p = document.getElementById('sim-panel');
                 if (p) p.style.display = 'none';
+                // Reset armed states and restore button labels
+                if (window.__freehandArmed || window.__freehandMode) {
+                    if (typeof window.__cancelFreehandDraw === 'function') window.__cancelFreehandDraw();
+                    window.__freehandArmed = false;
+                    const bf = document.getElementById('btn-freehand');
+                    if (bf) { bf.textContent = 'Draw line across tracks'; bf.style.opacity = ''; }
+                }
+                if (window.__waveBoxArmed || window.__waveBoxMode) {
+                    if (typeof window.__cancelWaveBoxDraw === 'function') window.__cancelWaveBoxDraw();
+                    window.__waveBoxArmed = false;
+                    const bw = document.getElementById('btn-wavebox');
+                    if (bw) { bw.textContent = 'Drag box on the map'; bw.style.opacity = ''; }
+                }
+                if (window.__similarArmed) {
+                    window.__similarArmed = false;
+                    const bs = document.getElementById('btn-similar');
+                    if (bs) { bs.textContent = 'Select one representative track'; bs.style.opacity = ''; }
+                }
+                window.__updateDeckCursor();
             } else {
                 // Partial update from "Apply filters" — only vessel types go through Dash.
                 // MMSI/seg are managed client-side by the cascade widget; don't override them.
@@ -2983,15 +3086,30 @@ function(n) {
             cv.width = r.width; cv.height = r.height;
             return cv;
         };
-        window.__freehandMode = false;
+        window.__freehandArmed = false;
+        window.__freehandMode  = false;
+        window.__cancelFreehandDraw = null;
+
         window.__enterFreehandMode = () => {
-            if (window.__freehandMode) return;
+            const btn = document.getElementById('btn-freehand');
+            if (window.__freehandArmed) {
+                window.__freehandArmed = false;
+                if (btn) { btn.textContent = 'Draw line across tracks'; btn.style.opacity = ''; }
+                window.__updateDeckCursor();
+                return;
+            }
+            window.__freehandArmed = true;
+            if (btn) { btn.textContent = 'Hold Ctrl to draw...'; btn.style.opacity = '0.65'; }
+            window.__updateDeckCursor();
+        };
+
+        window.__activateFreehandDraw = () => {
+            if (!window.__freehandArmed || window.__freehandMode) return;
             window.__freehandMode = true;
             window.deckInstance.setProps({ controller: false });
             window.__updateDeckCursor();
             const btn = document.getElementById('btn-freehand');
             if (btn) { btn.textContent = 'Drawing...'; btn.style.opacity = '0.65'; }
-            // Set up canvas
             const cv = getOrCreateCanvas();
             cv.style.display = 'block';
             const ctx2d = cv.getContext('2d');
@@ -3001,6 +3119,7 @@ function(n) {
             ctx2d.lineCap = 'round';
             ctx2d.lineJoin = 'round';
             ctx2d.setLineDash([6, 4]);
+            const container = document.getElementById('deck-container');
             let pencil = [], isDrawing = false;
             const rect = () => container.getBoundingClientRect();
             const onDown = (e) => {
@@ -3020,12 +3139,11 @@ function(n) {
                 ctx2d.lineTo(px, py);
                 ctx2d.stroke();
             };
-            const onUp   = () => {
-                if (!isDrawing || pencil.length < 2) { cleanup(); return; }
+            const onUp = () => {
+                if (!isDrawing || pencil.length < 2) { cancel(); return; }
                 isDrawing = false;
                 const vp = window.deckInstance.getViewports()[0];
                 const wp = pencil.map(([px, py]) => vp.unproject([px, py]));
-                // Pencil AABB
                 let pMinX=Infinity,pMaxX=-Infinity,pMinY=Infinity,pMaxY=-Infinity;
                 for (const [wx,wy] of wp) {
                     if(wx<pMinX)pMinX=wx; if(wx>pMaxX)pMaxX=wx;
@@ -3034,7 +3152,6 @@ function(n) {
                 const hits = [];
                 for (let si = 0; si < tMMSI.length; si++) {
                     const s = startIndices[si], e = startIndices[si + 1];
-                    // Segment AABB vs pencil AABB
                     let sMinX=Infinity,sMaxX=-Infinity,sMinY=Infinity,sMaxY=-Infinity;
                     for (let p = s; p < e; p++) {
                         const x=cPos[p*2],y=cPos[p*2+1];
@@ -3053,19 +3170,34 @@ function(n) {
                 }
                 window.__filterState.freehand = hits.length > 0 ? hits : null;
                 window.__recomputeVisibility();
-                cleanup();
+                finish();
             };
-            const cleanup = () => {
+            const removeListeners = () => {
                 container.removeEventListener('pointerdown', onDown);
                 container.removeEventListener('pointermove', onMove);
                 container.removeEventListener('pointerup', onUp);
+                window.__cancelFreehandDraw = null;
+            };
+            const cancel = () => {
+                removeListeners();
                 window.__freehandMode = false;
+                window.deckInstance.setProps({ controller: DEFAULT_CONTROLLER });
+                window.__updateDeckCursor();
+                if (btn) { btn.textContent = 'Hold Ctrl to draw...'; btn.style.opacity = '0.65'; }
+                cv.style.display = 'none';
+                ctx2d.clearRect(0, 0, cv.width, cv.height);
+            };
+            const finish = () => {
+                removeListeners();
+                window.__freehandArmed = false;
+                window.__freehandMode  = false;
                 window.deckInstance.setProps({ controller: DEFAULT_CONTROLLER });
                 window.__updateDeckCursor();
                 if (btn) { btn.textContent = 'Draw line across tracks'; btn.style.opacity = ''; }
                 cv.style.display = 'none';
                 ctx2d.clearRect(0, 0, cv.width, cv.height);
             };
+            window.__cancelFreehandDraw = cancel;
             container.addEventListener('pointerdown', onDown);
             container.addEventListener('pointermove', onMove);
             container.addEventListener('pointerup',   onUp);
@@ -3086,9 +3218,26 @@ function(n) {
             cv.width = r.width; cv.height = r.height;
             return cv;
         };
-        window.__waveBoxMode = false;
+        window.__waveBoxArmed = false;
+        window.__waveBoxMode  = false;
+        window.__cancelWaveBoxDraw = null;
+
         window.__enterWaveBoxMode = () => {
-            if (window.__waveBoxMode) return;
+            const btn = document.getElementById('btn-wavebox');
+            if (window.__waveBoxArmed) {
+                window.__waveBoxArmed = false;
+                if (btn) { btn.textContent = 'Drag box on the map'; btn.style.opacity = ''; }
+                window.__updateDeckCursor();
+                return;
+            }
+            if (!window.__hasWaves || wMMSI.length === 0) return;
+            window.__waveBoxArmed = true;
+            if (btn) { btn.textContent = 'Hold Ctrl to drag...'; btn.style.opacity = '0.65'; }
+            window.__updateDeckCursor();
+        };
+
+        window.__activateWaveBoxDraw = () => {
+            if (!window.__waveBoxArmed || window.__waveBoxMode) return;
             if (!window.__hasWaves || wMMSI.length === 0) return;
             window.__waveBoxMode = true;
             window.deckInstance.setProps({ controller: false });
@@ -3126,13 +3275,12 @@ function(n) {
                 drawRect(p0, p);
             };
             const onUp = (e) => {
-                if (!isDragging) { cleanup(); return; }
+                if (!isDragging) { cancel(); return; }
                 isDragging = false;
                 const r = rect();
                 const p1 = [e.clientX - r.left, e.clientY - r.top];
                 if (Math.abs(p1[0] - p0[0]) < 4 || Math.abs(p1[1] - p0[1]) < 4) {
-                    // Drag too small — treat as cancel
-                    cleanup();
+                    cancel();
                     return;
                 }
                 const vp = window.deckInstance.getViewports()[0];
@@ -3140,9 +3288,6 @@ function(n) {
                 const c2 = vp.unproject(p1);
                 const lonMin = Math.min(c1[0], c2[0]), lonMax = Math.max(c1[0], c2[0]);
                 const latMin = Math.min(c1[1], c2[1]), latMax = Math.max(c1[1], c2[1]);
-                // Collect wave indices in the box, derive track segment indices
-                // via the precomputed waveToSegIdx mapping. With the unified
-                // pipeline every wave maps to a valid track segment.
                 const boxWaveIdxs = [];
                 const boxSegIdxs = new Set();
                 for (let i = 0; i < wMMSI.length; i++) {
@@ -3160,19 +3305,34 @@ function(n) {
                     };
                     window.__recomputeVisibility();
                 }
-                cleanup();
+                finish();
             };
-            const cleanup = () => {
+            const removeListeners = () => {
                 container.removeEventListener('pointerdown', onDown);
                 container.removeEventListener('pointermove', onMove);
                 container.removeEventListener('pointerup', onUp);
+                window.__cancelWaveBoxDraw = null;
+            };
+            const cancel = () => {
+                removeListeners();
                 window.__waveBoxMode = false;
+                window.deckInstance.setProps({ controller: DEFAULT_CONTROLLER });
+                window.__updateDeckCursor();
+                if (btn) { btn.textContent = 'Hold Ctrl to drag...'; btn.style.opacity = '0.65'; }
+                cv.style.display = 'none';
+                ctx2d.clearRect(0, 0, cv.width, cv.height);
+            };
+            const finish = () => {
+                removeListeners();
+                window.__waveBoxArmed = false;
+                window.__waveBoxMode  = false;
                 window.deckInstance.setProps({ controller: DEFAULT_CONTROLLER });
                 window.__updateDeckCursor();
                 if (btn) { btn.textContent = 'Drag box on the map'; btn.style.opacity = ''; }
                 cv.style.display = 'none';
                 ctx2d.clearRect(0, 0, cv.width, cv.height);
             };
+            window.__cancelWaveBoxDraw = cancel;
             container.addEventListener('pointerdown', onDown);
             container.addEventListener('pointermove', onMove);
             container.addEventListener('pointerup',   onUp);
@@ -3211,7 +3371,25 @@ function(n) {
             }
             const simPanel = document.getElementById('sim-panel');
             if (simPanel) simPanel.style.display = 'none';
-            // Recompute (will set status text + rebuild layers).
+            // Reset armed states and restore button labels
+            if (window.__freehandArmed || window.__freehandMode) {
+                if (typeof window.__cancelFreehandDraw === 'function') window.__cancelFreehandDraw();
+                window.__freehandArmed = false;
+                const bf = document.getElementById('btn-freehand');
+                if (bf) { bf.textContent = 'Draw line across tracks'; bf.style.opacity = ''; }
+            }
+            if (window.__waveBoxArmed || window.__waveBoxMode) {
+                if (typeof window.__cancelWaveBoxDraw === 'function') window.__cancelWaveBoxDraw();
+                window.__waveBoxArmed = false;
+                const bw = document.getElementById('btn-wavebox');
+                if (bw) { bw.textContent = 'Drag box on the map'; bw.style.opacity = ''; }
+            }
+            if (window.__similarArmed) {
+                window.__similarArmed = false;
+                const bs = document.getElementById('btn-similar');
+                if (bs) { bs.textContent = 'Select one representative track'; bs.style.opacity = ''; }
+            }
+            window.__updateDeckCursor();
             window.__recomputeVisibility();
         };
 
@@ -3219,10 +3397,17 @@ function(n) {
         window.__similarArmed  = false;
         window.__simPickedData = null;
         window.__enterSimilarMode = () => {
-            window.__similarArmed = true;
             const btn = document.getElementById('btn-similar');
-            if (btn) { btn.textContent = 'Pick a track...'; btn.style.opacity = '0.65'; }
-            return 'Click a track on the map to pick the reference';
+            if (window.__similarArmed) {
+                window.__similarArmed = false;
+                if (btn) { btn.textContent = 'Select one representative track'; btn.style.opacity = ''; }
+                window.__updateDeckCursor();
+                return 'Similar mode cancelled';
+            }
+            window.__similarArmed = true;
+            if (btn) { btn.textContent = 'Ctrl+click a track...'; btn.style.opacity = '0.65'; }
+            window.__updateDeckCursor();
+            return 'Hold Ctrl and click a track to pick the reference';
         };
         window.__runSimilar = async (buffer_m, min_coverage) => {
             const pick = window.__simPickedData;
@@ -3520,7 +3705,12 @@ function(n) {
         const getCursorForState = (isDragging = false, isHovering = false) => {
             if (window.__freehandMode) return CURSOR_PENCIL;
             if (window.__waveBoxMode)  return 'crosshair';
-            if (window.__ctrlHeld)     return isHovering ? 'pointer' : 'default';
+            if (window.__ctrlHeld) {
+                if (window.__freehandArmed) return CURSOR_PENCIL;
+                if (window.__waveBoxArmed)  return 'crosshair';
+                if (window.__similarArmed)  return 'pointer';
+                return isHovering ? 'pointer' : 'default';
+            }
             return isDragging ? 'grabbing' : 'grab';
         };
         window.deckInstance = new deck.Deck({
@@ -3540,6 +3730,7 @@ function(n) {
                 // Similar pick mode: capture the clicked track
                 if (window.__similarArmed && layer && layer.id === 'tracks' && index >= 0) {
                     window.__similarArmed = false;
+                    window.__updateDeckCursor();
                     const si = (window.__visibleSegIdxs !== null && filteredSegIdxs.length > 0)
                         ? filteredSegIdxs[index] : index;
                     const mmsi = Number(tMMSI[si]);
@@ -3607,33 +3798,44 @@ function(n) {
         // No INPUT/TEXTAREA guard — __ctrlHeld only affects the map, not DOM inputs;
         // those handle Ctrl+A/C/V natively regardless of this flag.
         window.addEventListener('keydown', (e) => {
-            if (e.key !== 'Control' || window.__ctrlHeld || window.__freehandMode) return;
+            if (e.key !== 'Control' || window.__ctrlHeld) return;
             window.__ctrlHeld = true;
             window.__updateDeckCursor();
             if (typeof window.__rebuild === 'function') window.__rebuild();
+            if (window.__freehandArmed && !window.__freehandMode) window.__activateFreehandDraw();
+            if (window.__waveBoxArmed  && !window.__waveBoxMode)  window.__activateWaveBoxDraw();
         });
         window.addEventListener('keyup', (e) => {
             if (e.key !== 'Control' || !window.__ctrlHeld) return;
             window.__ctrlHeld = false;
             hideTip();
+            if (window.__freehandMode && typeof window.__cancelFreehandDraw === 'function') window.__cancelFreehandDraw();
+            if (window.__waveBoxMode  && typeof window.__cancelWaveBoxDraw  === 'function') window.__cancelWaveBoxDraw();
             window.__updateDeckCursor();
         });
         // Clear inspect mode if window loses focus while Ctrl is held (otherwise
         // ctrl-tabbing away leaves the flag stuck on with no key event to clear it)
         window.addEventListener('blur', () => {
             if (!window.__ctrlHeld) return;
-            window.__ctrlHeld = false; hideTip(); window.__updateDeckCursor();
+            window.__ctrlHeld = false;
+            hideTip();
+            if (window.__freehandMode && typeof window.__cancelFreehandDraw === 'function') window.__cancelFreehandDraw();
+            if (window.__waveBoxMode  && typeof window.__cancelWaveBoxDraw  === 'function') window.__cancelWaveBoxDraw();
+            window.__updateDeckCursor();
         });
         container.addEventListener('mousedown', (e) => {
             // Sync Ctrl state from the real event so first-interaction Ctrl+click works
             if (e.ctrlKey && !window.__ctrlHeld) {
                 window.__ctrlHeld = true;
                 window.__updateDeckCursor();
+                // Activate armed modes in case keydown didn't fire before Ctrl was held
+                if (window.__freehandArmed && !window.__freehandMode) window.__activateFreehandDraw();
+                if (window.__waveBoxArmed  && !window.__waveBoxMode)  window.__activateWaveBoxDraw();
             }
-            if (!window.__freehandMode) window.__updateDeckCursor(true);
+            if (!window.__freehandMode && !window.__waveBoxMode) window.__updateDeckCursor(true);
         });
         window.addEventListener('mouseup', () => {
-            if (!window.__freehandMode) window.__updateDeckCursor(false);
+            if (!window.__freehandMode && !window.__waveBoxMode) window.__updateDeckCursor(false);
         });
         const rebuildOnView = debounce((z) => {
             window.deckInstance.setProps({ layers: buildLayers(z, window._hoveredWave) });
@@ -4084,8 +4286,8 @@ function(n) {
             clearRenderStatus(1500);
         };
 
-        // ---- Combined dev-load: fetch tracks + waves under one overlay, then zoom-to-fit
-        window.__loadDevResults = async (result) => {
+        // ---- Load Results: fetch tracks + waves under one overlay, then zoom-to-fit
+        window.__loadResults = async (result) => {
             if (!result) return;
             const tv = result.track_version || 0;
             const wv = result.wave_version || 0;
@@ -4118,7 +4320,7 @@ function(n) {
                 window._pinnedWave  = null;
                 if (typeof window.__updateCascadeTrigger === 'function') window.__updateCascadeTrigger();
                 // Mark versions as "already handled" so the per-version refresh callbacks
-                // short-circuit when we bump the stores at the end of the dev-load handler.
+                // short-circuit when we bump the stores at the end of the load-results handler.
                 window.__lastTrackVersion = tv;
                 window.__lastWaveVersion  = wv;
                 // Zoom-to-fit using the server-supplied bbox.
@@ -4146,7 +4348,7 @@ function(n) {
                 }
             } catch (e) {
                 clearRenderStatus(0);
-                console.error('dev-load failed:', e);
+                console.error('load-results failed:', e);
             }
         };
 
@@ -4515,16 +4717,16 @@ def _sync_tide_item_from_pick(data):
     return no_update
 
 
-# Dev-load result → single combined progress overlay + zoom-to-fit, then bump stores
+# Load Results result → single combined progress overlay + zoom-to-fit, then bump stores
 # (sentinel-guarded so the per-version refresh callbacks short-circuit).
 app.clientside_callback(
     r"""
     async function(result) {
         const nu = window.dash_clientside.no_update;
         if (!result) return [nu, nu, ''];
-        if (result.error) return [nu, nu, 'Error: ' + result.error];
-        if (typeof window.__loadDevResults === 'function') {
-            await window.__loadDevResults(result);
+        if (result.error) return [nu, nu, result.error];
+        if (typeof window.__loadResults === 'function') {
+            await window.__loadResults(result);
         }
         const status = `Loaded: ${(result.n_segs||0).toLocaleString()} segments, `
                      + `${(result.n_waves||0).toLocaleString()} waves  ← ${result.source}`;
@@ -4533,8 +4735,8 @@ app.clientside_callback(
     """,
     Output('_track_version', 'data', allow_duplicate=True),
     Output('_wave_version',  'data', allow_duplicate=True),
-    Output('dev-load-status', 'children'),
-    Input('_dev_load_result', 'data'),
+    Output('load-results-status', 'children'),
+    Input('_load_result', 'data'),
     prevent_initial_call=True,
 )
 
@@ -4599,9 +4801,9 @@ app.clientside_callback(
 # Export button: enabled when _any_filter_active store is True (set by __recomputeVisibility).
 app.clientside_callback(
     r"function(active) { return !active; }",
-    Output('btn-fil-export', 'disabled'),
+    Output('btn-fil-export', 'disabled', allow_duplicate=True),
     Input('_any_filter_active', 'data'),
-    prevent_initial_call=False,
+    prevent_initial_call='initial_duplicate',
 )
 
 # Enable/disable the dependent-picker section based on AIS selection.
@@ -4744,6 +4946,12 @@ app.clientside_callback(
         const p = document.getElementById('sim-panel');
         if (p) p.style.display = 'none';
         if (window.__filterState) { window.__filterState.similar = null; }
+        if (window.__similarArmed) {
+            window.__similarArmed = false;
+            const btn = document.getElementById('btn-similar');
+            if (btn) { btn.textContent = 'Select one representative track'; btn.style.opacity = ''; }
+            if (typeof window.__updateDeckCursor === 'function') window.__updateDeckCursor();
+        }
         if (typeof window.__recomputeVisibility === 'function') window.__recomputeVisibility();
         return 'Similar filter cleared';
     }
