@@ -4857,23 +4857,31 @@ app.clientside_callback(
 # Export button click → show destination form on first click, POST on second click.
 app.clientside_callback(
     r"""
-    async function(n, n_apply, dest, workdir, sel_ais) {
+    async function(n, n_apply, dest, workdir, sel_ais, wd_options) {
         const nu = window.dash_clientside.no_update;
         const showForm = {'display': 'block'};
         const hideForm = {'display': 'none'};
-        if (!n && !n_apply) return [nu, nu, nu];
+        if (!n && !n_apply) return [nu, nu, nu, nu];
         const cleanDest = (dest || '').trim();
         if (!cleanDest) {
-            // First click or no name yet: reveal the folder input.
-            return ['Enter a destination folder name above', nu, showForm];
+            // First click or no name yet: reveal the folder input with a default name.
+            const defaultName = workdir
+                ? workdir.split('/').filter(Boolean).pop() + '_filtered'
+                : '';
+            return ['Confirm or edit the destination folder name', nu, showForm, defaultName];
         }
         if (!workdir) {
-            return ['Pick a source workdir first', nu, showForm];
+            return ['Pick a source workdir first', nu, showForm, nu];
+        }
+        // Guard: reject immediately if the destination folder already exists.
+        const existing = (wd_options || []).map(o => o.value);
+        if (existing.includes('data/' + cleanDest)) {
+            return [`Folder "data/${cleanDest}" already exists — choose a different name.`, nu, showForm, nu];
         }
         const seg_keys = (typeof window.__getFilteredSegKeys === 'function')
             ? window.__getFilteredSegKeys() : [];
         if (seg_keys.length === 0) {
-            return ['Apply a filter first', nu, showForm];
+            return ['Apply a filter first', nu, showForm, nu];
         }
         const wave_idxs = (typeof window.__getFilteredWaveIdxs === 'function')
             ? window.__getFilteredWaveIdxs() : null;
@@ -4885,7 +4893,7 @@ app.clientside_callback(
                 { method: 'POST', headers: {'Content-Type': 'application/json'}, body });
             const j = await resp.json();
             if (!resp.ok || j.error) {
-                return [`Error: ${j.error || resp.statusText}`, nu, showForm];
+                return [`Error: ${j.error || resp.statusText}`, nu, showForm, nu];
             }
             const cp = j.copied || {};
             const cpStr = ['coastline','land','bathymetry','tide']
@@ -4894,20 +4902,22 @@ app.clientside_callback(
                       + `  tracks=${j.n_tracks}  waves=${j.n_waves}  ais=${j.n_ais}\n`
                       + `  copied  ${cpStr}`;
             // Bump the workdir rescan trigger so the new folder appears.
-            return [msg, Date.now(), hideForm];
+            return [msg, Date.now(), hideForm, nu];
         } catch (e) {
-            return [`Error: ${e.message}`, nu, showForm];
+            return [`Error: ${e.message}`, nu, showForm, nu];
         }
     }
     """,
     Output('export-status', 'children'),
     Output('_rescan_count', 'data', allow_duplicate=True),
     Output('export-dest-form', 'style'),
+    Output('inp-export-dest', 'value', allow_duplicate=True),
     Input('btn-fil-export', 'n_clicks'),
     Input('btn-export-apply', 'n_clicks'),
     State('inp-export-dest', 'value'),
     State('sel-workdir', 'value'),
     State('sel-ais', 'value'),
+    State('sel-workdir', 'options'),
     prevent_initial_call=True,
 )
 
