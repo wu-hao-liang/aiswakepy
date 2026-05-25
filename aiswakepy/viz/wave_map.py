@@ -118,7 +118,7 @@ def _plot_impact_map(
     # Add satellite basemap if contextily is available
     if HAS_CONTEXTILY:
         try:
-            ctx.add_basemap(ax, source=ctx.providers.Esri.WorldImagery, zoom=zoom, crs="EPSG:4326", attribution="")
+            ctx.add_basemap(ax, source=ctx.providers.Esri.WorldImagery, zoom=zoom, zoom_adjust=1, crs="EPSG:4326", attribution="")
         except Exception as e:
             warnings.warn(f"Basemap unavailable: {e}")
 
