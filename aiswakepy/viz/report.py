@@ -210,7 +210,7 @@ def plot_vessel_track_scatter(
 
     ax.set_xlabel("Vessel Speed (knots)")
     ax.set_ylabel("Vessel Length (m)")
-    ax.set_title("Vessel Track Statistics by Type")
+    ax.set_title("Vessel Statistics by Length, Speed, and Type")
     ax.legend(
         handles=legend_handles,
         title="Vessel Type",

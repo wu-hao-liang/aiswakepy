@@ -148,6 +148,8 @@ def _plot_impact_map(
     ax.set_title(title or label)
     ax.set_xlabel("Longitude")
     ax.set_ylabel("Latitude")
+    ax.xaxis.set_major_formatter(plt.FormatStrFormatter("%.4f"))
+    ax.yaxis.set_major_formatter(plt.FormatStrFormatter("%.4f"))
 
     Path(output_path).parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(str(output_path), dpi=150, bbox_inches="tight")
@@ -181,7 +183,7 @@ def plot_wave_height_map(
         label="Wave Height (m)",
         cmap="turbo",
         output_path=output_path,
-        title="Ship-wake Shore Impact — Wave Height",
+        title="Ship Wake Impact — Maximum Wave Height (m)",
         max_points=max_points,
         lon0=lon0, lon1=lon1, lat0=lat0, lat1=lat1,
         zoom=zoom,
@@ -214,7 +216,7 @@ def plot_wave_period_map(
         label="Wave Period (s)",
         cmap="turbo",
         output_path=output_path,
-        title="Ship-wake Shore Impact — Wave Period",
+        title="Ship Wake Impact — Wave Period (s)",
         max_points=max_points,
         lon0=lon0, lon1=lon1, lat0=lat0, lat1=lat1,
         zoom=zoom,
