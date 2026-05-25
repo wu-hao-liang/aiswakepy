@@ -35,25 +35,25 @@ _TYPE_RANGES = [
 ]
 
 _TYPE_COLORS: dict[str, str] = {
-    "Tanker":           "#1f77b4",
-    "Cargo":            "#ff7f0e",
-    "Passenger":        "#2ca02c",
-    "High Speed Craft": "#d62728",
-    "Tug":              "#9467bd",
-    "Towing":           "#8c564b",
-    "Towing (large)":   "#c49c94",
-    "Fishing":          "#e377c2",
-    "Dredger":          "#7f7f7f",
-    "Diving Ops":       "#bcbd22",
-    "Military":         "#17becf",
-    "Sailing":          "#aec7e8",
-    "Pleasure Craft":   "#ffbb78",
-    "Pilot":            "#98df8a",
-    "SAR":              "#ff9896",
-    "Port Tender":      "#c5b0d5",
-    "Law Enforcement":  "#f7b6d2",
-    "Medical":          "#dbdb8d",
-    "Other":            "#c7c7c7",
+    "Tanker":           "#0055FF",
+    "Cargo":            "#FF6600",
+    "Passenger":        "#00BB00",
+    "High Speed Craft": "#EE0000",
+    "Tug":              "#9900EE",
+    "Towing":           "#AA3300",
+    "Towing (large)":   "#CC8800",
+    "Fishing":          "#FF00BB",
+    "Dredger":          "#555555",
+    "Diving Ops":       "#BBCC00",
+    "Military":         "#00CCEE",
+    "Sailing":          "#55AAFF",
+    "Pleasure Craft":   "#FFCC00",
+    "Pilot":            "#00CC55",
+    "SAR":              "#FF6644",
+    "Port Tender":      "#BB55FF",
+    "Law Enforcement":  "#FF55AA",
+    "Medical":          "#EEDD00",
+    "Other":            "#AAAAAA",
 }
 
 
@@ -180,31 +180,44 @@ def plot_vessel_track_scatter(
         print("plot_vessel_track_scatter: no vessel points on active segments — skipping")
         return
 
+    import matplotlib.lines as mlines
+
     df_plot["_VesselType"] = df_plot["typecargo"].apply(_typecargo_to_label)
-    types_present = sorted(df_plot["_VesselType"].unique())
+    types_present = set(df_plot["_VesselType"].unique())
 
     fig, ax = plt.subplots(figsize=(10, 7))
-    for vtype in types_present:
+    for vtype, color in _TYPE_COLORS.items():
+        if vtype not in types_present:
+            continue
         mask = df_plot["_VesselType"] == vtype
         ax.scatter(
             df_plot.loc[mask, "sog"],
             df_plot.loc[mask, "length"],
-            c=_TYPE_COLORS.get(vtype, "#999999"),
-            label=vtype,
+            c=color,
             s=10,
-            alpha=0.5,
+            alpha=0.7,
             linewidths=0,
+            zorder=3,
         )
+
+    legend_handles = [
+        mlines.Line2D(
+            [], [], color=c, marker="o", linestyle="None", markersize=6, label=vt,
+            alpha=1.0 if vt in types_present else 0.3,
+        )
+        for vt, c in _TYPE_COLORS.items()
+    ]
 
     ax.set_xlabel("Vessel Speed (knots)")
     ax.set_ylabel("Vessel Length (m)")
     ax.set_title("Vessel Track Statistics by Type")
     ax.legend(
+        handles=legend_handles,
         title="Vessel Type",
         bbox_to_anchor=(1.02, 1),
         loc="upper left",
         fontsize=8,
-        markerscale=2,
+        markerscale=1,
     )
     ax.grid(True, alpha=0.3)
     fig.tight_layout()

@@ -111,7 +111,7 @@ def run_pipeline(
             f"  \u2192 {len(results['df_vessel'])} vessel events "
             f"({time.perf_counter() - t0:.1f}s)"
         )
-        _save_stage_csv(results["df_vessel"], "03_vessel")
+        _save_stage_csv(results["df_vessel"], "02_vessel")
 
     if "wave_impact" in stages:
         from aiswakepy.stages.wave_impact import compute_wave_impact
@@ -137,7 +137,7 @@ def run_pipeline(
             f"  \u2192 {len(results['df_wave_impact'])} shore impact events "
             f"({time.perf_counter() - t0:.1f}s)"
         )
-        _save_stage_csv(results["df_wave_impact"], "04_wave_impact")
+        _save_stage_csv(results["df_wave_impact"], "03_wave_impact")
 
     if "viz" in stages and "df_wave_impact" in results:
         from aiswakepy.viz.wave_map import plot_wave_height_map, plot_wave_period_map

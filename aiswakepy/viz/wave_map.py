@@ -123,11 +123,15 @@ def _plot_impact_map(
     # Coastline overlay
     try:
         coast = gpd.read_file(str(coastline_shp))
-        coast.plot(ax=ax, color="yellow", edgecolor="orange", linewidth=1.0, alpha=0.6, zorder=2)
+        coast.plot(ax=ax, color="yellow", edgecolor="orange", linewidth=1.0, alpha=0.25, zorder=2)
     except Exception:
         pass
 
     df_plot = _downsample(df_impact, coastline_shp, max_points)
+
+    vmin = 0.0
+    if vmax is None:
+        vmax = math.ceil(df_plot[value_col].max())
 
     sc = ax.scatter(
         df_plot["ShLongitude"],
@@ -136,6 +140,7 @@ def _plot_impact_map(
         cmap=cmap,
         s=5,
         alpha=0.8,
+        vmin=vmin,
         vmax=vmax,
         zorder=3,
     )
@@ -174,11 +179,10 @@ def plot_wave_height_map(
         df_impact, coastline_shp,
         value_col="WaveHeight",
         label="Wave Height (m)",
-        cmap="rainbow",
+        cmap="turbo",
         output_path=output_path,
         title="Ship-wake Shore Impact — Wave Height",
         max_points=max_points,
-        vmax=0.5,
         lon0=lon0, lon1=lon1, lat0=lat0, lat1=lat1,
         zoom=zoom,
         show=show,
@@ -208,7 +212,7 @@ def plot_wave_period_map(
         df_impact, coastline_shp,
         value_col="WavePeriod",
         label="Wave Period (s)",
-        cmap="rainbow",
+        cmap="turbo",
         output_path=output_path,
         title="Ship-wake Shore Impact — Wave Period",
         max_points=max_points,
