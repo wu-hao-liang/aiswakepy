@@ -18,6 +18,8 @@ try:
 except ImportError:
     HAS_CONTEXTILY = False
 
+from mpl_toolkits.axes_grid1 import make_axes_locatable
+
 
 def _downsample(
     df_impact: pd.DataFrame,
@@ -144,7 +146,9 @@ def _plot_impact_map(
         vmax=vmax,
         zorder=3,
     )
-    plt.colorbar(sc, ax=ax, label=label)
+    divider = make_axes_locatable(ax)
+    cax = divider.append_axes("right", size="3%", pad=0.08)
+    fig.colorbar(sc, cax=cax, label=label)
     ax.set_title(title or label)
     ax.set_xlabel("Longitude")
     ax.set_ylabel("Latitude")

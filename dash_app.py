@@ -1768,13 +1768,21 @@ app.layout = html.Div([
                                   'copies into a new data/ subfolder'),
             ], className='row-buttons'),
             html.Div(id='export-dest-form', style={'display': 'none'}, children=[
-                dcc.Input(id='inp-export-dest', type='text',
-                          placeholder='new folder name (under data/)',
-                          debounce=False,
-                          style={'fontSize': '10px', 'width': '100%',
-                                 'padding': '3px 6px', 'marginTop': '4px',
-                                 'border': '1px solid #c8d4e0', 'borderRadius': '3px',
-                                 'boxSizing': 'border-box'}),
+                html.Div([
+                    dcc.Input(id='inp-export-dest', type='text',
+                              placeholder='new folder name (under data/)',
+                              debounce=False,
+                              style={'fontSize': '10px', 'flex': '1',
+                                     'padding': '3px 6px',
+                                     'border': '1px solid #c8d4e0', 'borderRadius': '3px',
+                                     'boxSizing': 'border-box', 'minWidth': '0'}),
+                    html.Button('Apply', id='btn-export-apply', n_clicks=0,
+                                style={'fontSize': '10px', 'marginLeft': '4px',
+                                       'padding': '3px 8px', 'background': '#4a85b5',
+                                       'color': 'white', 'border': '1px solid #3a75a5',
+                                       'borderRadius': '3px', 'cursor': 'pointer',
+                                       'whiteSpace': 'nowrap', 'flexShrink': '0'}),
+                ], style={'display': 'flex', 'alignItems': 'center', 'marginTop': '4px'}),
             ]),
             html.Div('', id='export-status',
                      style={'fontSize': '10px', 'color': '#556', 'marginTop': '3px',
@@ -4849,11 +4857,11 @@ app.clientside_callback(
 # Export button click → show destination form on first click, POST on second click.
 app.clientside_callback(
     r"""
-    async function(n, dest, workdir, sel_ais) {
+    async function(n, n_apply, dest, workdir, sel_ais) {
         const nu = window.dash_clientside.no_update;
         const showForm = {'display': 'block'};
         const hideForm = {'display': 'none'};
-        if (!n) return [nu, nu, nu];
+        if (!n && !n_apply) return [nu, nu, nu];
         const cleanDest = (dest || '').trim();
         if (!cleanDest) {
             // First click or no name yet: reveal the folder input.
@@ -4896,6 +4904,7 @@ app.clientside_callback(
     Output('_rescan_count', 'data', allow_duplicate=True),
     Output('export-dest-form', 'style'),
     Input('btn-fil-export', 'n_clicks'),
+    Input('btn-export-apply', 'n_clicks'),
     State('inp-export-dest', 'value'),
     State('sel-workdir', 'value'),
     State('sel-ais', 'value'),
