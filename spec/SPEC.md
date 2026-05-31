@@ -1,9 +1,9 @@
 # Implementation Spec — ShipwakeAIS Python Rewrite
 
 **Based on**: PRD.md
-**Status**: ✅ All 12 steps complete
-**Last reviewed**: 2026-05-09
-**Tests**: 145 passing on master
+**Status**: ✅ All 12 steps complete; post-v1 evolution documented below
+**Last reviewed**: 2026-05-28
+**Tests**: 142 passed, 2 skipped (on `feature/dash-interactive-app`)
 
 ---
 
@@ -15,21 +15,25 @@
 | 1 | `aiswakepy/config.py` | ✅ done | Pydantic v2; loads from JSON file/string/dict |
 | 2 | `aiswakepy/geo/geodesy.py` | ✅ done | `geodetic_distance`, `geodetic_bearing`, `forward_point` (scalar + array) |
 | 3 | `aiswakepy/vessel/block_coeff.py` | ✅ done | All three methods (`L_Le`, `B_Le`, `table`) + `ShipDataEDnew.csv` |
-| 4 | `aiswakepy/stages/filter.py` | ✅ done **(expanded)** | Now **12 steps** (originally planned 6): added `deduplicate`, `uniformize_vessel_info`, `remove_zero_dimensions`, `remove_invalid_draught`, `clean_error_coords` (kinematic check), `clean_error_speed` (acceleration check), `filter_study_area` |
-| 5 | `aiswakepy/stages/depth.py` + `aiswakepy/geo/bathymetry.py` | ✅ done | mikeio mesh + KDTree + tide snap + under-keel filter |
+| 4 | `aiswakepy/stages/filter.py` | ✅ done **(expanded + depth folded in)** | Now **13 sub-steps**: original 12-step AIS filter plus under-keel clearance check at the tail (see Step 4 detail) |
+| 5 | `aiswakepy/stages/depth.py` + `aiswakepy/geo/bathymetry.py` | ✅ done **(merged into Step 4)** | `depth.py` still exists as a utility module (`assign_depth`); no longer a standalone pipeline stage — called from `filter_ais()` tail |
 | 6 | `aiswakepy/stages/vessel.py` | ✅ done **(renamed)** | Originally planned as `wave_params.py`; now `vessel.py`. Wave physics (Theta, T, WakeDir) computed here |
 | 7 | `aiswakepy/geo/coastline.py` | ✅ done | Includes STRtree builder (per Step 12 fix #4) |
 | 8 | `aiswakepy/stages/wave_impact.py` | ✅ done **(renamed)** | Originally planned as `shore_impact.py`; now `wave_impact.py`. Computes per-point impact + ray-coastline intersection |
-| 9 | `aiswakepy/viz/wave_map.py` + `aiswakepy/viz/vessel_diagram.py` | ✅ done | Both modules present |
-| 10 | `aiswakepy/pipeline.py` + `main.py` + `run_shipwake.ipynb` + `run_shipwake_record.ipynb` | ✅ done | `run_pipeline()` orchestrator, CLI, two notebooks |
+| 9 | `aiswakepy/viz/wave_map.py` + `aiswakepy/viz/vessel_diagram.py` + `aiswakepy/viz/report.py` | ✅ done **(extended)** | `report.py` added post-v1: report-quality maps, `top_vessels_table`, `plot_vessel_track_scatter` |
+| 10 | `aiswakepy/pipeline.py` + `main.py` + `run_shipwake.ipynb` + `run_shipwake_record.ipynb` + `dash_app.py` | ✅ done **(extended)** | Pipeline now 3 stages (filter+depth, vessel, wave_impact); Dash interactive app added post-v1 |
 | 11 | `validate_pipeline.py` | ✅ done | End-to-end validation script vs MATLAB outputs (see `tests/validation_report.md` if generated) |
-| 12 | (multiple) | ✅ done | All 6 fixes complete. Fix 6 uses plain `print()` for status (not `rich.console.Console`) — vectorised stages have no per-row progress to render, so `print()` is the right granularity. See `docs/PERFORMANCE.md` |
+| 12 | (multiple) | ✅ done | All 6 fixes complete. Fix 6 uses plain `print()` for status — vectorised stages have no per-row progress. See `docs/PERFORMANCE.md` |
 
 **Architecture differences from original plan** (intentional, post-implementation evolution):
+- Stage 5 (`depth.py`) merged into the tail of `filter_ais()` — the under-keel check runs on the final interpolated frame; `depth.py` retained as a callable utility.
+- Pipeline reduced from 4 runtime stages to **3**: `filter` (includes depth), `vessel`, `wave_impact`. Stage CSV names renumbered: `01_filtered`, `02_vessel`, `03_wave_impact`.
 - Stage 6 file renamed `wave_params.py` → `vessel.py` (better reflects content: vessel-derived parameters).
 - Stage 8 file renamed `shore_impact.py` → `wave_impact.py` (impact is along the propagation path, not only at shore).
-- Stage 4 expanded from 6 to 12 sub-steps to handle real AIS data quality issues (GPS spikes, acceleration anomalies, duplicate fixes, vessel-info inconsistency, draught misreports).
+- Stage 4 expanded from 6 to 12 AIS sub-steps + 1 depth sub-step (13 total) to handle real data quality issues.
 - New `aiswakepy/comparison/ossi.py` module added (not in original plan) for OSSI gauge data matching.
+- New `aiswakepy/viz/report.py` module added (not in original plan) for report-quality plots and top-vessel tables.
+- New `dash_app.py` interactive application added (not in original plan) — see Step 10 for details.
 
 ---
 
@@ -74,9 +78,9 @@ Three methods (`L_Le` default, `B_Le`, `table`) with unified interface. `ShipDat
 
 ---
 
-## Step 4: AIS Filtering & Interpolation (`aiswakepy/stages/filter.py`) ✅ (expanded)
+## Step 4: AIS Filtering + Depth Check (`aiswakepy/stages/filter.py`) ✅ (expanded)
 
-**Originally planned** 6 sub-steps; **actual** 12-step pipeline (driven by real AIS data quality):
+**Originally planned** 6 sub-steps; **actual** 13 sub-steps (12 AIS cleaning steps + 1 depth check at the tail):
 
 | # | Function | Purpose |
 |---|----------|---------|
@@ -84,21 +88,23 @@ Three methods (`L_Le` default, `B_Le`, `table`) with unified interface. `ShipDat
 | 2 | `deduplicate` | Drop duplicate (mmsi, obstime) — prevents dt=0 |
 | 3 | `uniformize_vessel_info` | Mode-fill width/length/typecargo per MMSI |
 | 4 | `remove_zero_dimensions` | Drop width/length/draught ≤ 0 |
-| 5 | `remove_invalid_draught` | Drop draught > beam (NEW, post-PRD-v1) |
+| 5 | `remove_invalid_draught` | Drop draught > beam |
 | 6 | `segment_trajectories` | Split on time gaps > `traj_gap_s` |
 | 7 | `clean_error_coords` | Kinematic Consistency Check (GPS spike removal) |
 | 8 | `clean_error_speed` | Acceleration Check (replace bad SOG/COG) |
-| 9 | `validate_speed` | `SOG = min(reported, geodetic-derived)` (vectorised, Step 12 fix #1) |
-| 10 | `interpolate_trajectories` | Cubic Hermite Spline (vectorised, Step 12 fix #3) |
+| 9 | `validate_speed` | `SOG = min(reported, geodetic-derived)` (vectorised) |
+| 10 | `interpolate_trajectories` | Cubic Hermite Spline (vectorised) |
 | 11 | `filter_study_area` | Optional polygon clip |
-| 12 | `mask_land` | Remove land points (vectorised, Step 12 fix #2) |
+| 12 | `mask_land` | Remove land points (vectorised) |
+| 13 | `assign_depth` (from `depth.py`) | Bathy + tide → WaterDepth; under-keel filter on final interpolated frame |
+
+The depth check is intentionally at the tail so pre-interpolation points with uncertain draught still constrain the spline; only the final dense frame is checked against bathymetry.
 
 ---
 
-## Step 5: Bathymetry & Tidal Depth ✅
+## Step 5: Bathymetry & Tidal Depth — merged into Step 4 ✅
 
-- `aiswakepy/geo/bathymetry.py`: `load_bathymetry`, `get_depth` (KDTree, parallel queries).
-- `aiswakepy/stages/depth.py`: `assign_depth` — bathy + tide + under-keel filter.
+`aiswakepy/geo/bathymetry.py` provides `load_bathymetry`, `load_tide`, `snap_to_tide`, `get_depth` (KDTree, parallel queries). `aiswakepy/stages/depth.py` retains `assign_depth()` as a callable utility; it is no longer invoked as a standalone pipeline stage — `filter_ais()` calls it directly at sub-step 13 when `bathy_path` is provided.
 
 ---
 
@@ -121,19 +127,27 @@ Three methods (`L_Le` default, `B_Le`, `table`) with unified interface. `ShipDat
 
 ---
 
-## Step 9: Visualisation ✅
+## Step 9: Visualisation ✅ (extended)
 
-- `aiswakepy/viz/wave_map.py`: `plot_wave_height_map`, `plot_wave_period_map`, with coastline-binned top-N (Step 12 fix #5).
+- `aiswakepy/viz/wave_map.py`: `plot_wave_height_map`, `plot_wave_period_map`. Turbo colormap, `vmin=0`, `vmax=ceil(max)`, colorbar matched to axes height via `make_axes_locatable`, coastline-binned top-N downsampling.
 - `aiswakepy/viz/vessel_diagram.py`: per-vessel wake diagrams.
+- `aiswakepy/viz/report.py` *(added post-v1)*: report-quality wrappers `plot_wave_height_report` / `plot_wave_period_report` (auto-fitted extent), `top_vessels_table` (top-N vessels by peak shore height), `plot_vessel_track_scatter` (speed vs length coloured by vessel type, full 19-category fixed-colour legend).
 
 ---
 
-## Step 10: Pipeline Orchestration & Notebook ✅
+## Step 10: Pipeline Orchestration, Notebook & Dash App ✅ (extended)
 
-- `aiswakepy/pipeline.py`: `run_pipeline(config, stages=None)` orchestrator.
+- `aiswakepy/pipeline.py`: `run_pipeline(config, stages=None)` orchestrator. **Three runtime stages** (filter+depth, vessel, wave_impact). Stage CSV names: `01_filtered.csv`, `02_vessel.csv`, `03_wave_impact.csv`.
 - `main.py`: CLI entry — `uv run python main.py --config config.json`.
-- `run_shipwake.ipynb`: primary analysis notebook (extensively expanded for empirical formula comparison and regression analysis).
-- `run_shipwake_record.ipynb`: clean pipeline record notebook (added 2026-05).
+- `run_shipwake.ipynb`: primary analysis notebook (empirical formula comparison, regression analysis).
+- `run_shipwake_record.ipynb`: clean pipeline record notebook.
+- `dash_app.py` *(added post-v1)*: Dash + deck.gl interactive web application. Features:
+  - Pipeline runner (filter → vessel → wave_impact) with per-stage progress log
+  - Satellite basemap (Esri WorldImagery) with vessel tracks, wave scatter, and coastline overlay
+  - Spatial filters: freehand polygon, drag-box, wave-arrival box
+  - Attribute filters: vessel type multi-select, MMSI, track similarity
+  - Export filtered: saves rerun-ready dataset (AIS subset, tracks, waves, copied input files) to a new `data/` subfolder; default name `<workdir>_filtered`; guard against overwriting existing folders
+  - Report plots generated on export: wave height map, wave period map, vessel track scatter, top-10 vessels CSV
 
 ---
 
@@ -171,12 +185,11 @@ Step 0: Scaffolding
   │
   ├→ Step 2: Geodesy
   │    │
-  │    ├→ Step 4: AIS Filter (uses geodesy for distance)
+  │    ├→ Step 4: AIS Filter + Depth check (13 sub-steps)
+  │    │    │      [Step 5 depth utility called at sub-step 13]
   │    │    │
-  │    │    └→ Step 5: Depth
+  │    │    └→ Step 6: Vessel Params (vessel.py)
   │    │         │
-  │    │         └→ Step 6: Wave Params (vessel.py)
-  │    │              │
   │    ├→ Step 7: Coastline (uses geodesy for rays)
   │    │    │
   │    │    └→ Step 8: Wave Impact (wave_impact.py)
@@ -185,7 +198,7 @@ Step 0: Scaffolding
   │
   ├→ Step 9: Visualisation (uses wave impact output)
   │
-  └→ Step 10: Pipeline + Notebook
+  └→ Step 10: Pipeline + Notebook + Dash App
        │
        └→ Step 11: Validation
        │
