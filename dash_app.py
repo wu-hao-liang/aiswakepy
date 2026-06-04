@@ -1073,6 +1073,7 @@ INDEX_TEMPLATE = """<!DOCTYPE html>
 app = Dash(__name__, suppress_callback_exceptions=True, update_title=None)
 app.title = 'aiswakepy'
 app.index_string = INDEX_TEMPLATE
+server = app.server
 
 
 # ---------------------------------------------------------------------------

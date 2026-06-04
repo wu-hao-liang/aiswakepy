@@ -1,0 +1,11 @@
+services:
+  aiswakepy:
+    build: .
+    command: .venv/bin/python dash_app.py
+    ports:
+      - "8050:8050"
+    volumes:
+      - ./data:/app/data
+      - ./output:/app/output
+      - ./server_config.json:/app/server_config.json:ro
+    restart: unless-stopped
