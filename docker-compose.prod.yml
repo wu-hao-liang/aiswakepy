@@ -1,17 +1,28 @@
 services:
   aiswakepy:
     build: .
+    env_file:
+      - .env
     ports:
-      - "8050:8050"
+      - "${PORT:-8050}:8050"
     environment:
-      GUNICORN_WORKERS: "2"
-      GUNICORN_THREADS: "4"
-      GUNICORN_TIMEOUT: "300"
+      GUNICORN_WORKERS: "${GUNICORN_WORKERS:-1}"
+      GUNICORN_THREADS: "${GUNICORN_THREADS:-4}"
+      GUNICORN_TIMEOUT: "${GUNICORN_TIMEOUT:-300}"
     volumes:
-      - aiswakepy-data:/app/data
+      - "${HOST_DATA_DIR:-/opt/apps/aiswakepy/data}:/data"
       - aiswakepy-output:/app/output
+    healthcheck:
+      test:
+        - CMD
+        - .venv/bin/python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8050/', timeout=10)"
+      interval: 30s
+      timeout: 15s
+      retries: 3
+      start_period: 30s
     restart: unless-stopped
 
 volumes:
-  aiswakepy-data:
   aiswakepy-output:

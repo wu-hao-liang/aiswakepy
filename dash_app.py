@@ -308,14 +308,48 @@ DATA_UNC_ROOT: str = _srv_cfg.get('data_unc_root', '')
 # ---------------------------------------------------------------------------
 # Data directory inventory
 # ---------------------------------------------------------------------------
-DATA_ROOT = REPO / 'data'
-DATA_ROOT.mkdir(exist_ok=True)
+_data_root_value = os.environ.get('DATA_ROOT') or _srv_cfg.get('data_root') or 'data'
+DATA_ROOT = Path(_data_root_value).expanduser()
+if not DATA_ROOT.is_absolute():
+    DATA_ROOT = REPO / DATA_ROOT
+DATA_ROOT.mkdir(parents=True, exist_ok=True)
+
+
+def _data_path_value(path: Path) -> str:
+    """Return a stable UI path rooted at data/, independent of DATA_ROOT."""
+    return f"data/{path.relative_to(DATA_ROOT).as_posix()}"
+
+
+def _safe_app_path(value: str, *, must_exist: bool = True) -> Path:
+    """Resolve a UI path under either DATA_ROOT or the repository root."""
+    if not value:
+        raise ValueError('empty path')
+    rel = Path(value)
+    if rel.is_absolute():
+        raise ValueError(f'absolute path not allowed: {value!r}')
+
+    parts = rel.parts
+    if parts and parts[0] == 'data':
+        root = DATA_ROOT.resolve()
+        suffix = Path(*parts[1:])
+    else:
+        root = REPO.resolve()
+        suffix = rel
+
+    resolved = (root / suffix).resolve()
+    try:
+        resolved.relative_to(root)
+    except ValueError:
+        raise ValueError(f'path {value!r} escapes its allowed root')
+    if must_exist and not resolved.exists():
+        raise FileNotFoundError(value)
+    return resolved
 
 
 def _scan_data_subdirs() -> list[dict]:
     """Return working-directory dropdown options from data/ subdirectories."""
     dirs = sorted(
-        p.relative_to(REPO).as_posix()
+        _data_path_value(p)
         for p in DATA_ROOT.iterdir() if p.is_dir()
     )
     return [{'label': d, 'value': d} for d in dirs]
@@ -336,10 +370,10 @@ def _scan_working_dir(workdir: str | None) -> dict:
     empty = {'ais': [], 'bathymetry': [], 'coastline': [], 'land': [], 'tide': []}
     if not workdir:
         return empty
-    base = REPO / workdir
+    base = _safe_app_path(workdir, must_exist=False)
     if not base.exists():
         return empty
-    rel = lambda p: p.relative_to(REPO).as_posix()
+    rel = _data_path_value
     return {
         'ais':        sorted(rel(p) for p in (base / 'ais').glob('*.csv')),
         'bathymetry': sorted(rel(p) for ext in ('mesh', 'dfs2', 'dfsu')
@@ -1075,6 +1109,17 @@ app.title = 'aiswakepy'
 app.index_string = INDEX_TEMPLATE
 server = app.server
 
+UPLOAD_FOLDER = Path(os.environ.get('UPLOAD_FOLDER', DATA_ROOT / 'uploads')).expanduser()
+if not UPLOAD_FOLDER.is_absolute():
+    UPLOAD_FOLDER = REPO / UPLOAD_FOLDER
+UPLOAD_FOLDER.mkdir(parents=True, exist_ok=True)
+
+server.config.update(
+    SECRET_KEY=os.environ.get('SECRET_KEY'),
+    UPLOAD_FOLDER=str(UPLOAD_FOLDER),
+    MAX_CONTENT_LENGTH=int(os.environ.get('MAX_CONTENT_LENGTH', 50 * 1024 * 1024)),
+)
+
 
 # ---------------------------------------------------------------------------
 # Flask routes
@@ -1179,11 +1224,10 @@ def _scan_output_dirs() -> list[str]:
     if (REPO / 'output').is_dir():
         candidates.append('output')
     # data/*/output  (one level of project subdirectory)
-    data_root = REPO / 'data'
-    if data_root.is_dir():
-        for p in sorted(data_root.glob('*/output')):
+    if DATA_ROOT.is_dir():
+        for p in sorted(DATA_ROOT.glob('*/output')):
             if p.is_dir():
-                candidates.append(str(p.relative_to(REPO)).replace('\\', '/'))
+                candidates.append(_data_path_value(p))
     return candidates
 
 
@@ -1197,7 +1241,7 @@ def _load_results(directory: str) -> dict:
     global df_vessels, df_waves, IPC_VESSELS, IPC_WAVES
     global IPC_TRACK_COORDS, IPC_TRACK_META, IPC_TRACK_OFFSETS, PNG_BYTES, seg_meta
 
-    p = (REPO / directory).resolve()
+    p = _safe_app_path(directory)
     if not p.is_dir():
         raise FileNotFoundError(f'directory not found: {directory}')
 
@@ -1322,7 +1366,7 @@ def _export_filtered(body: dict) -> dict:
     base = DATA_ROOT / dest_name
     if base.exists():
         raise FileExistsError(f'destination already exists: data/{dest_name}')
-    src_root = REPO / workdir
+    src_root = _safe_app_path(workdir)
     if not src_root.is_dir():
         raise FileNotFoundError(f'source workdir not found: {workdir}')
 
@@ -1429,27 +1473,10 @@ def _r_export_filtered():
         return jsonify({'error': str(e)}), 500
 
 
-def _safe_repo_path(rel: str) -> Path:
-    """Resolve a user-supplied relative path to an absolute path under REPO,
-    raising if it tries to escape the repo root (defence against path traversal).
-    Uses normpath rather than resolve so symlinked subdirectories (e.g. data/)
-    are allowed — resolve() would follow the symlink outside the repo root."""
-    if not rel:
-        raise ValueError('empty path')
-    norm = Path(os.path.normpath(REPO / rel))
-    try:
-        norm.relative_to(REPO)
-    except ValueError:
-        raise ValueError(f'path {rel!r} escapes repo root')
-    if not norm.exists():
-        raise FileNotFoundError(rel)
-    return norm
-
-
 @app.server.route('/api/preview/ais.arrow')
 def _r_preview_ais():
     try:
-        p = _safe_repo_path(request.args.get('path', ''))
+        p = _safe_app_path(request.args.get('path', ''))
         return _bytes_response(_preview_ais_arrow(p))
     except Exception as exc:
         return jsonify(error=str(exc)), 400
@@ -1458,7 +1485,7 @@ def _r_preview_ais():
 @app.server.route('/api/preview/ais.bbox')
 def _r_preview_ais_bbox():
     try:
-        p = _safe_repo_path(request.args.get('path', ''))
+        p = _safe_app_path(request.args.get('path', ''))
         return jsonify(_preview_ais_bbox(p))
     except Exception as exc:
         return jsonify(error=str(exc)), 400
@@ -1467,7 +1494,7 @@ def _r_preview_ais_bbox():
 @app.server.route('/api/preview/coast.geojson')
 def _r_preview_coast():
     try:
-        p = _safe_repo_path(request.args.get('path', ''))
+        p = _safe_app_path(request.args.get('path', ''))
         return jsonify(_preview_coast_geojson(p))
     except Exception as exc:
         return jsonify(error=str(exc)), 400
@@ -1486,7 +1513,7 @@ def _parse_bbox(bbox_str: str) -> tuple | None:
 @app.server.route('/api/preview/bathy.arrow')
 def _r_preview_bathy():
     try:
-        p = _safe_repo_path(request.args.get('path', ''))
+        p = _safe_app_path(request.args.get('path', ''))
         bbox = _parse_bbox(request.args.get('bbox', ''))
         result = _preview_bathy_arrow(p, bbox)
         if result is None:
@@ -1500,7 +1527,7 @@ def _r_preview_bathy():
 @app.server.route('/api/preview/bathy_offsets.arrow')
 def _r_preview_bathy_offsets():
     try:
-        p = _safe_repo_path(request.args.get('path', ''))
+        p = _safe_app_path(request.args.get('path', ''))
         bbox = _parse_bbox(request.args.get('bbox', ''))
         result = _preview_bathy_arrow(p, bbox)
         if result is None:
@@ -2061,7 +2088,7 @@ def _rescan_workdir(_, count):
 def _update_unc_display(workdir, _rescan):
     if not workdir or not DATA_UNC_ROOT:
         return '', ''
-    subdir = workdir.removeprefix(f'{DATA_ROOT.name}/')
+    subdir = workdir.removeprefix('data/')
     unc = DATA_UNC_ROOT.rstrip('\\') + '\\' + subdir.replace('/', '\\')
     return unc, 'visible'
 
@@ -2151,11 +2178,16 @@ def _build_config(ais, land, bathy, coast, tide, tide_item=None,
                  'max_bf': float(max_bf or 0.4)},
         'impact': {'max_propagation_m': float(max_prop or 2000.0),
                    'wake_cutoff_m': float(wake_cutoff or 0.01)},
-        'output': {'directory': f'{workdir}/output/' if workdir else 'output/',
+        'output': {'directory': str(_safe_app_path(f'{workdir}/output', must_exist=False))
+                   if workdir else str(REPO / 'output'),
                    'save_stage_csv': True},
     }
+    cfg['ais']['raw_csv'] = str(_safe_app_path(ais)) if ais else ais
+    cfg['ais']['land_shp'] = str(_safe_app_path(land)) if land else land
+    cfg['bathymetry']['source'] = str(_safe_app_path(bathy)) if bathy else 'placeholder.mesh'
+    cfg['coastline']['shapefile'] = str(_safe_app_path(coast)) if coast else coast
     if tide:
-        cfg['bathymetry']['tide_dfs0'] = tide
+        cfg['bathymetry']['tide_dfs0'] = str(_safe_app_path(tide))
         if tide_item:
             cfg['bathymetry']['tide_item'] = tide_item
     return cfg
@@ -2360,7 +2392,7 @@ def _populate_tide_items(path):
     if not path:
         return [], None, []
     try:
-        data = _preview_tide(REPO / path)
+        data = _preview_tide(_safe_app_path(path))
         opts, items_meta = [], []
         for it in data['items']:
             rng = ''
@@ -2400,7 +2432,7 @@ def load_results_click(n, workdir):
     if not n or not workdir:
         return no_update, no_update
     directory = f'{workdir}/output'
-    out_path = REPO / directory
+    out_path = _safe_app_path(directory, must_exist=False)
     if not (out_path / 'vessels.parquet').exists():
         return {'error': 'Cannot find results — run Calculate Waves first'}, False
     try:

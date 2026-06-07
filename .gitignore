@@ -16,6 +16,11 @@ env/
 # uv
 .python-version
 
+# Local environment
+.env
+.env.*
+!.env.example
+
 # Jupyter
 .ipynb_checkpoints/
 *.ipynb_checkpoints/

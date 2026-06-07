@@ -1,3 +1,4 @@
 {
-  "data_unc_root": "\\\\sg-ncr04\\Projects\\aiswakepy\\data"
+  "data_root": "data",
+  "data_unc_root": ""
 }

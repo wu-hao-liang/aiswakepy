@@ -4,6 +4,9 @@
 .claude/
 .mcp.json
 .playwright-mcp/
+.env
+.env.*
+!.env.example
 
 .venv/
 __pycache__/
