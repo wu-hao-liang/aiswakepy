@@ -1646,7 +1646,7 @@ app.layout = html.Div([
                            'lineHeight': '1.4', 'height': '26px', 'boxSizing': 'border-box'}),
         html.Span('', id='load-results-status',
                   style={'fontSize': '11px', 'color': '#c44', 'marginLeft': '2px'}),
-        html.Div('AISWAKEPY', id='banner-title'),
+        html.Div('AISWAKEPY_PUBLIC', id='banner-title'),
         html.Div([
             html.Span(id='ais-time-range', style={'color': '#558', 'marginRight': '4px'}),
             html.Span(id='cnt-vessels', children=f'vessels {len(df_vessels):,}'),
