@@ -1,0 +1,51 @@
+name: CI/CD Deploy
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test-build-deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Create CI environment file
+        run: cp .env.example .env
+
+      - name: Validate Docker Compose config
+        run: |
+          docker compose -f docker-compose.prod.yml config
+
+      - name: Build production image in CI
+        run: |
+          docker compose -f docker-compose.prod.yml build
+
+      - name: Deploy to VPS
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USER }}
+          key: ${{ secrets.VPS_SSH_KEY }}
+          script: |
+            set -e
+            cd /opt/apps/aiswakepy
+            git fetch origin main
+            git reset --hard origin/main
+            docker compose -f docker-compose.prod.yml up -d --build
+            docker compose -f docker-compose.prod.yml ps
+            for attempt in $(seq 1 12); do
+              if curl -fsS http://127.0.0.1:8050 > /dev/null; then
+                exit 0
+              fi
+              sleep 5
+            done
+            docker compose -f docker-compose.prod.yml logs --tail=100 aiswakepy
+            exit 1
