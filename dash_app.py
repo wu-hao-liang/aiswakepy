@@ -14,6 +14,9 @@ import shutil
 import sys
 import threading
 import time
+import uuid
+import zipfile
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import datashader as ds
@@ -23,7 +26,8 @@ import pandas as pd
 import pyarrow as pa
 import pyarrow.ipc as ipc
 from dash import Dash, dcc, html, Input, Output, State, no_update
-from flask import Response, jsonify, request
+from flask import Response, jsonify, request, send_file
+from werkzeug.utils import secure_filename
 
 from aiswakepy.config import load_config
 from aiswakepy.pipeline import run_pipeline
@@ -47,18 +51,18 @@ PREVIEW_AIS_MAX_POINTS = 5000          # subsample raw AIS to this many points f
 PREVIEW_BATHY_MAX_TRIANGLES = 500000    # cap mesh element count for preview
 
 # ---------------------------------------------------------------------------
-# Module-level caches (mutated by _build_* helpers and the pipeline thread)
+# Empty runtime templates
 # ---------------------------------------------------------------------------
-df_vessels: pd.DataFrame
-df_waves: pd.DataFrame
-seg_meta: list[dict] = []
-IPC_VESSELS: bytes = b''
-IPC_WAVES: bytes = b''
-IPC_TRACK_COORDS: bytes = b''
-IPC_TRACK_META: bytes = b''
-IPC_TRACK_OFFSETS: bytes = b''
-PNG_BYTES: bytes = b''
-LAST_RESULTS: dict = {}                # {'df_filtered': df, 'df_vessel': df, ...}
+VESSEL_COLUMNS = [
+    'mmsi', 'longitude', 'latitude', 'sog', 'cog', 'typecargo',
+    'segment_id', 'obstime', 'width', 'length', 'draught',
+]
+WAVE_COLUMNS = [
+    'ShLongitude', 'ShLatitude', 'MMSI', 'WaveHeight', 'WavePeriod',
+    'Side', 'DistLoc_km', 'SOG', 'VesselLength', 'VesselWidth',
+    'DateTime', 'VesselLongitude', 'VesselLatitude',
+    'segment_id', 'VesselDraught', 'VesselCOG',
+]
 
 
 def _ipc(table: pa.Table) -> bytes:
@@ -95,15 +99,12 @@ def _ensure_vessel_columns(df_w: pd.DataFrame, df_v: pd.DataFrame) -> pd.DataFra
     return out
 
 
-def _build_vessel_caches(df_v: pd.DataFrame) -> None:
+def _build_vessel_caches(state: 'SessionState', df_v: pd.DataFrame) -> None:
     """(Re)compute vessel Arrow + track-segment Arrow + datashader PNG.
 
     Vectorised segment encoding: sort by (mmsi, segment_id), use np.diff to find
     boundaries, then build flat coords + offsets without a Python-level groupby loop.
     """
-    global df_vessels, seg_meta
-    global IPC_VESSELS, IPC_TRACK_COORDS, IPC_TRACK_META, IPC_TRACK_OFFSETS, PNG_BYTES
-
     print('  casting types...')
     df_v = df_v.astype({
         'mmsi': 'int64', 'segment_id': 'int32', 'typecargo': 'float32',
@@ -111,7 +112,7 @@ def _build_vessel_caches(df_v: pd.DataFrame) -> None:
         'sog': 'float32', 'cog': 'float32',
         'width': 'float32', 'length': 'float32', 'draught': 'float32',
     }, errors='ignore')
-    df_vessels = df_v
+    state.df_vessels = df_v
 
     print(f'  encoding vessel Arrow ({len(df_v):,} rows)...')
     _obstime_ns = df_v['obstime'].to_numpy(dtype='datetime64[ns]').astype(np.int64) if 'obstime' in df_v.columns else np.zeros(len(df_v), dtype=np.int64)
@@ -124,7 +125,7 @@ def _build_vessel_caches(df_v: pd.DataFrame) -> None:
         'typecargo': pa.array(df_v['typecargo'].to_numpy(dtype=np.float32) if 'typecargo' in df_v.columns else np.full(len(df_v), np.nan, dtype=np.float32), type=pa.float32()),
         'obstime':   pa.array(_obstime_ns, type=pa.int64()),
     })
-    IPC_VESSELS = _ipc(arrow_vessels)
+    state.ipc_vessels = _ipc(arrow_vessels)
 
     print('  building track segments (vectorised)...')
     if len(df_v) == 0:
@@ -178,8 +179,8 @@ def _build_vessel_caches(df_v: pd.DataFrame) -> None:
             type_arr = df_sorted['typecargo'].fillna(-1).to_numpy(dtype=np.float32) if 'typecargo' in df_sorted.columns else np.full(len(df_sorted), -1.0)
             meta_type = type_arr[kept_starts].astype(np.int32)
 
-    seg_meta = [{'mmsi': int(m), 'segment_id': int(s), 'n_points': int(n)}
-                for m, s, n in zip(meta_mmsi, meta_seg, meta_n)]
+    state.seg_meta = [{'mmsi': int(m), 'segment_id': int(s), 'n_points': int(n)}
+                      for m, s, n in zip(meta_mmsi, meta_seg, meta_n)]
     arrow_coords = pa.table({
         'lon':      pa.array(flat_arr[:, 0], type=pa.float32()),
         'lat':      pa.array(flat_arr[:, 1], type=pa.float32()),
@@ -194,9 +195,9 @@ def _build_vessel_caches(df_v: pd.DataFrame) -> None:
         'typecargo':  pa.array(meta_type,                  type=pa.int32()),
     })
     arrow_offsets = pa.table({'offset': pa.array(offsets_arr, type=pa.int32())})
-    IPC_TRACK_COORDS = _ipc(arrow_coords)
-    IPC_TRACK_META = _ipc(arrow_meta)
-    IPC_TRACK_OFFSETS = _ipc(arrow_offsets)
+    state.ipc_track_coords = _ipc(arrow_coords)
+    state.ipc_track_meta = _ipc(arrow_meta)
+    state.ipc_track_offsets = _ipc(arrow_offsets)
 
     print('  rasterising vessel density...')
     canvas = ds.Canvas(plot_width=RASTER_W, plot_height=RASTER_H,
@@ -206,7 +207,7 @@ def _build_vessel_caches(df_v: pd.DataFrame) -> None:
     img = tf.shade(agg, cmap=['#330033', '#ff6600', '#ffff80'], how='log')
     buf = io.BytesIO()
     img.to_pil().save(buf, format='PNG')
-    PNG_BYTES = buf.getvalue()
+    state.png_bytes = buf.getvalue()
 
 
 def _write_wave_track_link(df_w: pd.DataFrame, out_dir: Path) -> None:
@@ -224,10 +225,8 @@ def _write_wave_track_link(df_w: pd.DataFrame, out_dir: Path) -> None:
     link.to_csv(out_dir / 'wave_track_link.csv', index=False)
 
 
-def _build_wave_caches(df_w: pd.DataFrame) -> None:
+def _build_wave_caches(state: 'SessionState', df_w: pd.DataFrame) -> None:
     """(Re)compute the wave Arrow with the full enriched schema."""
-    global df_waves, IPC_WAVES
-
     cast = {
         'ShLongitude': 'float32', 'ShLatitude': 'float32',
         'VesselLongitude': 'float32', 'VesselLatitude': 'float32',
@@ -253,8 +252,8 @@ def _build_wave_caches(df_w: pd.DataFrame) -> None:
     df_w['DateTime'] = df_w['DateTime'].astype(str)
     df_w['Side'] = df_w['Side'].astype(str)
 
-    df_waves = df_w
-    IPC_WAVES = _ipc(pa.Table.from_pandas(df_w, preserve_index=False))
+    state.df_waves = df_w
+    state.ipc_waves = _ipc(pa.Table.from_pandas(df_w, preserve_index=False))
 
 
 # ---------------------------------------------------------------------------
@@ -262,40 +261,64 @@ def _build_wave_caches(df_w: pd.DataFrame) -> None:
 # Tracks appear after Step 1 (Filter AIS); waves after Step 2 (Calculate waves);
 # AIS preview points appear when the AIS preview checkbox is ticked.
 # ---------------------------------------------------------------------------
-df_vessels = pd.DataFrame(columns=[
-    'mmsi', 'longitude', 'latitude', 'sog', 'cog', 'typecargo',
-    'segment_id', 'obstime', 'width', 'length', 'draught',
-])
-df_waves = pd.DataFrame(columns=[
-    'ShLongitude', 'ShLatitude', 'MMSI', 'WaveHeight', 'WavePeriod',
-    'Side', 'DistLoc_km', 'SOG', 'VesselLength', 'VesselWidth',
-    'DateTime', 'VesselLongitude', 'VesselLatitude',
-    'segment_id', 'VesselDraught', 'VesselCOG',
-])
-IPC_VESSELS = _ipc(pa.table({
+EMPTY_IPC_VESSELS = _ipc(pa.table({
     'longitude': pa.array([], pa.float32()), 'latitude': pa.array([], pa.float32()),
     'mmsi': pa.array([], pa.int64()), 'sog': pa.array([], pa.float32()),
     'cog': pa.array([], pa.float32()), 'typecargo': pa.array([], pa.float32()),
 }))
-IPC_TRACK_COORDS = _ipc(pa.table({
+EMPTY_IPC_TRACK_COORDS = _ipc(pa.table({
     'lon': pa.array([], pa.float32()), 'lat': pa.array([], pa.float32()),
     'sog': pa.array([], pa.float32()), 'cog': pa.array([], pa.float32()),
     'obstime': pa.array([], pa.int64()),
 }))
-IPC_TRACK_META = _ipc(pa.table({
+EMPTY_IPC_TRACK_META = _ipc(pa.table({
     'mmsi': pa.array([], pa.int64()), 'segment_id': pa.array([], pa.int32()),
     'n_points': pa.array([], pa.int32()), 'typecargo': pa.array([], pa.int32()),
 }))
-IPC_TRACK_OFFSETS = _ipc(pa.table({'offset': pa.array([0], pa.int32())}))
-# Build wave Arrow with the empty df so the schema matches
-_build_wave_caches(df_waves.copy())
+EMPTY_IPC_TRACK_OFFSETS = _ipc(pa.table({'offset': pa.array([0], pa.int32())}))
+_empty_wave_state = type('_EmptyWaveState', (), {})()
+_build_wave_caches(_empty_wave_state, pd.DataFrame(columns=WAVE_COLUMNS))
+EMPTY_IPC_WAVES = _empty_wave_state.ipc_waves
 # 1x1 transparent PNG placeholder so /api/raster.png never 500s before data exists
-PNG_BYTES = bytes.fromhex(
+EMPTY_PNG_BYTES = bytes.fromhex(
     '89504e470d0a1a0a0000000d49484452000000010000000108060000001f15c4'
     '890000000d49444154789c63000100000005000100200001ad6f0e0000000049'
     '454e44ae426082'
 )
 print('caches initialised empty - tracks/waves appear after the corresponding pipeline step.')
+
+
+def _new_pipeline_state() -> dict:
+    return {
+        'running': False, 'log': [], 'live': '',
+        'started_at': None, 'finished_at': None, 'error': None,
+        'wave_version': 0, 'track_version': 0,
+        'n_waves': None, 'n_filtered': None, 'last_step': None, 'cfg': None,
+    }
+
+
+@dataclass
+class SessionState:
+    session_id: str
+    root: Path
+    created_at: float = field(default_factory=time.time)
+    last_access: float = field(default_factory=time.time)
+    files: dict[str, Path] = field(default_factory=dict)
+    original_names: dict[str, str] = field(default_factory=dict)
+    df_vessels: pd.DataFrame = field(
+        default_factory=lambda: pd.DataFrame(columns=VESSEL_COLUMNS))
+    df_waves: pd.DataFrame = field(
+        default_factory=lambda: pd.DataFrame(columns=WAVE_COLUMNS))
+    seg_meta: list[dict] = field(default_factory=list)
+    ipc_vessels: bytes = EMPTY_IPC_VESSELS
+    ipc_waves: bytes = EMPTY_IPC_WAVES
+    ipc_track_coords: bytes = EMPTY_IPC_TRACK_COORDS
+    ipc_track_meta: bytes = EMPTY_IPC_TRACK_META
+    ipc_track_offsets: bytes = EMPTY_IPC_TRACK_OFFSETS
+    png_bytes: bytes = EMPTY_PNG_BYTES
+    last_results: dict = field(default_factory=dict)
+    pipeline: dict = field(default_factory=_new_pipeline_state)
+    lock: threading.RLock = field(default_factory=threading.RLock)
 
 
 # ---------------------------------------------------------------------------
@@ -346,48 +369,12 @@ def _safe_app_path(value: str, *, must_exist: bool = True) -> Path:
     return resolved
 
 
-def _scan_data_subdirs() -> list[dict]:
-    """Return working-directory dropdown options from data/ subdirectories."""
-    dirs = sorted(
-        _data_path_value(p)
-        for p in DATA_ROOT.iterdir() if p.is_dir()
-    )
-    return [{'label': d, 'value': d} for d in dirs]
 
 
-def _scan_working_dir(workdir: str | None) -> dict:
-    """Scan standard subdirs under the working directory.
-
-    Expected layout::
-
-        data/<workdir>/
-            ais/*.csv
-            coastline/*.shp
-            land/*.shp
-            bathymetry/*.{mesh,dfs2,dfsu}
-            tide/*.dfs0
-    """
-    empty = {'ais': [], 'bathymetry': [], 'coastline': [], 'land': [], 'tide': []}
-    if not workdir:
-        return empty
-    base = _safe_app_path(workdir, must_exist=False)
-    if not base.exists():
-        return empty
-    rel = _data_path_value
-    return {
-        'ais':        sorted(rel(p) for p in (base / 'ais').glob('*.csv')),
-        'bathymetry': sorted(rel(p) for ext in ('mesh', 'dfs2', 'dfsu')
-                             for p in (base / 'bathymetry').glob(f'*.{ext}')),
-        'coastline':  sorted(rel(p) for p in (base / 'coastline').glob('*.shp')),
-        'land':       sorted(rel(p) for p in (base / 'land').glob('*.shp')),
-        'tide':       sorted(rel(p) for p in (base / 'tide').glob('*.dfs0')),
-    }
-
-
-def _ais_time_range_str() -> str:
-    if 'obstime' not in df_vessels.columns or len(df_vessels) == 0:
+def _ais_time_range_str(state: SessionState) -> str:
+    if 'obstime' not in state.df_vessels.columns or len(state.df_vessels) == 0:
         return ''
-    ts = df_vessels['obstime']
+    ts = state.df_vessels['obstime']
     lo, hi = ts.min(), ts.max()
     if pd.isna(lo):
         return ''
@@ -400,20 +387,7 @@ def _ais_time_range_str() -> str:
 # RLock so the worker can `print` (which acquires the lock via _LineCapture)
 # while it already holds the lock for state updates. A plain Lock deadlocks here.
 _pipeline_lock = threading.RLock()
-PIPELINE_STATE = {
-    'running': False,
-    'log': [],            # committed lines (one per print '\n')
-    'live': '',           # current in-progress spinner line (replaced on each '\r')
-    'started_at': None,
-    'finished_at': None,
-    'error': None,
-    'wave_version': 0,
-    'track_version': 0,
-    'n_waves': None,
-    'n_filtered': None,
-    'last_step': None,    # 'filter' or 'waves'
-    'cfg': None,          # last config_dict used (for report plots in _export_filtered)
-}
+_active_pipeline_session: str | None = None
 
 
 class _LineCapture(io.TextIOBase):
@@ -424,13 +398,14 @@ class _LineCapture(io.TextIOBase):
         to overwrite); does NOT commit to log.
       - '\\n' commits the in-progress buffer as a single log line.
       - any other char appends to the buffer.
-    The in-progress buffer is also surfaced as PIPELINE_STATE['live'] after
+    The in-progress buffer is also surfaced as the session pipeline ``live`` after
     every write call, so the UI can render it as a single replaceable line
     below the committed log — this is the "spinning in place" effect.
     """
 
-    def __init__(self, original):
+    def __init__(self, original, state: SessionState):
         self._orig = original
+        self._state = state
         self._buf = ''
 
     def write(self, s: str) -> int:
@@ -445,10 +420,10 @@ class _LineCapture(io.TextIOBase):
             else:
                 self._buf += ch
         live = self._buf if self._buf.strip() else ''
-        with _pipeline_lock:
+        with self._state.lock:
             if new_lines:
-                PIPELINE_STATE['log'].extend(new_lines)
-            PIPELINE_STATE['live'] = live
+                self._state.pipeline['log'].extend(new_lines)
+            self._state.pipeline['live'] = live
         try:
             self._orig.write(s)
             self._orig.flush()
@@ -515,17 +490,22 @@ def _generate_report_plots(
         print(f'  WARN: plot_wave_period_report failed: {e}')
 
 
-def _pipeline_thread(config_dict: dict, stages: list[str], step_label: str) -> None:
+def _pipeline_thread(
+    state: SessionState,
+    config_dict: dict,
+    stages: list[str],
+    step_label: str,
+) -> None:
     """Worker thread. Runs the requested stages and refreshes only the affected caches.
 
     Cache builds run *outside* the pipeline lock so the polling tick can keep
-    reading PIPELINE_STATE['log']/['live'] (and therefore the sidebar log keeps
+    reading the session pipeline log/live state (and therefore the sidebar log keeps
     updating) while the slow groupby + Arrow encoding is in progress.
     """
-    global LAST_RESULTS
-    PIPELINE_STATE['cfg'] = config_dict
+    global _active_pipeline_session
+    state.pipeline['cfg'] = config_dict
     old_stdout = sys.stdout
-    sys.stdout = _LineCapture(old_stdout)
+    sys.stdout = _LineCapture(old_stdout, state)
     try:
         cfg = load_config(config_dict)
 
@@ -533,7 +513,7 @@ def _pipeline_thread(config_dict: dict, stages: list[str], step_label: str) -> N
         # no seed-results / filter-cache shortcut. Filter is cheap relative to
         # wave_impact and the new bathy/tide params have to flow through it.
         results = run_pipeline(cfg, stages=stages)
-        LAST_RESULTS.update(results)
+        state.last_results.update(results)
 
         # ---- Cache rebuild (no lock held) ----
         out_dir = Path(cfg.output.directory)
@@ -541,26 +521,26 @@ def _pipeline_thread(config_dict: dict, stages: list[str], step_label: str) -> N
         # produced waves (post depth + SOG + BLratio trims). segment_ids align
         # with df_wave_impact because both inherit from the single final
         # segment_trajectories call inside filter_ais.
-        # Mirror df_vessel into LAST_RESULTS['df_filtered'] so the "Export
-        # filtered" path and any consumers reading LAST_RESULTS see the same
+        # Mirror df_vessel into session.last_results['df_filtered'] so the "Export
+        # filtered" path and any consumers reading session.last_results see the same
         # segment_id space as the displayed tracks and waves.
         vessels_for_tracks = results.get('df_vessel')
         if vessels_for_tracks is not None:
-            LAST_RESULTS['df_filtered'] = vessels_for_tracks
+            state.last_results['df_filtered'] = vessels_for_tracks
             print('Refreshing track caches from df_vessel...')
             t0 = time.perf_counter()
-            _build_vessel_caches(vessels_for_tracks)
+            _build_vessel_caches(state, vessels_for_tracks)
             print(f'  -> {len(vessels_for_tracks):,} rows, '
-                  f'{len(seg_meta):,} segments  ({time.perf_counter()-t0:.1f}s)')
+                  f'{len(state.seg_meta):,} segments  ({time.perf_counter()-t0:.1f}s)')
             try:
                 out_dir.mkdir(parents=True, exist_ok=True)
                 vessels_for_tracks.to_parquet(out_dir / 'vessels.parquet', index=False)
                 print(f'  ✓ saved results: vessels.parquet')
             except Exception as e:
                 print(f'  WARN: could not save vessels.parquet: {e}')
-            with _pipeline_lock:
-                PIPELINE_STATE['track_version'] += 1
-                PIPELINE_STATE['n_filtered'] = len(vessels_for_tracks)
+            with state.lock:
+                state.pipeline['track_version'] += 1
+                state.pipeline['n_filtered'] = len(vessels_for_tracks)
 
         if 'df_wave_impact' in results and 'wave_impact' in stages:
             print('Refreshing wave caches...')
@@ -568,7 +548,7 @@ def _pipeline_thread(config_dict: dict, stages: list[str], step_label: str) -> N
             # Fresh runs already have the columns _ensure_vessel_columns would
             # back-fill, so no join needed here. The helper is kept around for
             # _load_results also handles legacy CSV imports.
-            _build_wave_caches(results['df_wave_impact'])
+            _build_wave_caches(state, results['df_wave_impact'])
             print(f'  -> {len(results["df_wave_impact"]):,} wave events '
                   f'({time.perf_counter()-t0:.1f}s)')
             # Save wave parquet for dev-loading
@@ -582,9 +562,9 @@ def _pipeline_thread(config_dict: dict, stages: list[str], step_label: str) -> N
                 print(f'  ✓ saved wave_track_link.csv')
             except Exception as e:
                 print(f'  WARN: could not save wave_track_link.csv: {e}')
-            with _pipeline_lock:
-                PIPELINE_STATE['wave_version'] += 1
-                PIPELINE_STATE['n_waves'] = len(results['df_wave_impact'])
+            with state.lock:
+                state.pipeline['wave_version'] += 1
+                state.pipeline['n_waves'] = len(results['df_wave_impact'])
 
             print('Generating report plots...')
             _generate_report_plots(
@@ -594,20 +574,23 @@ def _pipeline_thread(config_dict: dict, stages: list[str], step_label: str) -> N
                 out_dir=out_dir,
             )
 
-        with _pipeline_lock:
-            PIPELINE_STATE['finished_at'] = time.time()
-            PIPELINE_STATE['last_step'] = step_label
+        with state.lock:
+            state.pipeline['finished_at'] = time.time()
+            state.pipeline['last_step'] = step_label
     except Exception as exc:
         import traceback
         traceback.print_exc()
-        with _pipeline_lock:
-            PIPELINE_STATE['error'] = f'{type(exc).__name__}: {exc}'
-            PIPELINE_STATE['finished_at'] = time.time()
+        with state.lock:
+            state.pipeline['error'] = f'{type(exc).__name__}: {exc}'
+            state.pipeline['finished_at'] = time.time()
     finally:
         sys.stdout = old_stdout
+        with state.lock:
+            state.pipeline['running'] = False
+            state.pipeline['live'] = ''
         with _pipeline_lock:
-            PIPELINE_STATE['running'] = False
-            PIPELINE_STATE['live'] = ''
+            if _active_pipeline_session == state.session_id:
+                _active_pipeline_session = None
 
 
 # ---------------------------------------------------------------------------
@@ -1114,39 +1097,380 @@ if not UPLOAD_FOLDER.is_absolute():
     UPLOAD_FOLDER = REPO / UPLOAD_FOLDER
 UPLOAD_FOLDER.mkdir(parents=True, exist_ok=True)
 
+# Bundled example data (tracked in repo under example_data/).
+EXAMPLE_DATA = REPO / 'example_data'
+
+# Role specs: canonical mapping of upload role → file accept filter, example subdir, UI label.
+# Backend role keys: 'ais', 'coast', 'land', 'bathy', 'tide' (coast/bathy differ from
+# the config fields coastline/bathymetry — these are internal session keys only).
+ROLE_SPECS: dict[str, dict] = {
+    'ais':   {'accept': '.csv',        'example_dir': 'ais',        'label': 'AIS CSV'},
+    'coast': {'accept': '.zip',        'example_dir': 'coastline',  'label': 'Coastline ZIP'},
+    'land':  {'accept': '.zip',        'example_dir': 'land',       'label': 'Land Mask ZIP'},
+    'bathy': {'accept': '.mesh,.dfsu', 'example_dir': 'bathymetry', 'label': 'Bathymetry .mesh/.dfsu'},
+    'tide':  {'accept': '.dfs0',       'example_dir': 'tide',       'label': 'Tide DFS0 (optional)'},
+}
+
 server.config.update(
     SECRET_KEY=os.environ.get('SECRET_KEY'),
     UPLOAD_FOLDER=str(UPLOAD_FOLDER),
-    MAX_CONTENT_LENGTH=int(os.environ.get('MAX_CONTENT_LENGTH', 50 * 1024 * 1024)),
+    MAX_CONTENT_LENGTH=int(os.environ.get('MAX_UPLOAD_FILE_BYTES', 100 * 1024 * 1024)),
 )
+
+
+@server.errorhandler(413)
+def _upload_too_large(_exc):
+    return jsonify({'error': 'file exceeds the per-file upload limit'}), 413
+MAX_UPLOAD_FILE_BYTES = int(
+    os.environ.get('MAX_UPLOAD_FILE_BYTES', 100 * 1024 * 1024))
+MAX_SESSION_BYTES = int(
+    os.environ.get('MAX_SESSION_BYTES', 300 * 1024 * 1024))
+SESSION_TTL_SECONDS = int(os.environ.get('SESSION_TTL_SECONDS', 3600))
+MAX_ZIP_EXPANDED_BYTES = int(
+    os.environ.get('MAX_ZIP_EXPANDED_BYTES', 250 * 1024 * 1024))
+
+_sessions: dict[str, SessionState] = {}
+_sessions_lock = threading.RLock()
+_last_cleanup = 0.0
+
+
+def _cleanup_sessions(*, force: bool = False) -> None:
+    global _last_cleanup
+    now = time.time()
+    if not force and now - _last_cleanup < 60:
+        return
+    expired: list[SessionState] = []
+    with _sessions_lock:
+        for session_id, state in list(_sessions.items()):
+            if state.pipeline['running']:
+                continue
+            if now - state.last_access > SESSION_TTL_SECONDS:
+                expired.append(_sessions.pop(session_id))
+        _last_cleanup = now
+    for state in expired:
+        shutil.rmtree(state.root, ignore_errors=True)
+
+
+def _create_session() -> SessionState:
+    _cleanup_sessions()
+    session_id = uuid.uuid4().hex
+    root = UPLOAD_FOLDER / session_id
+    root.mkdir(parents=True, exist_ok=False)
+    state = SessionState(session_id=session_id, root=root)
+    with _sessions_lock:
+        _sessions[session_id] = state
+    return state
+
+
+def _get_session(session_id: str | None = None) -> SessionState:
+    _cleanup_sessions()
+    sid = session_id or request.args.get('session_id') or request.headers.get('X-Session-ID')
+    if not sid:
+        raise ValueError('session_id required')
+    with _sessions_lock:
+        state = _sessions.get(sid)
+    if state is None:
+        raise FileNotFoundError('session expired or not found; refresh the page')
+    state.last_access = time.time()
+    return state
+
+
+def _session_path(state: SessionState, value: str, *, must_exist: bool = True) -> Path:
+    if not value:
+        raise ValueError('empty upload path')
+    candidate = (state.root / value).resolve()
+    try:
+        candidate.relative_to(state.root.resolve())
+    except ValueError as exc:
+        raise ValueError('upload path escapes session storage') from exc
+    if must_exist and not candidate.exists():
+        raise FileNotFoundError(value)
+    return candidate
+
+
+def _session_size(state: SessionState) -> int:
+    return sum(p.stat().st_size for p in state.root.rglob('*') if p.is_file())
+
+
+def _validate_loose_shapefile(directory: Path) -> Path:
+    """Validate a directory already containing a shapefile bundle; return the .shp path."""
+    shapefiles = sorted(directory.glob('*.shp'))
+    if len(shapefiles) != 1:
+        raise ValueError('shapefile directory must contain exactly one .shp file')
+    stem = shapefiles[0].stem
+    missing = [
+        ext for ext in ('.shx', '.dbf', '.prj')
+        if not (directory / f'{stem}{ext}').exists()
+    ]
+    if missing:
+        raise ValueError(f'shapefile is missing required sidecars: {", ".join(missing)}')
+    import geopandas as gpd
+    layer = gpd.read_file(shapefiles[0])
+    if layer.empty:
+        raise ValueError('shapefile contains no features')
+    if layer.crs is None:
+        raise ValueError('shapefile has no CRS; include a valid .prj file')
+    return shapefiles[0]
+
+
+def _extract_shapefile_zip(archive: Path, destination: Path) -> Path:
+    destination.mkdir(parents=True, exist_ok=True)
+    with zipfile.ZipFile(archive) as zf:
+        members = [info for info in zf.infolist() if not info.is_dir()]
+        if sum(info.file_size for info in members) > MAX_ZIP_EXPANDED_BYTES:
+            raise ValueError('expanded shapefile ZIP exceeds the configured limit')
+        for info in members:
+            member = Path(info.filename)
+            if member.is_absolute() or '..' in member.parts:
+                raise ValueError('shapefile ZIP contains an unsafe path')
+            target = (destination / member.name).resolve()
+            target.relative_to(destination.resolve())
+            with zf.open(info) as source, target.open('wb') as output:
+                shutil.copyfileobj(source, output)
+    return _validate_loose_shapefile(destination)
+
+
+def _validate_uploaded_file(role: str, path: Path, state: SessionState) -> Path:
+    suffix = path.suffix.lower()
+    if role == 'ais':
+        if suffix != '.csv':
+            raise ValueError('AIS input must be a .csv file')
+        cols = {str(c).strip().lower() for c in pd.read_csv(path, nrows=5).columns}
+        required = {
+            'mmsi', 'width', 'length', 'draught', 'obstime',
+            'longitude', 'latitude', 'sog', 'cog', 'typecargo',
+        }
+        missing = sorted(required - cols)
+        if missing:
+            raise ValueError(f'AIS CSV is missing required columns: {missing}')
+        return path
+    if role in {'coast', 'land'}:
+        if suffix != '.zip':
+            raise ValueError(f'{role} input must be a ZIP shapefile bundle')
+        extracted = state.root / role
+        shutil.rmtree(extracted, ignore_errors=True)
+        return _extract_shapefile_zip(path, extracted)
+    if role == 'bathy':
+        if suffix not in {'.mesh', '.dfsu'}:
+            raise ValueError('bathymetry input must be .mesh or .dfsu')
+        from aiswakepy.geo.bathymetry import load_bathymetry
+        load_bathymetry(path)
+        return path
+    if role == 'tide':
+        if suffix != '.dfs0':
+            raise ValueError('tide input must be a .dfs0 file')
+        _preview_tide(path)
+        return path
+    raise ValueError(f'unsupported upload role: {role}')
 
 
 # ---------------------------------------------------------------------------
 # Flask routes
 # ---------------------------------------------------------------------------
+@app.server.route('/api/session', methods=['POST'])
+def _r_create_session():
+    state = _create_session()
+    return jsonify({
+        'session_id': state.session_id,
+        'expires_in_s': SESSION_TTL_SECONDS,
+        'max_file_bytes': MAX_UPLOAD_FILE_BYTES,
+        'max_session_bytes': MAX_SESSION_BYTES,
+    })
+
+
+@app.server.route('/api/upload/<role>', methods=['POST'])
+def _r_upload(role: str):
+    try:
+        state = _get_session()
+        if role not in ROLE_SPECS:
+            return jsonify({'error': 'unknown upload role'}), 404
+        uploaded = request.files.get('file')
+        if uploaded is None or not uploaded.filename:
+            return jsonify({'error': 'file field is required'}), 400
+        filename = secure_filename(uploaded.filename)
+        if not filename:
+            return jsonify({'error': 'invalid filename'}), 400
+        expected_len = request.content_length or 0
+        if expected_len > MAX_UPLOAD_FILE_BYTES:
+            return jsonify({'error': 'file exceeds the per-file upload limit'}), 413
+        role_dir = state.root / 'uploads' / role
+        shutil.rmtree(role_dir, ignore_errors=True)
+        role_dir.mkdir(parents=True, exist_ok=True)
+        raw_path = role_dir / filename
+        uploaded.save(raw_path)
+        if raw_path.stat().st_size > MAX_UPLOAD_FILE_BYTES:
+            raw_path.unlink(missing_ok=True)
+            return jsonify({'error': 'file exceeds the per-file upload limit'}), 413
+        if _session_size(state) > MAX_SESSION_BYTES:
+            shutil.rmtree(role_dir, ignore_errors=True)
+            return jsonify({'error': 'session upload storage limit exceeded'}), 413
+        path = _validate_uploaded_file(role, raw_path, state)
+        state.files[role] = path
+        state.original_names[role] = filename
+        resp: dict = {
+            'role': role,
+            'filename': filename,
+            'path': str(path.relative_to(state.root)),
+            'bytes': raw_path.stat().st_size if raw_path.exists() else path.stat().st_size,
+        }
+        # For tide uploads, include item metadata so the frontend can populate
+        # the item picker without a separate round-trip.
+        if role == 'tide':
+            try:
+                meta = _preview_tide(path)
+                items = meta.get('items', [])
+                resp['items'] = items
+                resp['chosen_item'] = items[0]['name'] if items else None
+            except Exception:
+                pass
+        return jsonify(resp)
+    except Exception as exc:
+        import traceback
+        traceback.print_exc()
+        return jsonify({'error': str(exc)}), 400
+
+
+@app.server.route('/api/example', methods=['POST'])
+def _r_example():
+    """Load bundled example_data/ files into the current session as if uploaded."""
+    import traceback
+    try:
+        state = _get_session()
+        if not EXAMPLE_DATA.exists():
+            return jsonify({'error': 'example_data/ directory not found in this deployment'}), 404
+
+        loaded: dict[str, dict] = {}
+
+        for role, spec in ROLE_SPECS.items():
+            src_dir = EXAMPLE_DATA / spec['example_dir']
+            if not src_dir.exists():
+                return jsonify({'error': f'example_data/{spec["example_dir"]} not found'}), 404
+
+            if role == 'ais':
+                # Single CSV file
+                csv_files = sorted(src_dir.glob('*.csv'))
+                if not csv_files:
+                    return jsonify({'error': 'No AIS CSV in example_data/ais/'}), 404
+                src = csv_files[0]
+                role_dir = state.root / 'uploads' / role
+                shutil.rmtree(role_dir, ignore_errors=True)
+                role_dir.mkdir(parents=True, exist_ok=True)
+                dest = role_dir / src.name
+                shutil.copy2(src, dest)
+                path = _validate_uploaded_file(role, dest, state)
+                state.files[role] = path
+                state.original_names[role] = src.name
+                loaded[role] = {
+                    'path': str(path.relative_to(state.root)),
+                    'filename': src.name,
+                }
+
+            elif role in ('coast', 'land'):
+                # Loose shapefile bundle — copy all files to <root>/<role>/
+                extracted = state.root / role
+                shutil.rmtree(extracted, ignore_errors=True)
+                extracted.mkdir(parents=True, exist_ok=True)
+                for f in src_dir.iterdir():
+                    if f.is_file():
+                        shutil.copy2(f, extracted / f.name)
+                path = _validate_loose_shapefile(extracted)
+                state.files[role] = path
+                state.original_names[role] = path.name
+                loaded[role] = {
+                    'path': str(path.relative_to(state.root)),
+                    'filename': path.name,
+                }
+
+            elif role == 'bathy':
+                # .dfsu or .mesh file
+                bathy_files = sorted(
+                    f for f in src_dir.iterdir()
+                    if f.is_file() and f.suffix.lower() in {'.dfsu', '.mesh'}
+                )
+                if not bathy_files:
+                    return jsonify({'error': 'No bathymetry file in example_data/bathymetry/'}), 404
+                src = bathy_files[0]
+                role_dir = state.root / 'uploads' / role
+                shutil.rmtree(role_dir, ignore_errors=True)
+                role_dir.mkdir(parents=True, exist_ok=True)
+                dest = role_dir / src.name
+                shutil.copy2(src, dest)
+                path = _validate_uploaded_file(role, dest, state)
+                state.files[role] = path
+                state.original_names[role] = src.name
+                loaded[role] = {
+                    'path': str(path.relative_to(state.root)),
+                    'filename': src.name,
+                }
+
+            elif role == 'tide':
+                # .dfs0 file
+                tide_files = sorted(src_dir.glob('*.dfs0'))
+                if not tide_files:
+                    # Tide is optional — skip silently
+                    continue
+                src = tide_files[0]
+                role_dir = state.root / 'uploads' / role
+                shutil.rmtree(role_dir, ignore_errors=True)
+                role_dir.mkdir(parents=True, exist_ok=True)
+                dest = role_dir / src.name
+                shutil.copy2(src, dest)
+                # Don't call _validate_uploaded_file for tide here (it calls _preview_tide which
+                # we'll call anyway to get items). Just register the path directly.
+                state.files[role] = dest
+                state.original_names[role] = src.name
+                try:
+                    meta = _preview_tide(dest)
+                    items = meta.get('items', [])
+                    chosen = items[0]['name'] if items else None
+                except Exception:
+                    items = []
+                    chosen = None
+                loaded[role] = {
+                    'path': str(dest.relative_to(state.root)),
+                    'filename': src.name,
+                    'items': items,
+                    'chosen_item': chosen,
+                }
+
+        if _session_size(state) > MAX_SESSION_BYTES:
+            return jsonify({'error': 'session storage limit exceeded by example data'}), 413
+
+        return jsonify({'roles': loaded})
+
+    except Exception as exc:
+        traceback.print_exc()
+        return jsonify({'error': str(exc)}), 400
+
+
 def _bytes_response(b: bytes) -> Response:
     return Response(b, mimetype='application/vnd.apache.arrow.stream',
                     headers={'Cache-Control': 'no-store'})
 
 
 @app.server.route('/api/vessels.arrow')
-def _r_vessels(): return _bytes_response(IPC_VESSELS)
+def _r_vessels():
+    return _bytes_response(_get_session().ipc_vessels)
 
 
 @app.server.route('/api/waves.arrow')
-def _r_waves(): return _bytes_response(IPC_WAVES)
+def _r_waves():
+    return _bytes_response(_get_session().ipc_waves)
 
 
 @app.server.route('/api/track_coords.arrow')
-def _r_track_coords(): return _bytes_response(IPC_TRACK_COORDS)
+def _r_track_coords():
+    return _bytes_response(_get_session().ipc_track_coords)
 
 
 @app.server.route('/api/track_meta.arrow')
-def _r_track_meta(): return _bytes_response(IPC_TRACK_META)
+def _r_track_meta():
+    return _bytes_response(_get_session().ipc_track_meta)
 
 
 @app.server.route('/api/track_offsets.arrow')
-def _r_track_offsets(): return _bytes_response(IPC_TRACK_OFFSETS)
+def _r_track_offsets():
+    return _bytes_response(_get_session().ipc_track_offsets)
 
 
 def compute_similar_tracks(df: 'pd.DataFrame', seed_mmsi: int, seed_seg: int,
@@ -1200,7 +1524,11 @@ def _r_similar_tracks():
     min_cov   = float(body.get('min_coverage', 0.5))
     if seed_mmsi is None or seed_seg is None:
         return jsonify({'error': 'mmsi and segment_id required'}), 400
-    ref_df = df_vessels if len(df_vessels) > 0 else None
+    try:
+        state = _get_session()
+    except Exception as exc:
+        return jsonify({'error': str(exc)}), 400
+    ref_df = state.df_vessels if len(state.df_vessels) > 0 else None
     if ref_df is None:
         return jsonify({'error': 'no track data — run Filter first'}), 400
     try:
@@ -1211,7 +1539,8 @@ def _r_similar_tracks():
 
 
 @app.server.route('/api/raster.png')
-def _r_raster(): return Response(PNG_BYTES, mimetype='image/png')
+def _r_raster():
+    return Response(_get_session().png_bytes, mimetype='image/png')
 
 
 # ---------------------------------------------------------------------------
@@ -1315,47 +1644,22 @@ def _load_results(directory: str) -> dict:
 
 @app.server.route('/api/load_results', methods=['POST'])
 def _r_load_results():
-    body = request.get_json(force=True, silent=True) or {}
-    directory = body.get('directory', '')
-    if not directory:
-        return jsonify({'error': 'directory required'}), 400
-    try:
-        result = _load_results(directory)
-        return jsonify(result)
-    except Exception as e:
-        import traceback
-        traceback.print_exc()
-        return jsonify({'error': str(e)}), 500
+    return jsonify({'error': 'loading server-side result folders is disabled for temporary sessions'}), 410
 
 
 # ---------------------------------------------------------------------------
-# Export filtered tracks/waves/AIS subset → new data/ subfolder (rerun-ready)
+# Export filtered tracks/waves/AIS subset → downloadable rerun ZIP
 # ---------------------------------------------------------------------------
 _FORBIDDEN_NAME_CHARS = ('/', '\\', '..', ':', '\0')
 
 
-def _export_filtered(body: dict) -> dict:
-    """Export a rerun-ready slice of the current pipeline state.
-
-    Layout written under ``data/<dest_name>/``::
-
-        ais/<original_stem>.csv      ← cleaned filtered points (no segment_id)
-        coastline/                   ← every file copied from source workdir
-        land/                        ← every file copied from source workdir
-        bathymetry/                  ← every file copied from source workdir
-        tide/                        ← every file copied from source workdir
-        output/vessels.parquet       ← filtered tracks
-        output/waves.parquet         ← filtered waves
-        output/wave_track_link.csv   ← wave_row → MMSI/segment_id mapping
-    """
+def _export_filtered(state: SessionState, body: dict) -> Path:
+    """Build a rerun-ready ZIP slice of the current session state."""
     dest_name = (body.get('dest_name') or '').strip()
     if not dest_name:
-        raise ValueError('destination folder name is required')
+        dest_name = 'aiswakepy_export'
     if any(c in dest_name for c in _FORBIDDEN_NAME_CHARS):
         raise ValueError(f'invalid characters in folder name: {dest_name!r}')
-    workdir = (body.get('workdir') or '').strip()
-    if not workdir:
-        raise ValueError('source workdir is required')
     seg_keys = body.get('seg_keys') or []
     if not seg_keys:
         raise ValueError('no filter is active — nothing to export')
@@ -1363,110 +1667,98 @@ def _export_filtered(body: dict) -> dict:
     wave_idxs = body.get('wave_idxs')  # may be None or list[int]
     sel_ais = body.get('sel_ais') or ''
 
-    base = DATA_ROOT / dest_name
-    if base.exists():
-        raise FileExistsError(f'destination already exists: data/{dest_name}')
-    src_root = _safe_app_path(workdir)
-    if not src_root.is_dir():
-        raise FileNotFoundError(f'source workdir not found: {workdir}')
+    export_root = state.root / 'exports' / f'{dest_name}_{int(time.time())}'
+    if export_root.exists():
+        shutil.rmtree(export_root)
+    out_dir = export_root / 'output'
+    for sub in ('ais', 'coastline', 'land', 'bathymetry', 'tide', 'output'):
+        (export_root / sub).mkdir(parents=True, exist_ok=True)
 
-    created = False
-    try:
-        # Layout
-        for sub in ('ais', 'coastline', 'land', 'bathymetry', 'tide', 'output'):
-            (base / sub).mkdir(parents=True, exist_ok=True)
-        created = True
+    df_f = state.last_results.get('df_filtered')
+    if df_f is None or len(df_f) == 0:
+        raise RuntimeError('no filtered AIS available — run Calculate Waves first')
+    keys = list(zip(df_f['mmsi'].astype(int), df_f['segment_id'].astype(int)))
+    ais_subset = df_f.loc[pd.Series([k in seg_key_set for k in keys], index=df_f.index)].copy()
+    ais_cols = ['mmsi', 'width', 'length', 'draught', 'obstime',
+                'longitude', 'latitude', 'sog', 'cog', 'typecargo']
+    ais_stem = Path(sel_ais).stem if sel_ais else 'ais_filtered'
+    ais_subset[[c for c in ais_cols if c in ais_subset.columns]].to_csv(
+        export_root / 'ais' / f'{ais_stem}.csv', index=False)
 
-        # ---- 1. AIS subset (cleaned post-filter, drop segment_id) ----
-        df_f = LAST_RESULTS.get('df_filtered')
-        if df_f is None or len(df_f) == 0:
-            raise RuntimeError('no filtered AIS available — run Filter or Load Results first')
-        keys = list(zip(df_f['mmsi'].astype(int), df_f['segment_id'].astype(int)))
-        mask = pd.Series([k in seg_key_set for k in keys], index=df_f.index)
-        ais_subset = df_f.loc[mask].copy()
-        ais_cols = ['mmsi', 'width', 'length', 'draught', 'obstime',
-                    'longitude', 'latitude', 'sog', 'cog', 'typecargo']
-        keep_cols = [c for c in ais_cols if c in ais_subset.columns]
-        ais_subset = ais_subset[keep_cols]
-        ais_stem = Path(sel_ais).stem if sel_ais else 'ais_filtered'
-        ais_out = base / 'ais' / f'{ais_stem}.csv'
-        ais_subset.to_csv(ais_out, index=False)
-        n_ais = len(ais_subset)
+    df_v = state.df_vessels
+    tracks_mask = pd.Series(
+        [k in seg_key_set for k in zip(df_v['mmsi'].astype(int), df_v['segment_id'].astype(int))],
+        index=df_v.index,
+    ) if len(df_v) > 0 else pd.Series([], dtype=bool)
+    df_tracks_out = df_v.loc[tracks_mask].reset_index(drop=True)
+    df_tracks_out.to_parquet(out_dir / 'vessels.parquet', index=False)
 
-        # ---- 2. Bulk-copy input directories (coastline/land/bathymetry/tide) ----
-        copied = {}
-        for sub in ('coastline', 'land', 'bathymetry', 'tide'):
-            src_sub = src_root / sub
-            dst_sub = base / sub
-            count = 0
-            if src_sub.is_dir():
-                for f in src_sub.iterdir():
-                    if f.is_file():
-                        shutil.copy2(f, dst_sub / f.name)
-                        count += 1
-            copied[sub] = count
-
-        # ---- 3. Rerun-ready cached results in output/ ----
-        out_dir = base / 'output'
-        tracks_mask = pd.Series(
-            [k in seg_key_set for k in zip(df_vessels['mmsi'].astype(int),
-                                           df_vessels['segment_id'].astype(int))],
-            index=df_vessels.index,
-        ) if len(df_vessels) > 0 else pd.Series([], dtype=bool)
-        df_tracks_out = df_vessels.loc[tracks_mask].reset_index(drop=True)
-        df_tracks_out.to_parquet(out_dir / 'vessels.parquet', index=False)
-        n_tracks_out = len(df_tracks_out)
-
-        n_waves_out = 0
-        if len(df_waves) > 0:
-            if wave_idxs is not None:
-                idxs = [int(i) for i in wave_idxs if 0 <= int(i) < len(df_waves)]
-                df_waves_out = df_waves.iloc[idxs].reset_index(drop=True)
-            else:
-                wmask = pd.Series(
-                    [(int(m), int(s)) in seg_key_set for m, s in
-                     zip(df_waves['MMSI'], df_waves['segment_id'])],
-                    index=df_waves.index,
-                )
-                df_waves_out = df_waves.loc[wmask].reset_index(drop=True)
-            df_waves_out.to_parquet(out_dir / 'waves.parquet', index=False)
-            n_waves_out = len(df_waves_out)
+    df_w = state.df_waves
+    if len(df_w) > 0:
+        if wave_idxs is not None:
+            idxs = [int(i) for i in wave_idxs if 0 <= int(i) < len(df_w)]
+            df_waves_out = df_w.iloc[idxs].reset_index(drop=True)
         else:
-            df_waves_out = df_waves.iloc[:0].copy()
-            df_waves_out.to_parquet(out_dir / 'waves.parquet', index=False)
+            wmask = pd.Series(
+                [(int(m), int(s)) in seg_key_set for m, s in zip(df_w['MMSI'], df_w['segment_id'])],
+                index=df_w.index,
+            )
+            df_waves_out = df_w.loc[wmask].reset_index(drop=True)
+    else:
+        df_waves_out = df_w.iloc[:0].copy()
+    df_waves_out.to_parquet(out_dir / 'waves.parquet', index=False)
+    _write_wave_track_link(df_waves_out, out_dir)
 
-        # ---- 4. Wave↔track link sidecar ----
-        _write_wave_track_link(df_waves_out, out_dir)
+    for role, sub in [('coast', 'coastline'), ('land', 'land'), ('bathy', 'bathymetry'), ('tide', 'tide')]:
+        src = state.files.get(role)
+        if src and src.exists():
+            if role in {'coast', 'land'}:
+                for f in src.parent.iterdir():
+                    if f.is_file():
+                        shutil.copy2(f, export_root / sub / f.name)
+            else:
+                shutil.copy2(src, export_root / sub / src.name)
 
-        # ---- 5. Report plots for filtered results ----
-        cfg_snap = PIPELINE_STATE.get('cfg')
-        if cfg_snap and n_waves_out > 0 and n_tracks_out > 0:
-            try:
-                _generate_report_plots(cfg_snap, df_tracks_out, df_waves_out, out_dir=out_dir)
-            except Exception as e:
-                import traceback
-                traceback.print_exc()
-                print(f'WARN: report plots failed for export: {e}')
+    cfg_snap = dict(state.pipeline.get('cfg') or {})
+    if cfg_snap:
+        cfg_snap.setdefault('output', {})['directory'] = 'output'
+        cfg_snap['ais']['raw_csv'] = f'ais/{ais_stem}.csv'
+        cfg_snap['ais']['land_shp'] = next(
+            (f'land/{p.name}' for p in (export_root / 'land').glob('*.shp')), '')
+        cfg_snap['coastline']['shapefile'] = next(
+            (f'coastline/{p.name}' for p in (export_root / 'coastline').glob('*.shp')), '')
+        bathy_files = list((export_root / 'bathymetry').iterdir())
+        if bathy_files:
+            cfg_snap['bathymetry']['source'] = f'bathymetry/{bathy_files[0].name}'
+        tide_files = list((export_root / 'tide').iterdir())
+        if tide_files:
+            cfg_snap['bathymetry']['tide_dfs0'] = f'tide/{tide_files[0].name}'
+        (export_root / 'config.json').write_text(json.dumps(cfg_snap, indent=2), encoding='utf-8')
 
-        return {
-            'workdir': f'data/{dest_name}',
-            'n_tracks': int(n_tracks_out),
-            'n_waves': int(n_waves_out),
-            'n_ais': int(n_ais),
-            'copied': copied,
-        }
-    except Exception:
-        if created:
-            shutil.rmtree(base, ignore_errors=True)
-        raise
+    zip_path = state.root / 'exports' / f'{dest_name}.zip'
+    if zip_path.exists():
+        zip_path.unlink()
+    with zipfile.ZipFile(zip_path, 'w', compression=zipfile.ZIP_DEFLATED) as zf:
+        for path in export_root.rglob('*'):
+            if path.is_file():
+                zf.write(path, path.relative_to(export_root))
+    shutil.rmtree(export_root, ignore_errors=True)
+    return zip_path
 
 
 @app.server.route('/api/export/filtered', methods=['POST'])
 def _r_export_filtered():
     body = request.get_json(force=True, silent=True) or {}
     try:
-        result = _export_filtered(body)
-        return jsonify(result)
+        state = _get_session()
+        zip_path = _export_filtered(state, body)
+        return send_file(
+            zip_path,
+            mimetype='application/zip',
+            as_attachment=True,
+            download_name=zip_path.name,
+            max_age=0,
+        )
     except Exception as e:
         import traceback
         traceback.print_exc()
@@ -1476,7 +1768,8 @@ def _r_export_filtered():
 @app.server.route('/api/preview/ais.arrow')
 def _r_preview_ais():
     try:
-        p = _safe_app_path(request.args.get('path', ''))
+        state = _get_session()
+        p = _session_path(state, request.args.get('path', ''))
         return _bytes_response(_preview_ais_arrow(p))
     except Exception as exc:
         return jsonify(error=str(exc)), 400
@@ -1485,7 +1778,8 @@ def _r_preview_ais():
 @app.server.route('/api/preview/ais.bbox')
 def _r_preview_ais_bbox():
     try:
-        p = _safe_app_path(request.args.get('path', ''))
+        state = _get_session()
+        p = _session_path(state, request.args.get('path', ''))
         return jsonify(_preview_ais_bbox(p))
     except Exception as exc:
         return jsonify(error=str(exc)), 400
@@ -1494,7 +1788,8 @@ def _r_preview_ais_bbox():
 @app.server.route('/api/preview/coast.geojson')
 def _r_preview_coast():
     try:
-        p = _safe_app_path(request.args.get('path', ''))
+        state = _get_session()
+        p = _session_path(state, request.args.get('path', ''))
         return jsonify(_preview_coast_geojson(p))
     except Exception as exc:
         return jsonify(error=str(exc)), 400
@@ -1513,7 +1808,8 @@ def _parse_bbox(bbox_str: str) -> tuple | None:
 @app.server.route('/api/preview/bathy.arrow')
 def _r_preview_bathy():
     try:
-        p = _safe_app_path(request.args.get('path', ''))
+        state = _get_session()
+        p = _session_path(state, request.args.get('path', ''))
         bbox = _parse_bbox(request.args.get('bbox', ''))
         result = _preview_bathy_arrow(p, bbox)
         if result is None:
@@ -1527,7 +1823,8 @@ def _r_preview_bathy():
 @app.server.route('/api/preview/bathy_offsets.arrow')
 def _r_preview_bathy_offsets():
     try:
-        p = _safe_app_path(request.args.get('path', ''))
+        state = _get_session()
+        p = _session_path(state, request.args.get('path', ''))
         bbox = _parse_bbox(request.args.get('bbox', ''))
         result = _preview_bathy_arrow(p, bbox)
         if result is None:
@@ -1540,8 +1837,12 @@ def _r_preview_bathy_offsets():
 
 @app.server.route('/api/pipeline/status')
 def _r_pipeline_status():
-    with _pipeline_lock:
-        s = dict(PIPELINE_STATE)
+    try:
+        state = _get_session()
+    except Exception as exc:
+        return jsonify({'error': str(exc)}), 400
+    with state.lock:
+        s = dict(state.pipeline)
     if s['started_at']:
         end = s['finished_at'] or time.time()
         s['elapsed_s'] = round(end - s['started_at'], 1)
@@ -1622,36 +1923,15 @@ def _rsb_dd(label, pid, options, default, desc):
 
 app.layout = html.Div([
     html.Div([
-        html.Div([
-            dcc.Dropdown(id='sel-workdir', options=[], value=None, clearable=False,
-                         placeholder='Select a data/ subfolder...',
-                         className='compact-dropdown',
-                         style={'fontSize': '10px'}),
-            html.Button('↻', id='btn-rescan-workdir', n_clicks=0,
-                        title='Re-scan working directory for new files'),
-        ], id='workdir-wrapper'),
-        html.Button('New Folder', id='btn-new-folder', n_clicks=0,
-                    title='Create a new project folder in data/',
-                    style={'padding': '3px 10px', 'fontSize': '11px', 'background': '#e8f0f8',
-                           'border': '1px solid #a8c0d8', 'borderRadius': '4px',
-                           'cursor': 'pointer', 'color': '#3a6080', 'whiteSpace': 'nowrap',
-                           'flexShrink': '0', 'fontWeight': '600',
-                           'lineHeight': '1.4', 'height': '26px', 'boxSizing': 'border-box'}),
-        html.Button('Load Results', id='btn-load-results', n_clicks=0,
-                    title='Load pre-computed output from the selected working directory',
-                    style={'padding': '3px 10px', 'fontSize': '11px', 'background': '#f2ede4',
-                           'border': '1px solid #c8b488', 'borderRadius': '4px',
-                           'cursor': 'pointer', 'color': '#7a6040', 'whiteSpace': 'nowrap',
-                           'flexShrink': '0', 'fontWeight': '600',
-                           'lineHeight': '1.4', 'height': '26px', 'boxSizing': 'border-box'}),
-        html.Span('', id='load-results-status',
-                  style={'fontSize': '11px', 'color': '#c44', 'marginLeft': '2px'}),
+        # load-results-status kept as hidden dummy — still used by the load-results
+        # clientside callback (kept for future "resume from zip" feature).
+        html.Span('', id='load-results-status', style={'display': 'none'}),
         html.Div('AISWAKEPY_PUBLIC', id='banner-title'),
         html.Div([
             html.Span(id='ais-time-range', style={'color': '#558', 'marginRight': '4px'}),
-            html.Span(id='cnt-vessels', children=f'vessels {len(df_vessels):,}'),
-            ' | ', html.Span(id='cnt-segs',    children=f'segments {len(seg_meta):,}'),
-            ' | ', html.Span(id='cnt-waves',   children=f'waves {len(df_waves):,}'),
+            html.Span(id='cnt-vessels', children='vessels 0'),
+            ' | ', html.Span(id='cnt-segs',    children='segments 0'),
+            ' | ', html.Span(id='cnt-waves',   children='waves 0'),
             ' | ', html.Span(id='status', children='loading...'),
             ' | ', html.Span(id='click-info', style={'fontWeight': 'bold'}),
         ], id='banner-meta'),
@@ -1659,68 +1939,49 @@ app.layout = html.Div([
 
     html.Div([
 
-        html.Div(id='workdir-unc-display'),
-
-        # ---- AIS Data (always first — everything else requires it) ----
-        html.Label('AIS Data'),
         html.Div([
-            dcc.Dropdown(id='sel-ais', options=[], value=None, clearable=False,
-                         placeholder='Select AIS CSV...',
-                         className='compact-dropdown', style={'fontSize': '10px'}),
-            html.Div(
-                dcc.Checklist(id='pv-ais',
-                              options=[{'label': 'preview', 'value': '1'}],
-                              value=[]),
-                className='preview-box',
-            ),
-        ], className='row-with-preview'),
-        html.Div(id='pv-ais-info', className='preview-info'),
-
-        # ---- Remaining pickers + run button (disabled until AIS is selected) ----
-        html.Div(id='pickers-need-ais',
-                 style={'pointerEvents': 'none', 'opacity': '0.5'}, children=[
-
-            # ---- Coastline & Land mask ----
-            *_picker_with_preview('Coastline (block/calculate waves)', 'sel-coast', 'pv-coast',
-                                  'pv-coast-info', [], None, clearable=False,
-                                  placeholder='Select shapefile...'),
-            *_picker_with_preview('Land (filter AIS data)', 'sel-land', 'pv-land',
-                                  'pv-land-info', [], None, clearable=False,
-                                  placeholder='Select shapefile...'),
-
-            # ---- Bathymetry ----
-            *_picker_with_preview('Bathymetry', 'sel-bathy', 'pv-bathy',
-                                  'pv-bathy-info', [], None, clearable=False,
-                                  placeholder='Select .dfsu or .mesh file...',
-                                  preview_disabled=True),
-
-            # ---- Tide DFS0 ----
-            html.Label('Tide'),
+            html.Div('Temporary Uploads',
+                     style={'fontWeight': 'bold', 'fontSize': '11px', 'color': '#555'}),
+            html.Div('Files are temporary. Refreshing the page starts a new empty session.',
+                     style={'fontSize': '10px', 'color': '#667', 'margin': '2px 0 6px'}),
+            html.Div(id='upload-ais-host'),
+            html.Div(id='upload-coast-host'),
+            html.Div(id='upload-land-host'),
+            html.Div(id='upload-bathy-host'),
+            html.Div(id='upload-tide-host'),
+            # ---- Tide item picker (shown after tide file is uploaded) ----
             html.Div([
-                html.Div('No tide file', id='cascade-tide-trigger', className='cascade-trigger'),
-                html.Div(id='cascade-tide-panel', className='cascade-panel',
-                         style={'display': 'none'}),
-            ], id='cascade-tide', style={'position': 'relative', 'marginBottom': '4px'}),
-
+                html.Label('Tide Item', style={'fontSize': '10px', 'fontWeight': '700',
+                                               'marginTop': '4px', 'display': 'block'}),
+                dcc.Dropdown(id='tide-item-dd', options=[], value=None, clearable=False,
+                             placeholder='Select tide item...',
+                             className='compact-dropdown',
+                             style={'fontSize': '10px'}),
+            ], id='tide-item-row', style={'display': 'none'}),
+            html.Div(id='upload-status',
+                     style={'fontSize': '10px', 'color': '#556', 'whiteSpace': 'pre-wrap',
+                            'marginBottom': '4px'}),
             html.Div([
-                html.Button('Calculate Waves', id='btn-waves', n_clicks=0, disabled=True,
-                            title='Run AIS filter + interpolate + vessel params '
-                                  '+ wave impact (requires bathymetry)'),
-            ], className='row-buttons'),
+                html.Button('Run example', id='btn-run-example', n_clicks=0,
+                            title='Load bundled example data (Singapore, JI channel)',
+                            style={'padding': '3px 10px', 'fontSize': '11px',
+                                   'background': '#e8f4e8', 'border': '1px solid #88c488',
+                                   'borderRadius': '4px', 'cursor': 'pointer',
+                                   'color': '#3a7a3a', 'fontWeight': '600',
+                                   'lineHeight': '1.4', 'height': '26px',
+                                   'boxSizing': 'border-box'}),
+            ], style={'marginBottom': '6px'}),
+        ], id='upload-panel'),
 
-        ]),
+        # pv-ais-info kept as hidden dummy — used by the AIS preview clientside callback.
+        html.Span(id='pv-ais-info', style={'display': 'none'}),
 
-        # Hidden Dash components for tide — outside the pointer-events wrapper so
-        # JS-driven value bumps are never blocked.
-        html.Div(style={'display': 'none'}, children=[
-            dcc.Dropdown(id='sel-tide', options=[], value=None, clearable=True),
-            dcc.Dropdown(id='sel-tide-item', options=[], value=None, clearable=False),
-            html.Button(id='_tide-file-btn', n_clicks=0),
-            html.Button(id='_tide-item-btn', n_clicks=0),
-            dcc.Dropdown(id='sel-results-dir', options=[], value=None, clearable=True),
-        ]),
-        dcc.Store(id='_tide_file_pick', data={'value': None, 'nonce': 0}),
-        dcc.Store(id='_tide_item_pick', data={'value': None, 'nonce': 0}),
+        # ---- Calculate Waves button ----
+        html.Div([
+            html.Button('Calculate Waves', id='btn-waves', n_clicks=0, disabled=True,
+                        title='Run AIS filter + interpolate + vessel params '
+                              '+ wave impact (requires AIS, coastline, land, bathymetry)'),
+        ], className='row-buttons'),
 
         # ---- Track visualization filter (disabled until waves are loaded) ----
         html.Div(id='filter-section-wrap',
@@ -1827,27 +2088,6 @@ app.layout = html.Div([
     ], id='sidebar'),
 
     html.Div(id='deck-container'),
-    # New folder form — fixed panel below the workdir dropdown
-    html.Div(id='new-folder-form', style={'display': 'none'}, children=[
-        dcc.Input(id='inp-new-folder', type='text', placeholder='folder name',
-                  debounce=False,
-                  style={'fontSize': '11px', 'padding': '4px 8px', 'borderRadius': '4px',
-                         'border': '1px solid #b0c4d8', 'width': '160px',
-                         'outline': 'none'}),
-        html.Button('Create', id='btn-create-folder', n_clicks=0,
-                    style={'fontSize': '11px', 'padding': '4px 10px', 'background': '#4a85b5',
-                           'color': 'white', 'border': '1px solid #3a75a5', 'borderRadius': '4px',
-                           'cursor': 'pointer', 'fontWeight': '600'}),
-        html.Button('✕', id='btn-cancel-folder', n_clicks=0,
-                    style={'fontSize': '11px', 'padding': '4px 8px', 'background': '#eef2f7',
-                           'border': '1px solid #a8c0d8', 'borderRadius': '4px',
-                           'cursor': 'pointer', 'color': '#556'}),
-        html.Span(id='new-folder-status', style={'fontSize': '10px', 'color': '#c44'}),
-    ]),
-    # Setup overlay — blocks UI until a working directory is selected
-    html.Div(id='setup-overlay'),
-    # Speech bubble pointing to the workdir dropdown when no folder selected.
-    html.Div('Select or create a data folder to begin', id='workdir-hint'),
     # MMSI copy toast — appears briefly after Ctrl+click copies MMSI
     html.Div('', id='copy-toast'),
     # Ctrl hint — permanent floating label at bottom-left of canvas
@@ -1972,6 +2212,7 @@ app.layout = html.Div([
     ], id='btn-rsb-toggle', n_clicks=0, title='Toggle pipeline configuration panel'),
 
     dcc.Store(id='_rescan_count', data=0),
+    dcc.Store(id='_session', data=None),
     dcc.Store(id='_log_scroll', data=0),
     dcc.Interval(id='boot', max_intervals=1, interval=200),
     dcc.Interval(id='poll', interval=400, disabled=True),
@@ -1979,6 +2220,9 @@ app.layout = html.Div([
     dcc.Store(id='_wave_version', data=0),
     dcc.Store(id='_track_version', data=0),
     dcc.Store(id='_ais_import', data={'path': None, 'nonce': 0}),
+    # Uploaded-files store: maps role → {path, filename[, items, chosen_item]}
+    # This is the client-side source-of-truth for what has been uploaded.
+    dcc.Store(id='_uploaded_files', data={}),
     # Preview state Stores: {visible, path}
     dcc.Store(id='_pv_ais',   data={'visible': False, 'path': None}),
     dcc.Store(id='_pv_bathy', data={'visible': False, 'path': None}),
@@ -1986,23 +2230,9 @@ app.layout = html.Div([
     dcc.Store(id='_pv_land',  data={'visible': False, 'path': None}),
     dcc.Store(id='_filter_structural', data={'mmsi': None, 'seg_ids': [], 'types': [], 'nonce': 0}),
     dcc.Store(id='_load_result'),
-    dcc.Store(id='_tide_items_meta', data=[]),
-    dcc.Store(id='_tide_files_meta', data=[]),
     dcc.Store(id='_wave_n', data=0),
     dcc.Store(id='_any_filter_active', data=False),
 ])
-
-
-# ---------------------------------------------------------------------------
-# Working-directory callback: populates all file dropdowns
-# ---------------------------------------------------------------------------
-@app.callback(
-    Output('sel-workdir', 'options'),
-    Input('boot', 'n_intervals'),
-    prevent_initial_call=False,
-)
-def _populate_workdir_dirs(_):
-    return _scan_data_subdirs()
 
 
 app.clientside_callback(
@@ -2019,140 +2249,17 @@ app.clientside_callback(
 )
 
 
-@app.callback(
-    Output('sel-ais',   'options'),
-    Output('sel-bathy', 'options'),
-    Output('sel-coast', 'options'),
-    Output('sel-land',  'options'),
-    Output('sel-tide',  'options'),
-    Input('sel-workdir', 'value'),
-    Input('_rescan_count', 'data'),
-    prevent_initial_call=False,
-)
-def _update_file_dropdowns(workdir, _rescan):
-    files = _scan_working_dir(workdir)
-    return (
-        _opt_list(files['ais']),
-        _opt_list(files['bathymetry']),
-        _opt_list(files['coastline']),
-        _opt_list(files['land']),
-        _opt_list(files['tide']),
-    )
-
-
-# When the user switches workdir, reset every downstream picker + active filters
-# so the new folder is configured from a clean slate.
-@app.callback(
-    Output('sel-ais',       'value', allow_duplicate=True),
-    Output('sel-bathy',     'value', allow_duplicate=True),
-    Output('sel-coast',     'value', allow_duplicate=True),
-    Output('sel-land',      'value', allow_duplicate=True),
-    Output('sel-tide',      'value', allow_duplicate=True),
-    Output('sel-tide-item', 'value', allow_duplicate=True),
-    Output('pv-ais',        'value', allow_duplicate=True),
-    Output('load-results-status', 'children', allow_duplicate=True),
-    Output('export-status',   'children', allow_duplicate=True),
-    Output('inp-export-dest', 'value', allow_duplicate=True),
-    Output('export-dest-form', 'style', allow_duplicate=True),
-    Output('_filter_structural', 'data', allow_duplicate=True),
-    Output('fil-type', 'value', allow_duplicate=True),
-    Input('sel-workdir', 'value'),
-    State('_filter_structural', 'data'),
-    prevent_initial_call=True,
-)
-def _reset_pickers_on_workdir_change(_workdir, prev_filter):
-    nonce = ((prev_filter or {}).get('nonce', 0) + 1)
-    return (None, None, None, None, None, None,
-            [], '', '', '', {'display': 'none'},
-            {'mmsi': None, 'seg_ids': [], 'types': [], 'nonce': nonce, '_clear': True},
-            None)
-
-
-@app.callback(
-    Output('_rescan_count', 'data'),
-    Input('btn-rescan-workdir', 'n_clicks'),
-    State('_rescan_count', 'data'),
-    prevent_initial_call=True,
-)
-def _rescan_workdir(_, count):
-    return (count or 0) + 1
-
-
-@app.callback(
-    Output('workdir-unc-display', 'children'),
-    Output('workdir-unc-display', 'className'),
-    Input('sel-workdir', 'value'),
-    Input('_rescan_count', 'data'),
-    prevent_initial_call=False,
-)
-def _update_unc_display(workdir, _rescan):
-    if not workdir or not DATA_UNC_ROOT:
-        return '', ''
-    subdir = workdir.removeprefix('data/')
-    unc = DATA_UNC_ROOT.rstrip('\\') + '\\' + subdir.replace('/', '\\')
-    return unc, 'visible'
-
-
-@app.callback(
-    Output('setup-overlay', 'style'),
-    Output('workdir-hint', 'style'),
-    Input('sel-workdir', 'value'),
-    prevent_initial_call=False,
-)
-def _toggle_setup_overlay(workdir):
-    overlay_shown = {'position': 'fixed', 'top': '40px', 'left': 0, 'right': 0, 'bottom': 0,
-                     'background': 'rgba(0,0,0,0.45)', 'zIndex': 20, 'cursor': 'not-allowed',
-                     'display': 'flex', 'alignItems': 'center', 'justifyContent': 'center'}
-    if workdir:
-        return {'display': 'none'}, {'display': 'none'}
-    return overlay_shown, {}
-
-
-@app.callback(
-    Output('new-folder-form', 'style'),
-    Input('btn-new-folder', 'n_clicks'),
-    Input('btn-cancel-folder', 'n_clicks'),
-    prevent_initial_call=True,
-)
-def _toggle_folder_form(n_new, n_cancel):
-    from dash import ctx
-    if ctx.triggered_id == 'btn-new-folder' and n_new:
-        return {'display': 'flex'}
-    return {'display': 'none'}
-
-
-@app.callback(
-    Output('sel-workdir', 'options', allow_duplicate=True),
-    Output('sel-workdir', 'value', allow_duplicate=True),
-    Output('new-folder-form', 'style', allow_duplicate=True),
-    Output('new-folder-status', 'children'),
-    Input('btn-create-folder', 'n_clicks'),
-    State('inp-new-folder', 'value'),
-    prevent_initial_call=True,
-)
-def _create_folder(n, name):
-    if not n or not name or not name.strip():
-        return no_update, no_update, no_update, 'Enter a folder name'
-    name = name.strip()
-    if any(c in name for c in ('/', '\\', '..', ':')):
-        return no_update, no_update, no_update, 'Invalid name'
-    base = DATA_ROOT / name
-    for sub in ('ais', 'coastline', 'land', 'bathymetry', 'tide', 'output'):
-        (base / sub).mkdir(parents=True, exist_ok=True)
-    return _scan_data_subdirs(), f'data/{name}', {'display': 'none'}, ''
-
-
 # ---------------------------------------------------------------------------
 # Server-side callbacks: run buttons + polling
 # ---------------------------------------------------------------------------
-def _build_config(ais, land, bathy, coast, tide, tide_item=None,
+def _build_config(state: SessionState, ais, land, bathy, coast, tide, tide_item=None,
                   min_speed=0.0, traj_gap=180.0, interp='linear', interp_interval=30.0,
                   cb_method='L_Le', max_prop=2000.0, max_sog=12.0,
                   max_velocity=36.0, max_accel=10.0, max_dw=1.0,
                   low_sog=1.0, vel_ratio=2.0, spd_ratio=0.5,
                   waterline=0.8, formula='kriebel', gravity=9.78,
                   max_bl=0.3, min_froude=0.1, max_froude=0.5, max_bf=0.4,
-                  wake_cutoff=0.01, workdir=None) -> dict:
+                  wake_cutoff=0.01) -> dict:
     cfg = {
         'ais': {'raw_csv': ais, 'land_shp': land,
                 'min_speed_knots': float(min_speed or 0.0),
@@ -2178,32 +2285,34 @@ def _build_config(ais, land, bathy, coast, tide, tide_item=None,
                  'max_bf': float(max_bf or 0.4)},
         'impact': {'max_propagation_m': float(max_prop or 2000.0),
                    'wake_cutoff_m': float(wake_cutoff or 0.01)},
-        'output': {'directory': str(_safe_app_path(f'{workdir}/output', must_exist=False))
-                   if workdir else str(REPO / 'output'),
+        'output': {'directory': str(state.root / 'output'),
                    'save_stage_csv': True},
     }
-    cfg['ais']['raw_csv'] = str(_safe_app_path(ais)) if ais else ais
-    cfg['ais']['land_shp'] = str(_safe_app_path(land)) if land else land
-    cfg['bathymetry']['source'] = str(_safe_app_path(bathy)) if bathy else 'placeholder.mesh'
-    cfg['coastline']['shapefile'] = str(_safe_app_path(coast)) if coast else coast
+    cfg['ais']['raw_csv'] = str(_session_path(state, ais)) if ais else ais
+    cfg['ais']['land_shp'] = str(_session_path(state, land)) if land else land
+    cfg['bathymetry']['source'] = str(_session_path(state, bathy)) if bathy else 'placeholder.mesh'
+    cfg['coastline']['shapefile'] = str(_session_path(state, coast)) if coast else coast
     if tide:
-        cfg['bathymetry']['tide_dfs0'] = str(_safe_app_path(tide))
+        cfg['bathymetry']['tide_dfs0'] = str(_session_path(state, tide))
         if tide_item:
             cfg['bathymetry']['tide_item'] = tide_item
     return cfg
 
 
-def _kick(config_dict, stages, label):
+def _kick(state: SessionState, config_dict, stages, label):
+    global _active_pipeline_session
     with _pipeline_lock:
-        if PIPELINE_STATE['running']:
+        if _active_pipeline_session is not None:
             return False
-        PIPELINE_STATE.update({
+        _active_pipeline_session = state.session_id
+    with state.lock:
+        state.pipeline.update({
             'running': True, 'log': [], 'live': '',
             'started_at': time.time(),
             'finished_at': None, 'error': None,
         })
     threading.Thread(target=_pipeline_thread,
-                     args=(config_dict, stages, label), daemon=True).start()
+                     args=(state, config_dict, stages, label), daemon=True).start()
     return True
 
 
@@ -2212,9 +2321,8 @@ def _kick(config_dict, stages, label):
     Output('btn-waves',  'disabled', allow_duplicate=True),
     Output('progress-log', 'children', allow_duplicate=True),
     Input('btn-waves', 'n_clicks'),
-    State('sel-ais', 'value'), State('sel-land', 'value'),
-    State('sel-bathy', 'value'), State('sel-coast', 'value'),
-    State('sel-tide', 'value'), State('sel-tide-item', 'value'),
+    State('_uploaded_files', 'data'),
+    State('tide-item-dd', 'value'),
     State('rsb-min-speed', 'value'), State('rsb-traj-gap', 'value'),
     State('rsb-interp', 'value'), State('rsb-interp-interval', 'value'),
     State('rsb-cb-method', 'value'),
@@ -2226,18 +2334,31 @@ def _kick(config_dict, stages, label):
     State('rsb-gravity', 'value'), State('rsb-max-bl', 'value'),
     State('rsb-min-froude', 'value'), State('rsb-max-froude', 'value'),
     State('rsb-max-bf', 'value'), State('rsb-wake-cutoff', 'value'),
-    State('sel-workdir', 'value'),
+    State('_session', 'data'),
     prevent_initial_call=True,
 )
-def kick_waves(n, ais, land, bathy, coast, tide, tide_item,
+def kick_waves(n, uploaded_files, tide_item,
                min_speed, traj_gap, interp, interp_interval,
                cb_method, max_prop, max_sog,
                max_velocity, max_accel, max_dw, low_sog,
                vel_ratio, spd_ratio, waterline, formula,
                gravity, max_bl, min_froude, max_froude, max_bf, wake_cutoff,
-               workdir):
+               session_data):
     if not n:
         return no_update, no_update, no_update
+    try:
+        state = _get_session((session_data or {}).get('session_id'))
+    except Exception as exc:
+        return no_update, no_update, f'⚠ {exc}'
+    uf = uploaded_files or {}
+    ais   = (uf.get('ais')   or {}).get('path')
+    land  = (uf.get('land')  or {}).get('path')
+    coast = (uf.get('coast') or {}).get('path')
+    bathy = (uf.get('bathy') or {}).get('path')
+    tide  = (uf.get('tide')  or {}).get('path')
+    # tide_item comes from the dropdown; fall back to chosen_item stored at upload
+    if not tide_item:
+        tide_item = (uf.get('tide') or {}).get('chosen_item')
     missing = []
     if not ais:   missing.append('AIS data file')
     if not land:  missing.append('Land mask shapefile')
@@ -2246,53 +2367,32 @@ def kick_waves(n, ais, land, bathy, coast, tide, tide_item,
     if missing:
         warn = '⚠ Cannot calculate waves — missing required inputs:\n  • ' + '\n  • '.join(missing)
         return no_update, no_update, warn
-    cfg = _build_config(ais, land, bathy, coast, tide, tide_item,
+    cfg = _build_config(state, ais, land, bathy, coast, tide, tide_item,
                         min_speed, traj_gap, interp, interp_interval,
                         cb_method, max_prop, max_sog,
                         max_velocity, max_accel, max_dw, low_sog,
                         vel_ratio, spd_ratio, waterline, formula,
-                        gravity, max_bl, min_froude, max_froude, max_bf, wake_cutoff,
-                        workdir=workdir)
-    if _kick(cfg, ['filter', 'vessel', 'wave_impact'], 'waves'):
+                        gravity, max_bl, min_froude, max_froude, max_bf, wake_cutoff)
+    if _kick(state, cfg, ['filter', 'vessel', 'wave_impact'], 'waves'):
         return False, True, no_update
-    return no_update, no_update, no_update
+    return no_update, False, 'Server is busy calculating another session. Try again later.'
 
 
-# ---- AIS auto-import: fires whenever the user picks a new AIS file ----
-@app.callback(
-    Output('_ais_import', 'data'),
-    Output('pv-ais', 'value', allow_duplicate=True),
-    Input('sel-ais', 'value'),
-    State('_ais_import', 'data'),
-    prevent_initial_call=True,
+# btn-waves enabled when required inputs are present in _uploaded_files. Tide is optional.
+app.clientside_callback(
+    "function(uf){ uf=uf||{}; return !(uf.ais&&uf.coast&&uf.land&&uf.bathy); }",
+    Output('btn-waves', 'disabled', allow_duplicate=True),
+    Input('_uploaded_files', 'data'),
+    prevent_initial_call='initial_duplicate',
 )
-def trigger_ais_import(path, prev):
-    if not path:
-        return no_update, no_update
-    nonce = (prev or {}).get('nonce', 0) + 1
-    # Auto-tick the preview tickbox so the imported data shows on map.
-    return {'path': path, 'nonce': nonce}, ['1']
 
-
-@app.callback(
-    Output('pv-bathy', 'options'),
+# When _ais_import fires, make AIS layer visible in _pv_ais store.
+app.clientside_callback(
+    "function(s){ if(!s||!s.path) return window.dash_clientside.no_update; "
+    "return {visible:true, path:s.path}; }",
+    Output('_pv_ais', 'data', allow_duplicate=True),
     Input('_ais_import', 'data'),
     prevent_initial_call=True,
-)
-def _enable_bathy_preview(data):
-    if data and data.get('path'):
-        return [{'label': 'preview', 'value': '1'}]
-    return no_update
-
-
-# btn-waves enabled only when all 5 input files are selected (including tide file + item).
-app.clientside_callback(
-    "function(a,c,l,b,t,ti){ return !(a&&c&&l&&b&&t&&ti); }",
-    Output('btn-waves', 'disabled', allow_duplicate=True),
-    Input('sel-ais', 'value'), Input('sel-coast', 'value'),
-    Input('sel-land', 'value'), Input('sel-bathy', 'value'),
-    Input('sel-tide', 'value'), Input('sel-tide-item', 'value'),
-    prevent_initial_call='initial_duplicate',
 )
 
 
@@ -2307,148 +2407,116 @@ app.clientside_callback(
     Output('cnt-segs',    'children'),
     Output('cnt-vessels', 'children'),
     Output('ais-time-range', 'children'),
-    Output('pv-bathy', 'value', allow_duplicate=True),
-    Output('pv-coast', 'value', allow_duplicate=True),
-    Output('pv-land',  'value', allow_duplicate=True),
-    Output('pv-ais',   'value', allow_duplicate=True),
     Input('poll', 'n_intervals'),
     State('_wave_version', 'data'), State('_track_version', 'data'),
+    State('_session', 'data'),
     prevent_initial_call=True,
 )
-def tick(_, prev_wave_v, prev_track_v):
-    with _pipeline_lock:
-        s = dict(PIPELINE_STATE)
+def tick(_, prev_wave_v, prev_track_v, session_data):
+    try:
+        state = _get_session((session_data or {}).get('session_id'))
+    except Exception as exc:
+        return (
+            f'ERROR: {exc}', '', True, True,
+            prev_wave_v, prev_track_v,
+            no_update, no_update, no_update, no_update,
+        )
+    with state.lock:
+        s = dict(state.pipeline)
     log_lines = list(s['log'][-300:])
     if s.get('live'):
         log_lines.append(s['live'])  # in-progress spinner line, replaced each tick
     log_text = '\n'.join(log_lines) or '(no output yet)'
     elapsed = ''
-    counts = (f'waves {len(df_waves):,}', f'segments {len(seg_meta):,}',
-              f'vessels {len(df_vessels):,}')
-    _no_pv = (no_update,) * 4
+    counts = (f'waves {len(state.df_waves):,}', f'segments {len(state.seg_meta):,}',
+              f'vessels {len(state.df_vessels):,}')
     if s['error']:
         return (
             f"{log_text}\n\nERROR: {s['error']}",
             elapsed, True, False,
-            prev_wave_v, prev_track_v, *counts, no_update, *_no_pv,
+            prev_wave_v, prev_track_v, *counts, no_update,
         )
     if s['running']:
         return (
             log_text, elapsed, False, True,
             prev_wave_v, prev_track_v, no_update, no_update, no_update, no_update,
-            *_no_pv,
         )
-    # Finished — push fresh versions and clear all preview checkboxes.
+    # Finished — push fresh versions.
     return (
         log_text, elapsed, True, False,
-        s['wave_version'], s['track_version'], *counts, _ais_time_range_str(),
-        [], [], [], [],
+        s['wave_version'], s['track_version'], *counts, _ais_time_range_str(state),
     )
 
 
 # ---------------------------------------------------------------------------
-# Preview callbacks: bathy / coast / tide listen to dropdown + tickbox.
+# Tide item dropdown: populate from _uploaded_files when tide is uploaded.
 # ---------------------------------------------------------------------------
-def _make_pv_callback(store_id, sel_id, pv_id):
-    @app.callback(
-        Output(store_id, 'data'),
-        Input(sel_id, 'value'),
-        Input(pv_id, 'value'),
-        prevent_initial_call=False,
-    )
-    def _pv(path, pv_val):
-        return {'visible': bool(pv_val), 'path': path}
-    return _pv
-
-
-_make_pv_callback('_pv_bathy', 'sel-bathy', 'pv-bathy')
-_make_pv_callback('_pv_coast', 'sel-coast', 'pv-coast')
-_make_pv_callback('_pv_land',  'sel-land',  'pv-land')
-
-
-def _make_pv_auto_tick(sel_id, pv_id):
-    @app.callback(
-        Output(pv_id, 'value'),
-        Input(sel_id, 'value'),
-        prevent_initial_call=True,
-    )
-    def _auto(path):
-        return ['1'] if path else []
-
-
-_make_pv_auto_tick('sel-bathy', 'pv-bathy')
-_make_pv_auto_tick('sel-coast', 'pv-coast')
-_make_pv_auto_tick('sel-land',  'pv-land')
-
-
-@app.callback(
-    Output('sel-tide-item', 'options'),
-    Output('sel-tide-item', 'value'),
-    Output('_tide_items_meta', 'data'),
-    Input('sel-tide', 'value'),
+app.clientside_callback(
+    r"""
+    function(uf) {
+        const nu = window.dash_clientside.no_update;
+        if (!uf) return [[], null, {'display':'none'}];
+        const t = uf.tide;
+        if (!t || !t.items || t.items.length === 0) return [[], null, {'display':'none'}];
+        const opts = t.items.map(it => ({
+            label: it.name + (it.unit ? ' [' + it.unit + ']' : ''),
+            value: it.name,
+        }));
+        const val = t.chosen_item || opts[0].value;
+        return [opts, val, {'display':'block'}];
+    }
+    """,
+    Output('tide-item-dd', 'options'),
+    Output('tide-item-dd', 'value'),
+    Output('tide-item-row', 'style'),
+    Input('_uploaded_files', 'data'),
     prevent_initial_call=False,
 )
-def _populate_tide_items(path):
-    if not path:
-        return [], None, []
-    try:
-        data = _preview_tide(_safe_app_path(path))
-        opts, items_meta = [], []
-        for it in data['items']:
-            rng = ''
-            if it['value_min'] is not None and it['value_max'] is not None:
-                rng = f" [{it['value_min']:.2f}..{it['value_max']:.2f} {it['unit']}]"
-            opts.append({'label': f"{it['name']}{rng}", 'value': it['name']})
-            items_meta.append({'name': it['name'], 'unit': it.get('unit', ''),
-                                'label': f"{it['name']}{rng}"})
-        val = opts[0]['value'] if len(opts) == 1 else None
-        return opts, val, items_meta
-    except Exception:
-        return [], None, []
 
 
-# AIS preview tickbox is decoupled from the dropdown — it just toggles
-# visibility of the already-imported AIS data.
-
-
-@app.callback(
-    Output('sel-results-dir', 'options'),
-    Input('_init', 'data'),
-    prevent_initial_call=False,
-)
-def _populate_results_dirs(_):
-    dirs = _scan_output_dirs()
-    return [{'label': d, 'value': d} for d in dirs]
-
-
-@app.callback(
-    Output('_load_result', 'data'),
-    Output('btn-load-results', 'disabled'),
-    Input('btn-load-results', 'n_clicks'),
-    State('sel-workdir', 'value'),
+# ---------------------------------------------------------------------------
+# Run example: load bundled example_data/ into the session.
+# ---------------------------------------------------------------------------
+app.clientside_callback(
+    r"""
+    async function(n) {
+        const nu = window.dash_clientside.no_update;
+        if (!n) return nu;
+        const uploadStatus = document.getElementById('upload-status');
+        const setStatus = (msg) => { if (uploadStatus) uploadStatus.textContent = msg; };
+        setStatus('Loading example data...');
+        try {
+            const resp = await fetch('/api/example', {method: 'POST'});
+            const j = await resp.json();
+            if (!resp.ok || j.error) throw new Error(j.error || resp.statusText);
+            // Populate the window mirror and the Dash store.
+            window.__uploaded = {};
+            for (const [role, info] of Object.entries(j.roles)) {
+                window.__uploaded[role] = info;
+                // Update the per-row status label if the upload row is present.
+                const rowStatus = document.getElementById(`native-upload-${role}-status`);
+                if (rowStatus) rowStatus.textContent = `ready: ${info.filename}`;
+            }
+            if (window.dash_clientside?.set_props) {
+                window.dash_clientside.set_props('_uploaded_files',
+                    {data: Object.assign({}, window.__uploaded)});
+                const ais = j.roles.ais;
+                if (ais) {
+                    window.dash_clientside.set_props('_ais_import',
+                        {data: {path: ais.path, nonce: Date.now()}});
+                }
+            }
+            setStatus('Example loaded — click Calculate Waves to run the pipeline.');
+        } catch (e) {
+            setStatus('Error loading example: ' + e.message);
+        }
+        return nu;
+    }
+    """,
+    Output('upload-status', 'children', allow_duplicate=True),
+    Input('btn-run-example', 'n_clicks'),
     prevent_initial_call=True,
 )
-def load_results_click(n, workdir):
-    if not n or not workdir:
-        return no_update, no_update
-    directory = f'{workdir}/output'
-    out_path = _safe_app_path(directory, must_exist=False)
-    if not (out_path / 'vessels.parquet').exists():
-        return {'error': 'Cannot find results — run Calculate Waves first'}, False
-    try:
-        result = _load_results(directory)
-        return result, False
-    except Exception as e:
-        return {'error': str(e)}, False
-
-
-@app.callback(
-    Output('_pv_ais', 'data'),
-    Input('pv-ais', 'value'),
-    prevent_initial_call=False,
-)
-def _pv_ais_toggle(pv_val):
-    return {'visible': bool(pv_val)}
 
 
 # ---- Track filter: MMSI/segment/type selectors ----
@@ -2468,13 +2536,18 @@ _VESSEL_CATEGORIES = [
     Output('fil-mmsi', 'options'),
     Output('fil-type', 'options'),
     Input('_track_version', 'data'),
+    State('_session', 'data'),
     prevent_initial_call=False,
 )
-def _populate_filter_options(_):
+def _populate_filter_options(_, session_data):
     mmsi_opts = []
-    if seg_meta:
-        mmsis = sorted(set(s['mmsi'] for s in seg_meta))
-        mmsi_opts = [{'label': str(m), 'value': m} for m in mmsis]
+    try:
+        state = _get_session((session_data or {}).get('session_id'))
+        if state.seg_meta:
+            mmsis = sorted(set(s['mmsi'] for s in state.seg_meta))
+            mmsi_opts = [{'label': str(m), 'value': m} for m in mmsis]
+    except Exception:
+        pass
     type_opts = [{'label': label, 'value': cat} for cat, label in _VESSEL_CATEGORIES]
     return mmsi_opts, type_opts
 
@@ -2483,12 +2556,17 @@ def _populate_filter_options(_):
     Output('fil-segs', 'options'),
     Output('fil-segs', 'value'),
     Input('fil-mmsi', 'value'),
+    State('_session', 'data'),
     prevent_initial_call=False,
 )
-def _populate_seg_options(mmsi):
+def _populate_seg_options(mmsi, session_data):
     if mmsi is None:
         return [], None
-    segs = sorted(s['segment_id'] for s in seg_meta if s['mmsi'] == int(mmsi))
+    try:
+        state = _get_session((session_data or {}).get('session_id'))
+    except Exception:
+        return [], None
+    segs = sorted(s['segment_id'] for s in state.seg_meta if s['mmsi'] == int(mmsi))
     return [{'label': f'seg {s}', 'value': s} for s in segs], None
 
 
@@ -2531,7 +2609,7 @@ app.clientside_callback(
 # Clientside JS
 # ---------------------------------------------------------------------------
 INIT_JS = r"""
-function(n) {
+async function(n) {
     if (!n || window.__deck_initialized) return window.dash_clientside.no_update;
     const container = document.getElementById('deck-container');
     if (!container) return window.dash_clientside.no_update;
@@ -2541,6 +2619,88 @@ function(n) {
         return window.dash_clientside.no_update;
     }
     window.__deck_initialized = true;
+    if (!window.__sessionId) {
+        const sessionResp = await fetch('/api/session', {method: 'POST'});
+        const session = await sessionResp.json();
+        if (!sessionResp.ok || session.error) {
+            document.getElementById('status').textContent = 'ERROR: ' + (session.error || 'session failed');
+            return window.dash_clientside.no_update;
+        }
+        window.__sessionId = session.session_id;
+        if (window.dash_clientside?.set_props) {
+            window.dash_clientside.set_props('_session', {data: session});
+        }
+        const nativeFetch = window.fetch.bind(window);
+        window.fetch = function(input, init) {
+            init = init || {};
+            let url = (typeof input === 'string') ? input : input.url;
+            if (url && url.startsWith('/api/') && !url.startsWith('/api/session')) {
+                const sep = url.indexOf('?') >= 0 ? '&' : '?';
+                url = url + sep + 'session_id=' + encodeURIComponent(window.__sessionId);
+                const headers = new Headers(init.headers || {});
+                headers.set('X-Session-ID', window.__sessionId);
+                init = Object.assign({}, init, {headers});
+                return nativeFetch(url, init);
+            }
+            return nativeFetch(input, init);
+        };
+    }
+    const uploadStatus = document.getElementById('upload-status');
+    // Role specs: must match ROLE_SPECS in dash_app.py (backend canonical source).
+    const labels = {
+        ais:   {host: 'upload-ais-host',   label: 'AIS CSV',               accept: '.csv'},
+        coast: {host: 'upload-coast-host', label: 'Coastline ZIP',         accept: '.zip'},
+        land:  {host: 'upload-land-host',  label: 'Land Mask ZIP',         accept: '.zip'},
+        bathy: {host: 'upload-bathy-host', label: 'Bathymetry .mesh/.dfsu', accept: '.mesh,.dfsu'},
+        tide:  {host: 'upload-tide-host',  label: 'Tide DFS0 (optional)',  accept: '.dfs0'},
+    };
+    // Client-side mirror of _uploaded_files store (keyed by role).
+    window.__uploaded = window.__uploaded || {};
+    const setStatus = (msg) => { if (uploadStatus) uploadStatus.textContent = msg; };
+    const makeUploadRow = (role, spec) => {
+        const host = document.getElementById(spec.host);
+        if (!host || host.dataset.ready) return;
+        host.dataset.ready = '1';
+        host.innerHTML = `<label style="display:block;font-size:11px;font-weight:700;margin-top:4px">${spec.label}</label>` +
+                         `<input id="native-upload-${role}" type="file" accept="${spec.accept}" ` +
+                         `style="font-size:10px;width:100%;box-sizing:border-box" />` +
+                         `<div id="native-upload-${role}-status" style="font-size:10px;color:#667;min-height:13px"></div>`;
+        const input = document.getElementById(`native-upload-${role}`);
+        const rowStatus = document.getElementById(`native-upload-${role}-status`);
+        input.addEventListener('change', async () => {
+            const file = input.files && input.files[0];
+            if (!file) return;
+            rowStatus.textContent = 'uploading...';
+            setStatus('');
+            const fd = new FormData();
+            fd.append('file', file, file.name);
+            try {
+                const resp = await fetch(`/api/upload/${role}`, {method: 'POST', body: fd});
+                const j = await resp.json();
+                if (!resp.ok || j.error) throw new Error(j.error || resp.statusText);
+                rowStatus.textContent = `ready: ${j.filename}`;
+                // Merge into the uploaded-files mirror and push to Dash store.
+                const entry = {path: j.path, filename: j.filename};
+                if (role === 'tide') {
+                    entry.items = j.items || [];
+                    entry.chosen_item = j.chosen_item || null;
+                }
+                window.__uploaded[role] = entry;
+                if (window.dash_clientside?.set_props) {
+                    window.dash_clientside.set_props('_uploaded_files',
+                        {data: Object.assign({}, window.__uploaded)});
+                    if (role === 'ais') {
+                        window.dash_clientside.set_props('_ais_import',
+                            {data: {path: j.path, nonce: Date.now()}});
+                    }
+                }
+            } catch (e) {
+                rowStatus.textContent = 'ERROR: ' + e.message;
+                setStatus('Upload failed: ' + e.message);
+            }
+        });
+    };
+    Object.keys(labels).forEach(k => makeUploadRow(k, labels[k]));
 
     // ---------- Tooltip ----------
     const tip = document.createElement('div');
@@ -4679,80 +4839,6 @@ async function(state) {
 
 
 _make_preview_clientside('_pv_ais',   'pv-ais-info',   '__setPreviewAis')
-_make_preview_clientside('_pv_bathy', 'pv-bathy-info', '__setPreviewBathy')
-_make_preview_clientside('_pv_coast', 'pv-coast-info', '__setPreviewCoast')
-_make_preview_clientside('_pv_land',  'pv-land-info',  '__setPreviewLand')
-
-
-# Mirror sel-tide options + items meta into JS globals so the cascade
-# widget can render from them without going through the DOM.
-app.clientside_callback(
-    r"""
-    function(files, items) {
-        window.__tideFiles = files || [];
-        window.__tideItems = items || [];
-        if (typeof window.__rebuildCascadeTide === 'function') window.__rebuildCascadeTide();
-        return files || [];
-    }
-    """,
-    Output('_tide_files_meta', 'data'),
-    Input('sel-tide', 'options'),
-    Input('_tide_items_meta', 'data'),
-    prevent_initial_call=False,
-)
-
-
-# JS-clicked file or item bumps the matching hidden button; these two
-# callbacks capture window.__tideFilePick / __tideItemPick into Stores.
-app.clientside_callback(
-    r"""
-    function(n, prev) {
-        if (!n) return window.dash_clientside.no_update;
-        const nonce = ((prev || {}).nonce || 0) + 1;
-        return { value: window.__tideFilePick || null, nonce };
-    }
-    """,
-    Output('_tide_file_pick', 'data'),
-    Input('_tide-file-btn', 'n_clicks'),
-    State('_tide_file_pick', 'data'),
-    prevent_initial_call=True,
-)
-
-app.clientside_callback(
-    r"""
-    function(n, prev) {
-        if (!n) return window.dash_clientside.no_update;
-        const nonce = ((prev || {}).nonce || 0) + 1;
-        return { value: window.__tideItemPick || null, nonce };
-    }
-    """,
-    Output('_tide_item_pick', 'data'),
-    Input('_tide-item-btn', 'n_clicks'),
-    State('_tide_item_pick', 'data'),
-    prevent_initial_call=True,
-)
-
-
-@app.callback(
-    Output('sel-tide', 'value', allow_duplicate=True),
-    Input('_tide_file_pick', 'data'),
-    prevent_initial_call=True,
-)
-def _sync_tide_file_from_pick(data):
-    if data and data.get('value') is not None:
-        return data['value']
-    return no_update
-
-
-@app.callback(
-    Output('sel-tide-item', 'value', allow_duplicate=True),
-    Input('_tide_item_pick', 'data'),
-    prevent_initial_call=True,
-)
-def _sync_tide_item_from_pick(data):
-    if data and data.get('value'):
-        return data['value']
-    return no_update
 
 
 # Load Results result → single combined progress overlay + zoom-to-fit, then bump stores
@@ -4844,14 +4930,6 @@ app.clientside_callback(
     prevent_initial_call='initial_duplicate',
 )
 
-# Enable/disable the dependent-picker section based on AIS selection.
-app.clientside_callback(
-    "function(v) { return v ? {} : {pointerEvents: 'none', opacity: '0.5'}; }",
-    Output('pickers-need-ais', 'style'),
-    Input('sel-ais', 'value'),
-    prevent_initial_call=False,
-)
-
 # Enable/disable the track-filter section based on whether waves are loaded.
 app.clientside_callback(
     "function(n) { return (n && n > 0) ? {} : {pointerEvents: 'none', opacity: '0.5'}; }",
@@ -4860,34 +4938,11 @@ app.clientside_callback(
     prevent_initial_call=False,
 )
 
-# Reset the cascade-tide-trigger label when sel-tide is cleared (e.g. on workdir
-# change). Without this the trigger keeps showing the previous workdir's pick.
-app.clientside_callback(
-    r"""
-    function(tide_val) {
-        if (tide_val) return window.dash_clientside.no_update;
-        window.__tideSelFile = null;
-        window.__tideSelItem = null;
-        const trig = document.getElementById('cascade-tide-trigger');
-        if (trig) {
-            trig.textContent = 'No tide file';
-            trig.className = 'cascade-trigger';
-        }
-        const panel = document.getElementById('cascade-tide-panel');
-        if (panel) panel.style.display = 'none';
-        return window.dash_clientside.no_update;
-    }
-    """,
-    Output('cascade-tide-trigger', 'children'),
-    Input('sel-tide', 'value'),
-    prevent_initial_call=True,
-)
-
 
 # Export button click → show destination form on first click, POST on second click.
 app.clientside_callback(
     r"""
-    async function(n, n_apply, dest, workdir, sel_ais, wd_options) {
+    async function(n, n_apply, dest, uploaded_files) {
         const nu = window.dash_clientside.no_update;
         const showForm = {'display': 'block'};
         const hideForm = {'display': 'none'};
@@ -4895,18 +4950,8 @@ app.clientside_callback(
         const cleanDest = (dest || '').trim();
         if (!cleanDest) {
             // First click or no name yet: reveal the folder input with a default name.
-            const defaultName = workdir
-                ? workdir.split('/').filter(Boolean).pop() + '_filtered'
-                : '';
+            const defaultName = 'aiswakepy_filtered';
             return ['Confirm or edit the destination folder name', nu, showForm, defaultName];
-        }
-        if (!workdir) {
-            return ['Pick a source workdir first', nu, showForm, nu];
-        }
-        // Guard: reject immediately if the destination folder already exists.
-        const existing = (wd_options || []).map(o => o.value);
-        if (existing.includes('data/' + cleanDest)) {
-            return [`Folder "data/${cleanDest}" already exists — choose a different name.`, nu, showForm, nu];
         }
         const seg_keys = (typeof window.__getFilteredSegKeys === 'function')
             ? window.__getFilteredSegKeys() : [];
@@ -4915,24 +4960,31 @@ app.clientside_callback(
         }
         const wave_idxs = (typeof window.__getFilteredWaveIdxs === 'function')
             ? window.__getFilteredWaveIdxs() : null;
+        const sel_ais = (uploaded_files && uploaded_files.ais) ? uploaded_files.ais.path : '';
         const body = JSON.stringify({
-            dest_name: cleanDest, workdir, seg_keys, wave_idxs, sel_ais: sel_ais || '',
+            dest_name: cleanDest, seg_keys, wave_idxs, sel_ais,
         });
         try {
             const resp = await fetch('/api/export/filtered',
                 { method: 'POST', headers: {'Content-Type': 'application/json'}, body });
-            const j = await resp.json();
-            if (!resp.ok || j.error) {
-                return [`Error: ${j.error || resp.statusText}`, nu, showForm, nu];
+            if (!resp.ok) {
+                let msg = resp.statusText;
+                try {
+                    const j = await resp.json();
+                    msg = j.error || msg;
+                } catch (_) {}
+                return [`Error: ${msg}`, nu, showForm, nu];
             }
-            const cp = j.copied || {};
-            const cpStr = ['coastline','land','bathymetry','tide']
-                .map(k => `${k}:${cp[k]||0}`).join(' ');
-            const msg = `Exported to ${j.workdir}\n`
-                      + `  tracks=${j.n_tracks}  waves=${j.n_waves}  ais=${j.n_ais}\n`
-                      + `  copied  ${cpStr}`;
-            // Bump the workdir rescan trigger so the new folder appears.
-            return [msg, Date.now(), hideForm, nu];
+            const blob = await resp.blob();
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = `${cleanDest || 'aiswakepy_export'}.zip`;
+            document.body.appendChild(a);
+            a.click();
+            a.remove();
+            setTimeout(() => URL.revokeObjectURL(url), 30000);
+            return [`Downloaded ${a.download}`, Date.now(), hideForm, nu];
         } catch (e) {
             return [`Error: ${e.message}`, nu, showForm, nu];
         }
@@ -4945,9 +4997,7 @@ app.clientside_callback(
     Input('btn-fil-export', 'n_clicks'),
     Input('btn-export-apply', 'n_clicks'),
     State('inp-export-dest', 'value'),
-    State('sel-workdir', 'value'),
-    State('sel-ais', 'value'),
-    State('sel-workdir', 'options'),
+    State('_uploaded_files', 'data'),
     prevent_initial_call=True,
 )
 
