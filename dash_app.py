@@ -3427,12 +3427,7 @@ async function(n) {
                     const bf = document.getElementById('btn-freehand');
                     if (bf) { bf.textContent = 'Draw line across tracks'; bf.style.opacity = ''; }
                 }
-                if (window.__waveBoxArmed || window.__waveBoxMode) {
-                    if (typeof window.__cancelWaveBoxDraw === 'function') window.__cancelWaveBoxDraw();
-                    window.__waveBoxArmed = false;
-                    const bw = document.getElementById('btn-wavebox');
-                    if (bw) { bw.textContent = 'Draw polygon on the map'; bw.style.opacity = ''; }
-                }
+                if (window.__polygonController) window.__polygonController.cancel();
                 if (window.__similarArmed) {
                     window.__similarArmed = false;
                     const bs = document.getElementById('btn-similar');
@@ -3608,182 +3603,59 @@ async function(n) {
             cv.width = r.width; cv.height = r.height;
             return cv;
         };
-        window.__waveBoxArmed = false;
-        window.__waveBoxMode  = false;
-        window.__cancelWaveBoxDraw = null;
-
-        window.__enterWaveBoxMode = () => {
-            const btn = document.getElementById('btn-wavebox');
-            if (!window.__hasWaves || wMMSI.length === 0) return;
-            if (window.__waveBoxArmed || window.__waveBoxMode) {
-                if (typeof window.__cancelWaveBoxDraw === 'function') {
-                    window.__cancelWaveBoxDraw();
-                } else {
-                    window.__waveBoxArmed = false;
-                    if (btn) {
-                        btn.textContent = 'Draw polygon on the map';
-                        btn.style.opacity = '';
-                    }
+        const pointInPolygon = (x, y, points) => {
+            let inside = false;
+            for (let i = 0, j = points.length - 1; i < points.length; j = i++) {
+                const xi = points[i][0], yi = points[i][1];
+                const xj = points[j][0], yj = points[j][1];
+                const crosses = ((yi > y) !== (yj > y)) &&
+                    (x < (xj - xi) * (y - yi) / ((yj - yi) || Number.EPSILON) + xi);
+                if (crosses) inside = !inside;
+            }
+            return inside;
+        };
+        const applyWavePolygon = (polygon) => {
+            const polygonWaveIdxs = [];
+            const polygonSegIdxs = new Set();
+            for (let i = 0; i < wMMSI.length; i++) {
+                const lon = wPos[i*2], lat = wPos[i*2+1];
+                if (pointInPolygon(lon, lat, polygon)) {
+                    polygonWaveIdxs.push(i);
+                    const si = waveToSegIdx ? waveToSegIdx[i] : -1;
+                    if (si >= 0) polygonSegIdxs.add(si);
+                }
+            }
+            if (polygonWaveIdxs.length === 0) return;
+            window.__filterState.waveBox = {
+                waveIdxs: new Set(polygonWaveIdxs),
+                segIdxs: polygonSegIdxs,
+            };
+            window.__recomputeVisibility();
+        };
+        const polygonController = new window.AiswakePolygonController({
+            container,
+            canvas: getOrCreateWaveBoxCanvas(),
+            button: document.getElementById('btn-wavebox'),
+            getViewport: () => window.deckInstance.getViewports()[0],
+            onComplete: applyWavePolygon,
+            onStateChange: () => {
+                if (typeof window.__updateDeckCursor === 'function') {
                     window.__updateDeckCursor();
                 }
-                return;
-            }
-            window.__waveBoxArmed = true;
-            if (btn) {
-                btn.textContent = 'Hold Ctrl to add polygon vertices';
-                btn.style.opacity = '0.75';
-            }
-            if (typeof window.__highlightCtrlHint === 'function') window.__highlightCtrlHint();
-            window.__updateDeckCursor();
-            if (window.__ctrlHeld) window.__activateWaveBoxDraw();
-        };
-
-        window.__activateWaveBoxDraw = () => {
-            if (!window.__waveBoxArmed || window.__waveBoxMode) return;
+            },
+        });
+        window.__polygonController = polygonController;
+        window.__enterWaveBoxMode = () => {
             if (!window.__hasWaves || wMMSI.length === 0) return;
-            window.__waveBoxMode = true;
-            window.__updateDeckCursor();
-            const btn = document.getElementById('btn-wavebox');
-            if (btn) { btn.textContent = 'Click vertices; click start to finish'; btn.style.opacity = '0.75'; }
-            const container = document.getElementById('deck-container');
-            const cv = getOrCreateWaveBoxCanvas();
-            cv.style.display = 'block';
-            const ctx2d = cv.getContext('2d');
-            let polygon = []; // world coordinates, so zoom/pan can continue while drawing
-            let hoverPoint = null;
-            let pointerStart = null;
-            const rect = () => container.getBoundingClientRect();
-            const screenPoint = (event) => {
-                const r = rect();
-                return [event.clientX - r.left, event.clientY - r.top];
-            };
-            const drawPolygon = () => {
-                ctx2d.clearRect(0, 0, cv.width, cv.height);
-                if (polygon.length === 0) return;
-                const vp = window.deckInstance.getViewports()[0];
-                const points = polygon.map(p => vp.project(p));
-                const hover = hoverPoint ? vp.project(hoverPoint) : null;
-                ctx2d.strokeStyle = 'rgba(80,200,255,0.95)';
-                ctx2d.fillStyle = 'rgba(80,200,255,0.14)';
-                ctx2d.lineWidth = 2;
-                ctx2d.lineCap = 'round';
-                ctx2d.lineJoin = 'round';
-                ctx2d.setLineDash([6, 4]);
-                ctx2d.beginPath();
-                ctx2d.moveTo(points[0][0], points[0][1]);
-                for (let i = 1; i < points.length; i++) {
-                    ctx2d.lineTo(points[i][0], points[i][1]);
-                }
-                if (hover) ctx2d.lineTo(hover[0], hover[1]);
-                ctx2d.stroke();
-                ctx2d.setLineDash([]);
-                for (let i = 0; i < points.length; i++) {
-                    ctx2d.beginPath();
-                    ctx2d.arc(points[i][0], points[i][1], i === 0 ? 6 : 4, 0, Math.PI * 2);
-                    ctx2d.fillStyle = i === 0 ? 'rgba(255,220,80,0.95)' : 'rgba(80,200,255,0.95)';
-                    ctx2d.fill();
-                }
-            };
-            window.__redrawWavePolygon = drawPolygon;
-            const onPointerDown = (e) => {
-                if (e.button !== 0) return;
-                pointerStart = screenPoint(e);
-            };
-            const onPointerMove = (e) => {
-                if (!e.ctrlKey && !window.__ctrlHeld) {
-                    hoverPoint = null;
-                    drawPolygon();
-                    return;
-                }
-                const vp = window.deckInstance.getViewports()[0];
-                hoverPoint = vp.unproject(screenPoint(e));
-                drawPolygon();
-            };
-            const pointInPolygon = (x, y, points) => {
-                let inside = false;
-                for (let i = 0, j = points.length - 1; i < points.length; j = i++) {
-                    const xi = points[i][0], yi = points[i][1];
-                    const xj = points[j][0], yj = points[j][1];
-                    const crosses = ((yi > y) !== (yj > y)) &&
-                        (x < (xj - xi) * (y - yi) / ((yj - yi) || Number.EPSILON) + xi);
-                    if (crosses) inside = !inside;
-                }
-                return inside;
-            };
-            const complete = () => {
-                if (polygon.length < 3) return;
-                const polygonWaveIdxs = [];
-                const polygonSegIdxs = new Set();
-                for (let i = 0; i < wMMSI.length; i++) {
-                    const lon = wPos[i*2], lat = wPos[i*2+1];
-                    if (pointInPolygon(lon, lat, polygon)) {
-                        polygonWaveIdxs.push(i);
-                        const si = waveToSegIdx ? waveToSegIdx[i] : -1;
-                        if (si >= 0) polygonSegIdxs.add(si);
-                    }
-                }
-                if (polygonWaveIdxs.length > 0) {
-                    window.__filterState.waveBox = {
-                        waveIdxs: new Set(polygonWaveIdxs),
-                        segIdxs: polygonSegIdxs,
-                    };
-                    window.__recomputeVisibility();
-                }
-                finish();
-            };
-            const onPointerUp = (e) => {
-                if (e.button !== 0 || !pointerStart) return;
-                const point = screenPoint(e);
-                const moved = Math.hypot(
-                    point[0] - pointerStart[0], point[1] - pointerStart[1]);
-                pointerStart = null;
-                if (moved > 5) {
-                    drawPolygon();
-                    return; // map pan, not a polygon vertex
-                }
-                if (!e.ctrlKey && !window.__ctrlHeld) return;
-                const vp = window.deckInstance.getViewports()[0];
-                if (polygon.length >= 3) {
-                    const first = vp.project(polygon[0]);
-                    if (Math.hypot(point[0] - first[0], point[1] - first[1]) <= 14) {
-                        complete();
-                        return;
-                    }
-                }
-                polygon.push(vp.unproject(point));
-                hoverPoint = null;
-                drawPolygon();
-            };
-            const removeListeners = () => {
-                container.removeEventListener('pointerdown', onPointerDown);
-                container.removeEventListener('pointermove', onPointerMove);
-                container.removeEventListener('pointerup', onPointerUp);
-                window.__cancelWaveBoxDraw = null;
-                window.__redrawWavePolygon = null;
-            };
-            const cancel = () => {
-                removeListeners();
-                window.__waveBoxArmed = false;
-                window.__waveBoxMode = false;
-                window.__updateDeckCursor();
-                if (btn) { btn.textContent = 'Draw polygon on the map'; btn.style.opacity = ''; }
-                cv.style.display = 'none';
-                ctx2d.clearRect(0, 0, cv.width, cv.height);
-            };
-            const finish = () => {
-                removeListeners();
-                window.__waveBoxArmed = false;
-                window.__waveBoxMode  = false;
-                window.__updateDeckCursor();
-                if (btn) { btn.textContent = 'Draw polygon on the map'; btn.style.opacity = ''; }
-                cv.style.display = 'none';
-                ctx2d.clearRect(0, 0, cv.width, cv.height);
-            };
-            window.__cancelWaveBoxDraw = cancel;
-            container.addEventListener('pointerdown', onPointerDown);
-            container.addEventListener('pointermove', onPointerMove);
-            container.addEventListener('pointerup', onPointerUp);
+            polygonController.setCtrlHeld(window.__ctrlHeld);
+            const armed = polygonController.arm();
+            if (armed && typeof window.__highlightCtrlHint === 'function') {
+                window.__highlightCtrlHint();
+            }
         };
+        window.__activateWaveBoxDraw = () => polygonController.activate();
+        window.__cancelWaveBoxDraw = () => polygonController.cancel();
+        window.__redrawWavePolygon = () => polygonController.redraw();
         if (window.__pendingWaveBoxClick) {
             window.__pendingWaveBoxClick = false;
             window.__enterWaveBoxMode();
@@ -3830,12 +3702,7 @@ async function(n) {
                 const bf = document.getElementById('btn-freehand');
                 if (bf) { bf.textContent = 'Draw line across tracks'; bf.style.opacity = ''; }
             }
-            if (window.__waveBoxArmed || window.__waveBoxMode) {
-                if (typeof window.__cancelWaveBoxDraw === 'function') window.__cancelWaveBoxDraw();
-                window.__waveBoxArmed = false;
-                const bw = document.getElementById('btn-wavebox');
-                if (bw) { bw.textContent = 'Draw polygon on the map'; bw.style.opacity = ''; }
-            }
+            if (window.__polygonController) window.__polygonController.cancel();
             if (window.__similarArmed) {
                 window.__similarArmed = false;
                 const bs = document.getElementById('btn-similar');
@@ -4156,11 +4023,12 @@ async function(n) {
         // Single source of truth for cursor — used by deck.gl getCursor AND manual updates.
         // isHovering comes from deck.gl's pick state; isDragging from mousedown/up.
         const getCursorForState = (isDragging = false, isHovering = false) => {
+            const polygonState = window.__polygonController?.getState();
             if (window.__freehandMode) return CURSOR_PENCIL;
-            if (window.__waveBoxMode)  return 'crosshair';
+            if (polygonState?.drawing) return 'crosshair';
             if (window.__ctrlHeld) {
                 if (window.__freehandArmed) return CURSOR_PENCIL;
-                if (window.__waveBoxArmed)  return 'crosshair';
+                if (polygonState?.armed) return 'crosshair';
                 if (window.__similarArmed)  return 'pointer';
                 return isHovering ? 'pointer' : 'default';
             }
@@ -4259,14 +4127,14 @@ async function(n) {
             window.__updateDeckCursor();
             if (typeof window.__rebuild === 'function') window.__rebuild();
             if (window.__freehandArmed && !window.__freehandMode) window.__activateFreehandDraw();
-            if (window.__waveBoxArmed && !window.__waveBoxMode) window.__activateWaveBoxDraw();
+            if (window.__polygonController) window.__polygonController.setCtrlHeld(true);
         });
         window.addEventListener('keyup', (e) => {
             if (e.key !== 'Control' || !window.__ctrlHeld) return;
             window.__ctrlHeld = false;
             hideTip();
             if (window.__freehandMode && typeof window.__cancelFreehandDraw === 'function') window.__cancelFreehandDraw();
-            if (window.__waveBoxMode && typeof window.__cancelWaveBoxDraw === 'function') window.__cancelWaveBoxDraw();
+            if (window.__polygonController) window.__polygonController.setCtrlHeld(false);
             window.__updateDeckCursor();
         });
         // Clear inspect mode if window loses focus while Ctrl is held (otherwise
@@ -4276,7 +4144,7 @@ async function(n) {
             window.__ctrlHeld = false;
             hideTip();
             if (window.__freehandMode && typeof window.__cancelFreehandDraw === 'function') window.__cancelFreehandDraw();
-            if (window.__waveBoxMode && typeof window.__cancelWaveBoxDraw === 'function') window.__cancelWaveBoxDraw();
+            if (window.__polygonController) window.__polygonController.setCtrlHeld(false);
             window.__updateDeckCursor();
         });
         container.addEventListener('mousedown', (e) => {
@@ -4286,12 +4154,16 @@ async function(n) {
                 window.__updateDeckCursor();
                 // Activate armed modes in case keydown didn't fire before Ctrl was held
                 if (window.__freehandArmed && !window.__freehandMode) window.__activateFreehandDraw();
-                if (window.__waveBoxArmed && !window.__waveBoxMode) window.__activateWaveBoxDraw();
+                if (window.__polygonController) window.__polygonController.setCtrlHeld(true);
             }
-            if (!window.__freehandMode && !window.__waveBoxMode) window.__updateDeckCursor(true);
+            if (!window.__freehandMode && !window.__polygonController?.getState().drawing) {
+                window.__updateDeckCursor(true);
+            }
         });
         window.addEventListener('mouseup', () => {
-            if (!window.__freehandMode && !window.__waveBoxMode) window.__updateDeckCursor(false);
+            if (!window.__freehandMode && !window.__polygonController?.getState().drawing) {
+                window.__updateDeckCursor(false);
+            }
         });
         const rebuildOnView = debounce((z) => {
             window.deckInstance.setProps({ layers: buildLayers(z, window._hoveredWave) });
