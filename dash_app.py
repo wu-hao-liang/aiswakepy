@@ -318,6 +318,7 @@ class SessionState:
     ipc_track_offsets: bytes = EMPTY_IPC_TRACK_OFFSETS
     png_bytes: bytes = EMPTY_PNG_BYTES
     last_results: dict = field(default_factory=dict)
+    downloads: dict[str, Path] = field(default_factory=dict)
     pipeline: dict = field(default_factory=_new_pipeline_state)
     lock: threading.RLock = field(default_factory=threading.RLock)
 
@@ -1014,6 +1015,14 @@ INDEX_TEMPLATE = """<!DOCTYPE html>
                                  box-shadow: inset 0 1px 3px rgba(0,0,0,0.2); }
         #sidebar button:disabled { background: #b8c8d8 !important; border-color: #a0b4c4 !important;
                                    box-shadow: none !important; cursor: wait; text-shadow: none; }
+        #btn-fil-export.export-busy { pointer-events: none; cursor: wait; opacity: 0.8; }
+        #btn-fil-export.export-busy::before {
+            content: ''; display: inline-block; width: 10px; height: 10px;
+            margin-right: 6px; vertical-align: -1px; border: 2px solid rgba(255,255,255,0.45);
+            border-top-color: white; border-radius: 50%;
+            animation: export-spin 0.75s linear infinite;
+        }
+        @keyframes export-spin { to { transform: rotate(360deg); } }
         #btn-waves { background: linear-gradient(180deg, #5abaaa, #3a9a8a) !important;
                      border-color: #3a9a8a !important; }
         #btn-waves:hover { background: linear-gradient(180deg, #4aaa9a, #2a8a7a) !important;
@@ -1028,7 +1037,8 @@ INDEX_TEMPLATE = """<!DOCTYPE html>
                          background: rgba(0,0,0,0.45); z-index: 20; cursor: not-allowed;
                          display: flex; align-items: center; justify-content: center; }
         #progress-log { background: #1e1e1e; color: #ddd; font: 11px ui-monospace, monospace;
-                        padding: 8px; max-height: 160px; overflow: auto; white-space: pre-wrap;
+                        line-height: 14px; padding: 5px 8px; height: 52px; overflow: auto;
+                        white-space: pre-wrap; box-sizing: border-box;
                         border-radius: 3px; margin: 4px 0; }
         #deck-container { position: fixed; top: 40px; left: 340px; right: 0; bottom: 0;
                           z-index: 1; overflow: hidden; transition: right 0.2s ease; }
@@ -1049,6 +1059,25 @@ INDEX_TEMPLATE = """<!DOCTYPE html>
                            line-height: 1.2; }
         #ctrl-hint-body { font-size: 10px; color: rgba(200,220,255,0.75);
                           margin-top: 4px; line-height: 1.7; }
+        .status-highlight { animation: status-highlight 1.1s ease-out; }
+        #ctrl-hint.ctrl-highlight { animation: ctrl-highlight 2.6s ease-out; }
+        @keyframes status-highlight {
+            0% { background: rgba(255,220,80,0.9); color: #17243a;
+                 box-shadow: 0 0 0 3px rgba(255,220,80,0.35); }
+            100% { background: transparent; box-shadow: none; }
+        }
+        @keyframes ctrl-highlight {
+            0%, 55% { background: rgba(255,215,55,0.98);
+                 color: #17243a; border-color: rgba(255,235,120,1);
+                 box-shadow: 0 0 0 7px rgba(255,215,55,0.42), 0 2px 18px rgba(0,0,0,0.55);
+                 transform: scale(1.08); }
+            100% { border-color: rgba(255,255,255,0.08);
+                   color: inherit;
+                   background: rgba(16,18,28,0.88);
+                   box-shadow: 0 2px 12px rgba(0,0,0,0.45); transform: scale(1); }
+        }
+        #ctrl-hint.ctrl-highlight #ctrl-hint-title,
+        #ctrl-hint.ctrl-highlight #ctrl-hint-body { color: #17243a; }
         #tooltip { position: fixed; pointer-events: none; padding: 6px 10px;
                    background: rgba(0,0,0,0.85); color: white; font: 12px monospace;
                    border-radius: 4px; z-index: 100; display: none; white-space: nowrap; }
@@ -1652,21 +1681,20 @@ def _r_load_results():
 
 
 # ---------------------------------------------------------------------------
-# Export filtered tracks/waves/AIS subset → downloadable rerun ZIP
+# Export full or filtered tracks/waves and session inputs → downloadable rerun ZIP
 # ---------------------------------------------------------------------------
 _FORBIDDEN_NAME_CHARS = ('/', '\\', '..', ':', '\0')
 
 
 def _export_filtered(state: SessionState, body: dict) -> Path:
-    """Build a rerun-ready ZIP slice of the current session state."""
+    """Build a rerun-ready ZIP of the full session or its visible filtered slice."""
     dest_name = (body.get('dest_name') or '').strip()
     if not dest_name:
         dest_name = 'aiswakepy_export'
     if any(c in dest_name for c in _FORBIDDEN_NAME_CHARS):
         raise ValueError(f'invalid characters in folder name: {dest_name!r}')
+    filtered = bool(body.get('filtered'))
     seg_keys = body.get('seg_keys') or []
-    if not seg_keys:
-        raise ValueError('no filter is active — nothing to export')
     seg_key_set = {(int(m), int(s)) for m, s in seg_keys}
     wave_idxs = body.get('wave_idxs')  # may be None or list[int]
     sel_ais = body.get('sel_ais') or ''
@@ -1681,24 +1709,39 @@ def _export_filtered(state: SessionState, body: dict) -> Path:
     df_f = state.last_results.get('df_filtered')
     if df_f is None or len(df_f) == 0:
         raise RuntimeError('no filtered AIS available — run Calculate Waves first')
-    keys = list(zip(df_f['mmsi'].astype(int), df_f['segment_id'].astype(int)))
-    ais_subset = df_f.loc[pd.Series([k in seg_key_set for k in keys], index=df_f.index)].copy()
-    ais_cols = ['mmsi', 'width', 'length', 'draught', 'obstime',
-                'longitude', 'latitude', 'sog', 'cog', 'typecargo']
-    ais_stem = Path(sel_ais).stem if sel_ais else 'ais_filtered'
-    ais_subset[[c for c in ais_cols if c in ais_subset.columns]].to_csv(
-        export_root / 'ais' / f'{ais_stem}.csv', index=False)
+    ais_source = state.files.get('ais')
+    if not filtered and ais_source and ais_source.is_file():
+        ais_name = state.original_names.get('ais') or ais_source.name
+        shutil.copy2(ais_source, export_root / 'ais' / ais_name)
+        ais_relpath = f'ais/{ais_name}'
+    else:
+        keys = list(zip(df_f['mmsi'].astype(int), df_f['segment_id'].astype(int)))
+        ais_subset = (
+            df_f.loc[pd.Series([k in seg_key_set for k in keys], index=df_f.index)].copy()
+            if filtered else df_f.copy()
+        )
+        ais_cols = ['mmsi', 'width', 'length', 'draught', 'obstime',
+                    'longitude', 'latitude', 'sog', 'cog', 'typecargo']
+        ais_stem = Path(state.original_names.get('ais') or sel_ais or 'ais').stem
+        ais_name = f'{ais_stem}.csv'
+        ais_subset[[c for c in ais_cols if c in ais_subset.columns]].to_csv(
+            export_root / 'ais' / ais_name, index=False)
+        ais_relpath = f'ais/{ais_name}'
 
     df_v = state.df_vessels
-    tracks_mask = pd.Series(
-        [k in seg_key_set for k in zip(df_v['mmsi'].astype(int), df_v['segment_id'].astype(int))],
-        index=df_v.index,
-    ) if len(df_v) > 0 else pd.Series([], dtype=bool)
-    df_tracks_out = df_v.loc[tracks_mask].reset_index(drop=True)
+    if filtered and len(df_v) > 0:
+        tracks_mask = pd.Series(
+            [k in seg_key_set for k in zip(
+                df_v['mmsi'].astype(int), df_v['segment_id'].astype(int))],
+            index=df_v.index,
+        )
+        df_tracks_out = df_v.loc[tracks_mask].reset_index(drop=True)
+    else:
+        df_tracks_out = df_v.reset_index(drop=True)
     df_tracks_out.to_parquet(out_dir / 'vessels.parquet', index=False)
 
     df_w = state.df_waves
-    if len(df_w) > 0:
+    if filtered and len(df_w) > 0:
         if wave_idxs is not None:
             idxs = [int(i) for i in wave_idxs if 0 <= int(i) < len(df_w)]
             df_waves_out = df_w.iloc[idxs].reset_index(drop=True)
@@ -1709,7 +1752,14 @@ def _export_filtered(state: SessionState, body: dict) -> Path:
             )
             df_waves_out = df_w.loc[wmask].reset_index(drop=True)
     else:
-        df_waves_out = df_w.iloc[:0].copy()
+        df_waves_out = df_w.reset_index(drop=True)
+
+    if not filtered:
+        session_output = state.root / 'output'
+        if session_output.is_dir():
+            for path in session_output.iterdir():
+                if path.is_file():
+                    shutil.copy2(path, out_dir / path.name)
     df_waves_out.to_parquet(out_dir / 'waves.parquet', index=False)
     _write_wave_track_link(df_waves_out, out_dir)
 
@@ -1723,10 +1773,10 @@ def _export_filtered(state: SessionState, body: dict) -> Path:
             else:
                 shutil.copy2(src, export_root / sub / src.name)
 
-    cfg_snap = dict(state.pipeline.get('cfg') or {})
+    cfg_snap = json.loads(json.dumps(state.pipeline.get('cfg') or {}))
     if cfg_snap:
         cfg_snap.setdefault('output', {})['directory'] = 'output'
-        cfg_snap['ais']['raw_csv'] = f'ais/{ais_stem}.csv'
+        cfg_snap['ais']['raw_csv'] = ais_relpath
         cfg_snap['ais']['land_shp'] = next(
             (f'land/{p.name}' for p in (export_root / 'land').glob('*.shp')), '')
         cfg_snap['coastline']['shapefile'] = next(
@@ -1738,6 +1788,13 @@ def _export_filtered(state: SessionState, body: dict) -> Path:
         if tide_files:
             cfg_snap['bathymetry']['tide_dfs0'] = f'tide/{tide_files[0].name}'
         (export_root / 'config.json').write_text(json.dumps(cfg_snap, indent=2), encoding='utf-8')
+        if filtered and len(df_waves_out) > 0:
+            _generate_report_plots(
+                state.pipeline.get('cfg') or {},
+                df_tracks_out,
+                df_waves_out,
+                out_dir=out_dir,
+            )
 
     zip_path = state.root / 'exports' / f'{dest_name}.zip'
     if zip_path.exists():
@@ -1756,6 +1813,36 @@ def _r_export_filtered():
     try:
         state = _get_session()
         zip_path = _export_filtered(state, body)
+        token = uuid.uuid4().hex
+        with state.lock:
+            state.downloads[token] = zip_path
+        return jsonify({
+            'filename': zip_path.name,
+            'download_url': (
+                f'/api/export/download/{token}?session_id={state.session_id}'
+            ),
+        })
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return jsonify({'error': str(e)}), 500
+
+
+@app.server.route('/api/export/download/<token>')
+def _r_download_export(token: str):
+    try:
+        state = _get_session()
+        with state.lock:
+            zip_path = state.downloads.pop(token, None)
+        if zip_path is None:
+            return jsonify({'error': 'download expired or already used'}), 404
+        zip_path = zip_path.resolve()
+        try:
+            zip_path.relative_to(state.root.resolve())
+        except ValueError:
+            return jsonify({'error': 'invalid download path'}), 400
+        if not zip_path.is_file():
+            return jsonify({'error': 'download file not found'}), 404
         return send_file(
             zip_path,
             mimetype='application/zip',
@@ -1764,9 +1851,7 @@ def _r_export_filtered():
             max_age=0,
         )
     except Exception as e:
-        import traceback
-        traceback.print_exc()
-        return jsonify({'error': str(e)}), 500
+        return jsonify({'error': str(e)}), 404
 
 
 @app.server.route('/api/preview/ais.arrow')
@@ -1946,6 +2031,9 @@ app.layout = html.Div([
     html.Div([
 
         html.Div([
+            html.Div(id='upload-status',
+                     style={'fontSize': '10px', 'color': '#556', 'whiteSpace': 'pre-wrap',
+                            'marginBottom': '4px'}),
             html.Div(id='upload-ais-host'),
             html.Div(id='pv-ais-info', className='preview-info'),
             html.Div(id='upload-coast-host'),
@@ -1955,9 +2043,6 @@ app.layout = html.Div([
             html.Div(id='upload-bathy-host'),
             html.Div(id='pv-bathy-info', className='preview-info'),
             html.Div(id='upload-tide-host'),
-            html.Div(id='upload-status',
-                     style={'fontSize': '10px', 'color': '#556', 'whiteSpace': 'pre-wrap',
-                            'marginBottom': '4px'}),
         ], id='upload-panel'),
 
         # ---- Calculate Waves button ----
@@ -2030,36 +2115,28 @@ app.layout = html.Div([
                       'border': '1px solid #bcd0e4'}),
             html.Label('Wave arrival area'),
             html.Div([
-                html.Button('Drag box on the map', id='btn-wavebox', n_clicks=0,
-                            title='Drag a rectangle on the map — keeps only waves landing '
+                html.Button('Draw polygon on the map', id='btn-wavebox', n_clicks=0,
+                            title='Draw a polygon on the map — keeps only waves landing '
                                   'inside, plus the tracks that produced them'),
             ], className='row-buttons'),
             html.Div([
-                html.Button('Clear all filters', id='btn-fil-clear', n_clicks=0),
-                html.Button('Export filtered →', id='btn-fil-export', n_clicks=0,
-                            title='Save filtered tracks, waves, AIS subset and input file '
-                                  'copies into a new data/ subfolder'),
+                html.Button('Reset', id='btn-fil-clear', n_clicks=0),
+                html.Button('Invert', id='btn-fil-invert', n_clicks=0,
+                            title='Invert the final combined filter selection'),
+                html.Button('Export', id='btn-fil-export', n_clicks=0,
+                            title='Download all inputs and results, or only visible results '
+                                  'when a visualization filter is active'),
             ], className='row-buttons'),
-            html.Div(id='export-dest-form', style={'display': 'none'}, children=[
-                html.Div([
-                    dcc.Input(id='inp-export-dest', type='text',
-                              placeholder='new folder name (under data/)',
-                              debounce=False,
-                              style={'fontSize': '10px', 'flex': '1',
-                                     'padding': '3px 6px',
-                                     'border': '1px solid #c8d4e0', 'borderRadius': '3px',
-                                     'boxSizing': 'border-box', 'minWidth': '0'}),
-                    html.Button('Apply', id='btn-export-apply', n_clicks=0,
-                                style={'marginLeft': '4px', 'whiteSpace': 'nowrap',
-                                       'flex': '0 0 auto'}),
-                ], style={'display': 'flex', 'alignItems': 'center', 'marginTop': '4px'}),
-            ]),
-            html.Div('', id='export-status',
-                     style={'fontSize': '10px', 'color': '#556', 'marginTop': '3px',
-                            'minHeight': '14px', 'whiteSpace': 'pre-wrap'}),
-            html.Div('', id='fil-status',
-                     style={'fontSize': '10px', 'color': '#556', 'marginTop': '3px',
-                            'minHeight': '14px'}),
+            html.Div([
+                html.Div('', id='fil-status',
+                         style={'fontSize': '10px', 'color': '#556',
+                                'minHeight': '14px', 'flex': '1', 'minWidth': '0'}),
+                html.Div('', id='export-status',
+                         style={'fontSize': '10px', 'color': '#556',
+                                'minHeight': '14px', 'flex': '1', 'minWidth': '0',
+                                'textAlign': 'right', 'whiteSpace': 'pre-wrap'}),
+            ], style={'display': 'flex', 'alignItems': 'flex-start', 'gap': '8px',
+                      'marginTop': '3px'}),
 
         ]),
 
@@ -2559,14 +2636,13 @@ def _populate_seg_options(mmsi, session_data):
 @app.callback(
     Output('_filter_structural', 'data', allow_duplicate=True),
     Output('fil-type', 'value', allow_duplicate=True),
-    Output('btn-fil-export', 'disabled', allow_duplicate=True),
     Input('btn-fil-clear', 'n_clicks'),
     State('_filter_structural', 'data'),
     prevent_initial_call=True,
 )
 def _clear_track_filter(_, prev):
     nonce = ((prev or {}).get('nonce', 0) + 1)
-    return {'mmsi': None, 'seg_ids': [], 'types': [], 'nonce': nonce, '_clear': True}, None, True
+    return {'mmsi': None, 'seg_ids': [], 'types': [], 'nonce': nonce, '_clear': True}, None
 
 
 # Vessel type applies immediately on dropdown change
@@ -2632,6 +2708,27 @@ async function(n) {
         };
     }
     const uploadStatus = document.getElementById('upload-status');
+    const pulseElement = (el, className, duration = 1200) => {
+        if (!el) return;
+        if (el.__pulseTimer) window.clearTimeout(el.__pulseTimer);
+        el.classList.remove(className);
+        void el.offsetWidth;
+        el.classList.add(className);
+        el.__pulseTimer = window.setTimeout(() => {
+            el.classList.remove(className);
+            el.__pulseTimer = null;
+        }, duration);
+    };
+    window.__highlightCtrlHint = () =>
+        pulseElement(document.getElementById('ctrl-hint'), 'ctrl-highlight', 2800);
+    for (const id of ['upload-status', 'export-status', 'fil-status']) {
+        const el = document.getElementById(id);
+        if (!el || el.dataset.highlightReady) continue;
+        el.dataset.highlightReady = '1';
+        new MutationObserver(() => {
+            if ((el.textContent || '').trim()) pulseElement(el, 'status-highlight');
+        }).observe(el, {childList: true, characterData: true, subtree: true});
+    }
     // Role specs: must match ROLE_SPECS in dash_app.py (backend canonical source).
     const labels = {
         ais:   {host: 'upload-ais-host',   label: 'AIS CSV', accept: '.csv',
@@ -2729,7 +2826,39 @@ async function(n) {
         });
     };
     Object.keys(labels).forEach(k => makeUploadRow(k, labels[k]));
-
+    const exportButton = document.getElementById('btn-fil-export');
+    const exportStatus = document.getElementById('export-status');
+    window.__setExportBusy = (busy, message) => {
+        if (exportButton) {
+            exportButton.classList.toggle('export-busy', !!busy);
+            exportButton.setAttribute('aria-busy', busy ? 'true' : 'false');
+        }
+        if (exportStatus && message != null) exportStatus.textContent = message;
+    };
+    if (exportButton && !exportButton.dataset.savePickerReady) {
+        exportButton.dataset.savePickerReady = '1';
+        exportButton.addEventListener('click', () => {
+            const canPick = window.isSecureContext
+                && typeof window.showSaveFilePicker === 'function';
+            window.__setExportBusy(
+                true,
+                canPick
+                    ? 'Choose a save location, then the export will be prepared...'
+                    : 'Preparing export... The browser will use its download settings.',
+            );
+            if (!canPick) {
+                window.__exportFileHandlePromise = null;
+                return;
+            }
+            window.__exportFileHandlePromise = window.showSaveFilePicker({
+                suggestedName: 'aiswakepy_export.zip',
+                types: [{
+                    description: 'ZIP archive',
+                    accept: {'application/zip': ['.zip']},
+                }],
+            }).then(handle => ({handle})).catch(error => ({error}));
+        });
+    }
     // ---------- Tooltip ----------
     const tip = document.createElement('div');
     tip.id = 'tooltip';
@@ -2935,6 +3064,7 @@ async function(n) {
         let wWid = new Float32Array(0), wDist = new Float32Array(0);
         let wVesselLon = new Float32Array(0), wVesselLat = new Float32Array(0);
         let wSegId = new Int32Array(0);
+        let wSourceIdx = new Int32Array(0);
         // Precomputed mapping: wave index → track segment index (-1 = no match).
         // Rebuilt every time wave OR track data changes; values are Number-normalised
         // so BigInt (int64) vs Number (int32) representations never disagree.
@@ -2970,6 +3100,7 @@ async function(n) {
             wLen = get('VesselLength'); wWid = get('VesselWidth'); wDist = get('DistLoc_km');
             wVesselLon = get('VesselLongitude'); wVesselLat = get('VesselLatitude');
             wSegId = wT.getChild('segment_id') ? wT.getChild('segment_id').toArray() : new Int32Array(wLon.length);
+            wSourceIdx = Int32Array.from({length: wLon.length}, (_, i) => i);
             wPos = new Float32Array(wLon.length * 2);
             for (let i = 0; i < wLon.length; i++) { wPos[i*2]=wLon[i]; wPos[i*2+1]=wLat[i]; }
             // Sort by H ascending so highest wave renders on top (deck.gl draws last index last = on top)
@@ -2992,6 +3123,7 @@ async function(n) {
                 wLen = reorder(wLen); wWid = reorder(wWid); wDist = reorder(wDist);
                 wVesselLon = reorder(wVesselLon); wVesselLat = reorder(wVesselLat);
                 wSegId = reorder(wSegId);
+                wSourceIdx = reorder(wSourceIdx);
                 const _origSide = wSide, _origTime = wTime;
                 wSide = (i) => _origSide(perm[i]);
                 wTime = (i) => _origTime(perm[i]);
@@ -3053,8 +3185,12 @@ async function(n) {
         };
 
         // ---- Multi-filter state ----
-        window.__filterState = { mmsi: null, seg_ids: [], types: [], freehand: null, similar: null, waveBox: null };
+        window.__filterState = {
+            mmsi: null, seg_ids: [], types: [], freehand: null,
+            similar: null, waveBox: null, inverted: false,
+        };
         window.__visibleSegIdxs = null; // null = show all; Set<segIdx> = filtered
+        window.__baseVisibleSegIdxs = null; // combined filters before optional inversion
         window.__visibleWaveIdxs = null; // null = show all; Set<waveIdx> = filtered (post-sort idx)
         window.__visibleWaveIdxsArr = null; // sorted Array<waveIdx> matching visibility (preserves H-asc order)
         window.__filteredWavePos = null; // packed Float32Array of [lon,lat,...] for visible waves
@@ -3099,7 +3235,7 @@ async function(n) {
         const rebuildFilteredWaveArrays = () => {
             const fs = window.__filterState;
             const M = wMMSI.length;
-            const segVis = window.__visibleSegIdxs;
+            const segVis = window.__baseVisibleSegIdxs;
             // No waves loaded → reset.
             if (M === 0 || !window.__hasWaves) {
                 window.__visibleWaveIdxs = null;
@@ -3110,7 +3246,7 @@ async function(n) {
             // No filter active → reset.
             const noBox = fs.waveBox == null;
             const noTrackFilter = segVis === null;
-            if (noBox && noTrackFilter) {
+            if (noBox && noTrackFilter && !fs.inverted) {
                 window.__visibleWaveIdxs = null;
                 window.__visibleWaveIdxsArr = null;
                 window.__filteredWavePos = null;
@@ -3128,11 +3264,13 @@ async function(n) {
             const visSet = new Set();
             const visArr = [];
             for (let i = 0; i < M; i++) {
-                if (boxSet && !boxSet.has(i)) continue;
+                let passes = !boxSet || boxSet.has(i);
                 if (!noTrackFilter) {
                     const sIdx = waveToSegIdx ? waveToSegIdx[i] : -1;
-                    if (sIdx < 0 || !segVis.has(sIdx)) continue;
+                    passes = passes && sIdx >= 0 && segVis.has(sIdx);
                 }
+                if (fs.inverted) passes = !passes;
+                if (!passes) continue;
                 visSet.add(i);
                 visArr.push(i);
             }
@@ -3155,14 +3293,18 @@ async function(n) {
                             (!fs.seg_ids || !fs.seg_ids.length) &&
                             (!fs.types || !fs.types.length) &&
                             fs.freehand == null && fs.similar == null &&
-                            fs.waveBox == null;
+                            fs.waveBox == null && !fs.inverted;
             if (N === 0 || allNull) {
                 window.__visibleSegIdxs = null;
+                window.__baseVisibleSegIdxs = null;
                 rebuildFilteredArrays(null);
                 rebuildFilteredWaveArrays();
                 window.__rebuild();
                 const stat = document.getElementById('fil-status');
                 if (stat) stat.textContent = N > 0 ? `All ${N.toLocaleString()} tracks visible` : '';
+                if (window.dash_clientside?.set_props) {
+                    window.dash_clientside.set_props('_any_filter_active', {data: false});
+                }
                 return;
             }
             const sets = [];
@@ -3213,8 +3355,9 @@ async function(n) {
                 sets.push(new Set(fs.waveBox.segIdxs));
             }
             if (sets.length === 0) {
-                window.__visibleSegIdxs = null;
-                rebuildFilteredArrays(null);
+                window.__baseVisibleSegIdxs = fs.inverted
+                    ? new Set(Array.from({length: N}, (_, i) => i))
+                    : null;
             } else {
                 sets.sort((a, b) => a.size - b.size);
                 let result = sets[0];
@@ -3223,9 +3366,20 @@ async function(n) {
                     for (const v of result) { if (sets[k].has(v)) next.add(v); }
                     result = next;
                 }
-                window.__visibleSegIdxs = result;
-                rebuildFilteredArrays(Array.from(result));
+                window.__baseVisibleSegIdxs = result;
             }
+            if (fs.inverted) {
+                const result = new Set();
+                for (let i = 0; i < N; i++) {
+                    if (window.__baseVisibleSegIdxs === null ||
+                            !window.__baseVisibleSegIdxs.has(i)) result.add(i);
+                }
+                window.__visibleSegIdxs = result;
+            } else {
+                window.__visibleSegIdxs = window.__baseVisibleSegIdxs;
+            }
+            rebuildFilteredArrays(
+                window.__visibleSegIdxs === null ? null : Array.from(window.__visibleSegIdxs));
             rebuildFilteredWaveArrays();
             window.__rebuild();
             // Update status div directly (also updated via Dash callback for structural changes)
@@ -3237,21 +3391,30 @@ async function(n) {
                     : `${vis.size.toLocaleString()} of ${N.toLocaleString()} tracks visible`;
             }
             if (window.dash_clientside?.set_props) {
-                const isActive = window.__visibleSegIdxs !== null && window.__visibleSegIdxs.size > 0;
+                const isActive = sets.length > 0 || fs.inverted;
                 window.dash_clientside.set_props('_any_filter_active', {data: isActive});
             }
+        };
+
+        window.__invertFilters = () => {
+            window.__filterState.inverted = !window.__filterState.inverted;
+            window.__recomputeVisibility();
+            return window.__filterState.inverted
+                ? 'Filter selection inverted'
+                : 'Filter inversion removed';
         };
 
         window.__applyStructuralFilter = (structural) => {
             if (!structural) return '';
             if (structural._clear) {
-                // Full reset from "Clear all" button
+                // Full reset from the Reset button
                 window.__filterState.mmsi    = null;
                 window.__filterState.seg_ids = [];
                 window.__filterState.types   = [];
                 window.__filterState.freehand = null;
                 window.__filterState.similar  = null;
                 window.__filterState.waveBox  = null;
+                window.__filterState.inverted = false;
                 window.__cascadeMMSI = null;
                 window.__cascadeSegs = [];
                 if (typeof window.__updateCascadeTrigger === 'function') window.__updateCascadeTrigger();
@@ -3268,7 +3431,7 @@ async function(n) {
                     if (typeof window.__cancelWaveBoxDraw === 'function') window.__cancelWaveBoxDraw();
                     window.__waveBoxArmed = false;
                     const bw = document.getElementById('btn-wavebox');
-                    if (bw) { bw.textContent = 'Drag box on the map'; bw.style.opacity = ''; }
+                    if (bw) { bw.textContent = 'Draw polygon on the map'; bw.style.opacity = ''; }
                 }
                 if (window.__similarArmed) {
                     window.__similarArmed = false;
@@ -3326,6 +3489,7 @@ async function(n) {
             }
             window.__freehandArmed = true;
             if (btn) { btn.textContent = 'Hold Ctrl to draw...'; btn.style.opacity = '0.65'; }
+            if (typeof window.__highlightCtrlHint === 'function') window.__highlightCtrlHint();
             window.__updateDeckCursor();
         };
 
@@ -3429,7 +3593,7 @@ async function(n) {
             container.addEventListener('pointerup',   onUp);
         };
 
-        // ---- Wave-arrival-area box mode ----
+        // ---- Wave-arrival-area polygon mode ----
         const getOrCreateWaveBoxCanvas = () => {
             let cv = document.getElementById('wavebox-canvas');
             if (!cv) {
@@ -3450,101 +3614,159 @@ async function(n) {
 
         window.__enterWaveBoxMode = () => {
             const btn = document.getElementById('btn-wavebox');
-            if (window.__waveBoxArmed) {
-                window.__waveBoxArmed = false;
-                if (btn) { btn.textContent = 'Drag box on the map'; btn.style.opacity = ''; }
-                window.__updateDeckCursor();
+            if (!window.__hasWaves || wMMSI.length === 0) return;
+            if (window.__waveBoxArmed || window.__waveBoxMode) {
+                if (typeof window.__cancelWaveBoxDraw === 'function') {
+                    window.__cancelWaveBoxDraw();
+                } else {
+                    window.__waveBoxArmed = false;
+                    if (btn) {
+                        btn.textContent = 'Draw polygon on the map';
+                        btn.style.opacity = '';
+                    }
+                    window.__updateDeckCursor();
+                }
                 return;
             }
-            if (!window.__hasWaves || wMMSI.length === 0) return;
             window.__waveBoxArmed = true;
-            if (btn) { btn.textContent = 'Hold Ctrl to drag...'; btn.style.opacity = '0.65'; }
+            if (btn) {
+                btn.textContent = 'Hold Ctrl to add polygon vertices';
+                btn.style.opacity = '0.75';
+            }
+            if (typeof window.__highlightCtrlHint === 'function') window.__highlightCtrlHint();
             window.__updateDeckCursor();
+            if (window.__ctrlHeld) window.__activateWaveBoxDraw();
         };
 
         window.__activateWaveBoxDraw = () => {
             if (!window.__waveBoxArmed || window.__waveBoxMode) return;
             if (!window.__hasWaves || wMMSI.length === 0) return;
             window.__waveBoxMode = true;
-            window.deckInstance.setProps({ controller: false });
             window.__updateDeckCursor();
             const btn = document.getElementById('btn-wavebox');
-            if (btn) { btn.textContent = 'Dragging...'; btn.style.opacity = '0.65'; }
+            if (btn) { btn.textContent = 'Click vertices; click start to finish'; btn.style.opacity = '0.75'; }
             const container = document.getElementById('deck-container');
             const cv = getOrCreateWaveBoxCanvas();
             cv.style.display = 'block';
             const ctx2d = cv.getContext('2d');
-            ctx2d.clearRect(0, 0, cv.width, cv.height);
-            let isDragging = false;
-            let p0 = null;
+            let polygon = []; // world coordinates, so zoom/pan can continue while drawing
+            let hoverPoint = null;
+            let pointerStart = null;
             const rect = () => container.getBoundingClientRect();
-            const drawRect = (a, b) => {
+            const screenPoint = (event) => {
+                const r = rect();
+                return [event.clientX - r.left, event.clientY - r.top];
+            };
+            const drawPolygon = () => {
                 ctx2d.clearRect(0, 0, cv.width, cv.height);
-                const x = Math.min(a[0], b[0]), y = Math.min(a[1], b[1]);
-                const w = Math.abs(b[0] - a[0]), h = Math.abs(b[1] - a[1]);
-                ctx2d.fillStyle = 'rgba(80,200,255,0.12)';
-                ctx2d.fillRect(x, y, w, h);
-                ctx2d.strokeStyle = 'rgba(80,200,255,0.85)';
+                if (polygon.length === 0) return;
+                const vp = window.deckInstance.getViewports()[0];
+                const points = polygon.map(p => vp.project(p));
+                const hover = hoverPoint ? vp.project(hoverPoint) : null;
+                ctx2d.strokeStyle = 'rgba(80,200,255,0.95)';
+                ctx2d.fillStyle = 'rgba(80,200,255,0.14)';
                 ctx2d.lineWidth = 2;
+                ctx2d.lineCap = 'round';
+                ctx2d.lineJoin = 'round';
                 ctx2d.setLineDash([6, 4]);
-                ctx2d.strokeRect(x, y, w, h);
+                ctx2d.beginPath();
+                ctx2d.moveTo(points[0][0], points[0][1]);
+                for (let i = 1; i < points.length; i++) {
+                    ctx2d.lineTo(points[i][0], points[i][1]);
+                }
+                if (hover) ctx2d.lineTo(hover[0], hover[1]);
+                ctx2d.stroke();
+                ctx2d.setLineDash([]);
+                for (let i = 0; i < points.length; i++) {
+                    ctx2d.beginPath();
+                    ctx2d.arc(points[i][0], points[i][1], i === 0 ? 6 : 4, 0, Math.PI * 2);
+                    ctx2d.fillStyle = i === 0 ? 'rgba(255,220,80,0.95)' : 'rgba(80,200,255,0.95)';
+                    ctx2d.fill();
+                }
             };
-            const onDown = (e) => {
-                const r = rect();
-                isDragging = true;
-                p0 = [e.clientX - r.left, e.clientY - r.top];
+            window.__redrawWavePolygon = drawPolygon;
+            const onPointerDown = (e) => {
+                if (e.button !== 0) return;
+                pointerStart = screenPoint(e);
             };
-            const onMove = (e) => {
-                if (!isDragging) return;
-                const r = rect();
-                const p = [e.clientX - r.left, e.clientY - r.top];
-                drawRect(p0, p);
-            };
-            const onUp = (e) => {
-                if (!isDragging) { cancel(); return; }
-                isDragging = false;
-                const r = rect();
-                const p1 = [e.clientX - r.left, e.clientY - r.top];
-                if (Math.abs(p1[0] - p0[0]) < 4 || Math.abs(p1[1] - p0[1]) < 4) {
-                    cancel();
+            const onPointerMove = (e) => {
+                if (!e.ctrlKey && !window.__ctrlHeld) {
+                    hoverPoint = null;
+                    drawPolygon();
                     return;
                 }
                 const vp = window.deckInstance.getViewports()[0];
-                const c1 = vp.unproject(p0);
-                const c2 = vp.unproject(p1);
-                const lonMin = Math.min(c1[0], c2[0]), lonMax = Math.max(c1[0], c2[0]);
-                const latMin = Math.min(c1[1], c2[1]), latMax = Math.max(c1[1], c2[1]);
-                const boxWaveIdxs = [];
-                const boxSegIdxs = new Set();
+                hoverPoint = vp.unproject(screenPoint(e));
+                drawPolygon();
+            };
+            const pointInPolygon = (x, y, points) => {
+                let inside = false;
+                for (let i = 0, j = points.length - 1; i < points.length; j = i++) {
+                    const xi = points[i][0], yi = points[i][1];
+                    const xj = points[j][0], yj = points[j][1];
+                    const crosses = ((yi > y) !== (yj > y)) &&
+                        (x < (xj - xi) * (y - yi) / ((yj - yi) || Number.EPSILON) + xi);
+                    if (crosses) inside = !inside;
+                }
+                return inside;
+            };
+            const complete = () => {
+                if (polygon.length < 3) return;
+                const polygonWaveIdxs = [];
+                const polygonSegIdxs = new Set();
                 for (let i = 0; i < wMMSI.length; i++) {
                     const lon = wPos[i*2], lat = wPos[i*2+1];
-                    if (lon >= lonMin && lon <= lonMax && lat >= latMin && lat <= latMax) {
-                        boxWaveIdxs.push(i);
+                    if (pointInPolygon(lon, lat, polygon)) {
+                        polygonWaveIdxs.push(i);
                         const si = waveToSegIdx ? waveToSegIdx[i] : -1;
-                        if (si >= 0) boxSegIdxs.add(si);
+                        if (si >= 0) polygonSegIdxs.add(si);
                     }
                 }
-                if (boxWaveIdxs.length > 0) {
+                if (polygonWaveIdxs.length > 0) {
                     window.__filterState.waveBox = {
-                        waveIdxs: new Set(boxWaveIdxs),
-                        segIdxs: boxSegIdxs,
+                        waveIdxs: new Set(polygonWaveIdxs),
+                        segIdxs: polygonSegIdxs,
                     };
                     window.__recomputeVisibility();
                 }
                 finish();
             };
+            const onPointerUp = (e) => {
+                if (e.button !== 0 || !pointerStart) return;
+                const point = screenPoint(e);
+                const moved = Math.hypot(
+                    point[0] - pointerStart[0], point[1] - pointerStart[1]);
+                pointerStart = null;
+                if (moved > 5) {
+                    drawPolygon();
+                    return; // map pan, not a polygon vertex
+                }
+                if (!e.ctrlKey && !window.__ctrlHeld) return;
+                const vp = window.deckInstance.getViewports()[0];
+                if (polygon.length >= 3) {
+                    const first = vp.project(polygon[0]);
+                    if (Math.hypot(point[0] - first[0], point[1] - first[1]) <= 14) {
+                        complete();
+                        return;
+                    }
+                }
+                polygon.push(vp.unproject(point));
+                hoverPoint = null;
+                drawPolygon();
+            };
             const removeListeners = () => {
-                container.removeEventListener('pointerdown', onDown);
-                container.removeEventListener('pointermove', onMove);
-                container.removeEventListener('pointerup', onUp);
+                container.removeEventListener('pointerdown', onPointerDown);
+                container.removeEventListener('pointermove', onPointerMove);
+                container.removeEventListener('pointerup', onPointerUp);
                 window.__cancelWaveBoxDraw = null;
+                window.__redrawWavePolygon = null;
             };
             const cancel = () => {
                 removeListeners();
+                window.__waveBoxArmed = false;
                 window.__waveBoxMode = false;
-                window.deckInstance.setProps({ controller: DEFAULT_CONTROLLER });
                 window.__updateDeckCursor();
-                if (btn) { btn.textContent = 'Hold Ctrl to drag...'; btn.style.opacity = '0.65'; }
+                if (btn) { btn.textContent = 'Draw polygon on the map'; btn.style.opacity = ''; }
                 cv.style.display = 'none';
                 ctx2d.clearRect(0, 0, cv.width, cv.height);
             };
@@ -3552,17 +3774,20 @@ async function(n) {
                 removeListeners();
                 window.__waveBoxArmed = false;
                 window.__waveBoxMode  = false;
-                window.deckInstance.setProps({ controller: DEFAULT_CONTROLLER });
                 window.__updateDeckCursor();
-                if (btn) { btn.textContent = 'Drag box on the map'; btn.style.opacity = ''; }
+                if (btn) { btn.textContent = 'Draw polygon on the map'; btn.style.opacity = ''; }
                 cv.style.display = 'none';
                 ctx2d.clearRect(0, 0, cv.width, cv.height);
             };
             window.__cancelWaveBoxDraw = cancel;
-            container.addEventListener('pointerdown', onDown);
-            container.addEventListener('pointermove', onMove);
-            container.addEventListener('pointerup',   onUp);
+            container.addEventListener('pointerdown', onPointerDown);
+            container.addEventListener('pointermove', onPointerMove);
+            container.addEventListener('pointerup', onPointerUp);
         };
+        if (window.__pendingWaveBoxClick) {
+            window.__pendingWaveBoxClick = false;
+            window.__enterWaveBoxMode();
+        }
 
         // ---- Window-scope accessors for clientside callbacks outside this IIFE ----
         window.__getFilteredSegKeys = () => {
@@ -3577,7 +3802,7 @@ async function(n) {
         window.__getFilteredWaveIdxs = () => {
             if (!window.__hasWaves) return null;
             const arr = window.__visibleWaveIdxsArr;
-            return arr ? Array.from(arr).map(Number) : null;
+            return arr ? Array.from(arr, i => Number(wSourceIdx[i])) : null;
         };
 
         // ---- Reset all filters (used when waves are recalculated) ----
@@ -3588,6 +3813,7 @@ async function(n) {
             window.__filterState.freehand = null;
             window.__filterState.similar  = null;
             window.__filterState.waveBox  = null;
+            window.__filterState.inverted = false;
             if (typeof window.__cascadeMMSI !== 'undefined') {
                 window.__cascadeMMSI = null;
                 window.__cascadeSegs = [];
@@ -3608,7 +3834,7 @@ async function(n) {
                 if (typeof window.__cancelWaveBoxDraw === 'function') window.__cancelWaveBoxDraw();
                 window.__waveBoxArmed = false;
                 const bw = document.getElementById('btn-wavebox');
-                if (bw) { bw.textContent = 'Drag box on the map'; bw.style.opacity = ''; }
+                if (bw) { bw.textContent = 'Draw polygon on the map'; bw.style.opacity = ''; }
             }
             if (window.__similarArmed) {
                 window.__similarArmed = false;
@@ -3632,6 +3858,7 @@ async function(n) {
             }
             window.__similarArmed = true;
             if (btn) { btn.textContent = 'Ctrl+click a track...'; btn.style.opacity = '0.65'; }
+            if (typeof window.__highlightCtrlHint === 'function') window.__highlightCtrlHint();
             window.__updateDeckCursor();
             return 'Hold Ctrl and click a track to pick the reference';
         };
@@ -4013,6 +4240,9 @@ async function(n) {
             onViewStateChange: (params) => {
                 window._currentZoom = params.viewState.zoom;
                 rebuildOnView(params.viewState.zoom);
+                if (typeof window.__redrawWavePolygon === 'function') {
+                    requestAnimationFrame(window.__redrawWavePolygon);
+                }
                 return params.viewState;
             },
         });
@@ -4029,14 +4259,14 @@ async function(n) {
             window.__updateDeckCursor();
             if (typeof window.__rebuild === 'function') window.__rebuild();
             if (window.__freehandArmed && !window.__freehandMode) window.__activateFreehandDraw();
-            if (window.__waveBoxArmed  && !window.__waveBoxMode)  window.__activateWaveBoxDraw();
+            if (window.__waveBoxArmed && !window.__waveBoxMode) window.__activateWaveBoxDraw();
         });
         window.addEventListener('keyup', (e) => {
             if (e.key !== 'Control' || !window.__ctrlHeld) return;
             window.__ctrlHeld = false;
             hideTip();
             if (window.__freehandMode && typeof window.__cancelFreehandDraw === 'function') window.__cancelFreehandDraw();
-            if (window.__waveBoxMode  && typeof window.__cancelWaveBoxDraw  === 'function') window.__cancelWaveBoxDraw();
+            if (window.__waveBoxMode && typeof window.__cancelWaveBoxDraw === 'function') window.__cancelWaveBoxDraw();
             window.__updateDeckCursor();
         });
         // Clear inspect mode if window loses focus while Ctrl is held (otherwise
@@ -4046,7 +4276,7 @@ async function(n) {
             window.__ctrlHeld = false;
             hideTip();
             if (window.__freehandMode && typeof window.__cancelFreehandDraw === 'function') window.__cancelFreehandDraw();
-            if (window.__waveBoxMode  && typeof window.__cancelWaveBoxDraw  === 'function') window.__cancelWaveBoxDraw();
+            if (window.__waveBoxMode && typeof window.__cancelWaveBoxDraw === 'function') window.__cancelWaveBoxDraw();
             window.__updateDeckCursor();
         });
         container.addEventListener('mousedown', (e) => {
@@ -4056,7 +4286,7 @@ async function(n) {
                 window.__updateDeckCursor();
                 // Activate armed modes in case keydown didn't fire before Ctrl was held
                 if (window.__freehandArmed && !window.__freehandMode) window.__activateFreehandDraw();
-                if (window.__waveBoxArmed  && !window.__waveBoxMode)  window.__activateWaveBoxDraw();
+                if (window.__waveBoxArmed && !window.__waveBoxMode) window.__activateWaveBoxDraw();
             }
             if (!window.__freehandMode && !window.__waveBoxMode) window.__updateDeckCursor(true);
         });
@@ -4499,9 +4729,9 @@ async function(n) {
                     }
                 } catch (e) { /* nonfatal */ }
                 const range = window.__previews.ais.timeMin
-                    ? `\ntime: ${window.__previews.ais.timeMin}  →  ${window.__previews.ais.timeMax}`
+                    ? `time: ${window.__previews.ais.timeMin}  →  ${window.__previews.ais.timeMax}`
                     : '';
-                return `imported ${lon.length.toLocaleString()} points${range}`;
+                return range;
             } catch (e) {
                 clearRenderStatus(0);
                 return 'ERROR: ' + e.message;
@@ -4537,9 +4767,9 @@ async function(n) {
                 window.__rebuild();
                 if (!window.__previews.ais.visible) return 'hidden';
                 const range = window.__previews.ais.timeMin
-                    ? `\ntime: ${window.__previews.ais.timeMin}  →  ${window.__previews.ais.timeMax}`
+                    ? `time: ${window.__previews.ais.timeMin}  →  ${window.__previews.ais.timeMax}`
                     : '';
-                return `showing ${(window.__previews.ais.pos.length/2).toLocaleString()} points${range}`;
+                return range;
             }
             return visible ? 'import first' : '';
         };
@@ -4685,6 +4915,20 @@ WAVE_RELOAD_JS = r"""
 async function(version) {
     if (!version || version === window.__lastWaveVersion) return window.dash_clientside.no_update;
     window.__lastWaveVersion = version;
+    const previewStores = {
+        ais: '_pv_ais', coast: '_pv_coast',
+        land: '_pv_land', bathy: '_pv_bathy',
+    };
+    for (const [role, storeId] of Object.entries(previewStores)) {
+        const checkbox = document.getElementById(`native-preview-${role}`);
+        if (checkbox) checkbox.checked = false;
+        const uploaded = window.__uploaded?.[role];
+        if (window.dash_clientside?.set_props) {
+            window.dash_clientside.set_props(storeId, {
+                data: {visible: false, path: uploaded?.path || null},
+            });
+        }
+    }
     if (typeof window.__resetAllFilters === 'function' &&
             window.__visibleSegIdxs !== null) {
         window.__resetAllFilters();
@@ -4810,26 +5054,36 @@ app.clientside_callback(
     prevent_initial_call=True,
 )
 
-# Wave-arrival-area button click → enter box-drag mode.
+# Invert the final intersection produced by all active filters.
 app.clientside_callback(
     r"""
     function(n) {
         if (!n) return window.dash_clientside.no_update;
-        if (typeof window.__enterWaveBoxMode === 'function') window.__enterWaveBoxMode();
+        if (typeof window.__invertFilters !== 'function') return 'Filter controls not ready';
+        return window.__invertFilters();
+    }
+    """,
+    Output('fil-status', 'children', allow_duplicate=True),
+    Input('btn-fil-invert', 'n_clicks'),
+    prevent_initial_call=True,
+)
+
+# Wave-arrival-area button click → enter polygon-draw mode.
+app.clientside_callback(
+    r"""
+    function(n) {
+        if (!n) return window.dash_clientside.no_update;
+        if (typeof window.__enterWaveBoxMode === 'function') {
+            window.__enterWaveBoxMode();
+        } else {
+            window.__pendingWaveBoxClick = true;
+        }
         return window.dash_clientside.no_update;
     }
     """,
     Output('fil-status', 'children', allow_duplicate=True),
     Input('btn-wavebox', 'n_clicks'),
     prevent_initial_call=True,
-)
-
-# Export button: enabled when _any_filter_active store is True (set by __recomputeVisibility).
-app.clientside_callback(
-    r"function(active) { return !active; }",
-    Output('btn-fil-export', 'disabled', allow_duplicate=True),
-    Input('_any_filter_active', 'data'),
-    prevent_initial_call='initial_duplicate',
 )
 
 # Enable/disable the track-filter section based on whether waves are loaded.
@@ -4841,30 +5095,43 @@ app.clientside_callback(
 )
 
 
-# Export button click → show destination form on first click, POST on second click.
+# Export button click → use a native save picker where available, then prepare the ZIP.
 app.clientside_callback(
     r"""
-    async function(n, n_apply, dest, uploaded_files) {
+    async function(n, uploaded_files, filter_active) {
         const nu = window.dash_clientside.no_update;
-        const showForm = {'display': 'block'};
-        const hideForm = {'display': 'none'};
-        if (!n && !n_apply) return [nu, nu, nu, nu];
-        const cleanDest = (dest || '').trim();
-        if (!cleanDest) {
-            // First click or no name yet: reveal the folder input with a default name.
-            const defaultName = 'aiswakepy_filtered';
-            return ['Confirm or edit the destination folder name', nu, showForm, defaultName];
+        if (!n) return [nu, nu];
+        let fileHandle = null;
+        const pickerPromise = window.__exportFileHandlePromise;
+        window.__exportFileHandlePromise = null;
+        if (pickerPromise) {
+            const pickerResult = await pickerPromise;
+            if (pickerResult.error) {
+                if (typeof window.__setExportBusy === 'function') {
+                    window.__setExportBusy(false,
+                        pickerResult.error.name === 'AbortError'
+                            ? 'Export cancelled'
+                            : `Error opening save dialog: ${pickerResult.error.message}`);
+                }
+                return [
+                    pickerResult.error.name === 'AbortError'
+                        ? 'Export cancelled'
+                        : `Error opening save dialog: ${pickerResult.error.message}`,
+                    nu,
+                ];
+            }
+            fileHandle = pickerResult.handle;
         }
-        const seg_keys = (typeof window.__getFilteredSegKeys === 'function')
+        if (typeof window.__setExportBusy === 'function') {
+            window.__setExportBusy(true, 'Preparing export archive...');
+        }
+        const seg_keys = filter_active && typeof window.__getFilteredSegKeys === 'function'
             ? window.__getFilteredSegKeys() : [];
-        if (seg_keys.length === 0) {
-            return ['Apply a filter first', nu, showForm, nu];
-        }
-        const wave_idxs = (typeof window.__getFilteredWaveIdxs === 'function')
+        const wave_idxs = filter_active && typeof window.__getFilteredWaveIdxs === 'function'
             ? window.__getFilteredWaveIdxs() : null;
         const sel_ais = (uploaded_files && uploaded_files.ais) ? uploaded_files.ais.path : '';
         const body = JSON.stringify({
-            dest_name: cleanDest, seg_keys, wave_idxs, sel_ais,
+            filtered: !!filter_active, seg_keys, wave_idxs, sel_ais,
         });
         try {
             const resp = await fetch('/api/export/filtered',
@@ -4875,31 +5142,52 @@ app.clientside_callback(
                     const j = await resp.json();
                     msg = j.error || msg;
                 } catch (_) {}
-                return [`Error: ${msg}`, nu, showForm, nu];
+                if (typeof window.__setExportBusy === 'function') {
+                    window.__setExportBusy(false, `Error: ${msg}`);
+                }
+                return [`Error: ${msg}`, nu];
             }
-            const blob = await resp.blob();
-            const url = URL.createObjectURL(blob);
-            const a = document.createElement('a');
-            a.href = url;
-            a.download = `${cleanDest || 'aiswakepy_export'}.zip`;
-            document.body.appendChild(a);
-            a.click();
-            a.remove();
-            setTimeout(() => URL.revokeObjectURL(url), 30000);
-            return [`Downloaded ${a.download}`, Date.now(), hideForm, nu];
+            const result = await resp.json();
+            if (!result.download_url) {
+                if (typeof window.__setExportBusy === 'function') {
+                    window.__setExportBusy(false,
+                        'Error: download URL missing from server response');
+                }
+                return ['Error: download URL missing from server response', nu];
+            }
+            const scope = filter_active ? 'filtered results' : 'full inputs and results';
+            if (fileHandle) {
+                if (typeof window.__setExportBusy === 'function') {
+                    window.__setExportBusy(true, 'Downloading and saving export archive...');
+                }
+                const download = await fetch(result.download_url);
+                if (!download.ok) throw new Error(`download failed: ${download.statusText}`);
+                const writable = await fileHandle.createWritable();
+                await writable.write(await download.blob());
+                await writable.close();
+                if (typeof window.__setExportBusy === 'function') {
+                    window.__setExportBusy(false, `Saved ${scope}`);
+                }
+                return [`Saved ${scope}`, Date.now()];
+            }
+            if (typeof window.__setExportBusy === 'function') {
+                window.__setExportBusy(false, `Downloading ${scope}`);
+            }
+            window.location.assign(result.download_url);
+            return [`Downloading ${scope}`, Date.now()];
         } catch (e) {
-            return [`Error: ${e.message}`, nu, showForm, nu];
+            if (typeof window.__setExportBusy === 'function') {
+                window.__setExportBusy(false, `Error: ${e.message}`);
+            }
+            return [`Error: ${e.message}`, nu];
         }
     }
     """,
     Output('export-status', 'children'),
     Output('_rescan_count', 'data', allow_duplicate=True),
-    Output('export-dest-form', 'style'),
-    Output('inp-export-dest', 'value', allow_duplicate=True),
     Input('btn-fil-export', 'n_clicks'),
-    Input('btn-export-apply', 'n_clicks'),
-    State('inp-export-dest', 'value'),
     State('_uploaded_files', 'data'),
+    State('_any_filter_active', 'data'),
     prevent_initial_call=True,
 )
 
