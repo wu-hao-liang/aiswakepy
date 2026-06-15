@@ -1113,7 +1113,7 @@ ROLE_SPECS: dict[str, dict] = {
               'example_dir': 'coastline', 'label': 'Coastline Shapefile'},
     'land':  {'accept': '.shp,.shx,.dbf,.prj,.xml,.sbn,.sbx,.cpg',
               'example_dir': 'land', 'label': 'Land Mask Shapefile'},
-    'bathy': {'accept': '.mesh,.dfsu', 'example_dir': 'bathymetry', 'label': 'Bathymetry .mesh/.dfsu'},
+    'bathy': {'accept': '.mesh,.dfsu', 'example_dir': 'bathymetry', 'label': 'Bathymetry'},
     'tide':  {'accept': '.dfs0',       'example_dir': 'tide',       'label': 'Tide DFS0 (optional)'},
 }
 
@@ -1336,16 +1336,6 @@ def _r_upload(role: str):
         }
         if warning:
             resp['warning'] = warning
-        # For tide uploads, include item metadata so the frontend can populate
-        # the item picker without a separate round-trip.
-        if role == 'tide':
-            try:
-                meta = _preview_tide(path)
-                items = meta.get('items', [])
-                resp['items'] = items
-                resp['chosen_item'] = items[0]['name'] if items else None
-            except Exception:
-                pass
         return jsonify(resp)
     except Exception as exc:
         import traceback
@@ -1442,18 +1432,9 @@ def _r_example():
                 # we'll call anyway to get items). Just register the path directly.
                 state.files[role] = dest
                 state.original_names[role] = src.name
-                try:
-                    meta = _preview_tide(dest)
-                    items = meta.get('items', [])
-                    chosen = items[0]['name'] if items else None
-                except Exception:
-                    items = []
-                    chosen = None
                 loaded[role] = {
                     'path': str(dest.relative_to(state.root)),
                     'filename': src.name,
-                    'items': items,
-                    'chosen_item': chosen,
                 }
 
         if _session_size(state) > MAX_SESSION_BYTES:
@@ -1949,6 +1930,8 @@ app.layout = html.Div([
         # load-results-status kept as hidden dummy — still used by the load-results
         # clientside callback (kept for future "resume from zip" feature).
         html.Span('', id='load-results-status', style={'display': 'none'}),
+        html.Button('Run example', id='btn-run-example', n_clicks=0, disabled=True,
+                    title='Load bundled example data (Singapore, JI channel)'),
         html.Div('AISWAKEPY_PUBLIC', id='banner-title'),
         html.Div([
             html.Span(id='ais-time-range', style={'color': '#558', 'marginRight': '4px'}),
@@ -1963,10 +1946,6 @@ app.layout = html.Div([
     html.Div([
 
         html.Div([
-            html.Div('Temporary Uploads',
-                     style={'fontWeight': 'bold', 'fontSize': '11px', 'color': '#555'}),
-            html.Div('Files are temporary. Refreshing the page starts a new empty session.',
-                     style={'fontSize': '10px', 'color': '#667', 'margin': '2px 0 6px'}),
             html.Div(id='upload-ais-host'),
             html.Div(id='pv-ais-info', className='preview-info'),
             html.Div(id='upload-coast-host'),
@@ -1976,28 +1955,9 @@ app.layout = html.Div([
             html.Div(id='upload-bathy-host'),
             html.Div(id='pv-bathy-info', className='preview-info'),
             html.Div(id='upload-tide-host'),
-            # ---- Tide item picker (shown after tide file is uploaded) ----
-            html.Div([
-                html.Label('Tide Item', style={'fontSize': '10px', 'fontWeight': '700',
-                                               'marginTop': '4px', 'display': 'block'}),
-                dcc.Dropdown(id='tide-item-dd', options=[], value=None, clearable=False,
-                             placeholder='Select tide item...',
-                             className='compact-dropdown',
-                             style={'fontSize': '10px'}),
-            ], id='tide-item-row', style={'display': 'none'}),
             html.Div(id='upload-status',
                      style={'fontSize': '10px', 'color': '#556', 'whiteSpace': 'pre-wrap',
                             'marginBottom': '4px'}),
-            html.Div([
-                html.Button('Run example', id='btn-run-example', n_clicks=0, disabled=True,
-                            title='Load bundled example data (Singapore, JI channel)',
-                            style={'padding': '3px 10px', 'fontSize': '11px',
-                                   'background': '#e8f4e8', 'border': '1px solid #88c488',
-                                   'borderRadius': '4px', 'cursor': 'pointer',
-                                   'color': '#3a7a3a', 'fontWeight': '600',
-                                   'lineHeight': '1.4', 'height': '26px',
-                                   'boxSizing': 'border-box'}),
-            ], style={'marginBottom': '6px'}),
         ], id='upload-panel'),
 
         # ---- Calculate Waves button ----
@@ -2244,7 +2204,7 @@ app.layout = html.Div([
     dcc.Store(id='_wave_version', data=0),
     dcc.Store(id='_track_version', data=0),
     dcc.Store(id='_ais_import', data={'path': None, 'nonce': 0}),
-    # Uploaded-files store: maps role → {path, filename[, items, chosen_item]}
+    # Uploaded-files store: maps role → {path, filename}
     # This is the client-side source-of-truth for what has been uploaded.
     dcc.Store(id='_uploaded_files', data={}),
     # Preview state Stores: {visible, path}
@@ -2276,7 +2236,7 @@ app.clientside_callback(
 # ---------------------------------------------------------------------------
 # Server-side callbacks: run buttons + polling
 # ---------------------------------------------------------------------------
-def _build_config(state: SessionState, ais, land, bathy, coast, tide, tide_item=None,
+def _build_config(state: SessionState, ais, land, bathy, coast, tide,
                   min_speed=0.0, traj_gap=180.0, interp='linear', interp_interval=30.0,
                   cb_method='L_Le', max_prop=2000.0, max_sog=12.0,
                   max_velocity=36.0, max_accel=10.0, max_dw=1.0,
@@ -2318,8 +2278,6 @@ def _build_config(state: SessionState, ais, land, bathy, coast, tide, tide_item=
     cfg['coastline']['shapefile'] = str(_session_path(state, coast)) if coast else coast
     if tide:
         cfg['bathymetry']['tide_dfs0'] = str(_session_path(state, tide))
-        if tide_item:
-            cfg['bathymetry']['tide_item'] = tide_item
     return cfg
 
 
@@ -2346,7 +2304,6 @@ def _kick(state: SessionState, config_dict, stages, label):
     Output('progress-log', 'children', allow_duplicate=True),
     Input('btn-waves', 'n_clicks'),
     State('_uploaded_files', 'data'),
-    State('tide-item-dd', 'value'),
     State('rsb-min-speed', 'value'), State('rsb-traj-gap', 'value'),
     State('rsb-interp', 'value'), State('rsb-interp-interval', 'value'),
     State('rsb-cb-method', 'value'),
@@ -2361,7 +2318,7 @@ def _kick(state: SessionState, config_dict, stages, label):
     State('_session', 'data'),
     prevent_initial_call=True,
 )
-def kick_waves(n, uploaded_files, tide_item,
+def kick_waves(n, uploaded_files,
                min_speed, traj_gap, interp, interp_interval,
                cb_method, max_prop, max_sog,
                max_velocity, max_accel, max_dw, low_sog,
@@ -2380,9 +2337,6 @@ def kick_waves(n, uploaded_files, tide_item,
     coast = (uf.get('coast') or {}).get('path')
     bathy = (uf.get('bathy') or {}).get('path')
     tide  = (uf.get('tide')  or {}).get('path')
-    # tide_item comes from the dropdown; fall back to chosen_item stored at upload
-    if not tide_item:
-        tide_item = (uf.get('tide') or {}).get('chosen_item')
     missing = []
     if not ais:   missing.append('AIS data file')
     if not land:  missing.append('Land mask shapefile')
@@ -2391,7 +2345,7 @@ def kick_waves(n, uploaded_files, tide_item,
     if missing:
         warn = '⚠ Cannot calculate waves — missing required inputs:\n  • ' + '\n  • '.join(missing)
         return no_update, no_update, warn
-    cfg = _build_config(state, ais, land, bathy, coast, tide, tide_item,
+    cfg = _build_config(state, ais, land, bathy, coast, tide,
                         min_speed, traj_gap, interp, interp_interval,
                         cb_method, max_prop, max_sog,
                         max_velocity, max_accel, max_dw, low_sog,
@@ -2470,32 +2424,6 @@ def tick(_, prev_wave_v, prev_track_v, session_data):
         log_text, elapsed, True, False,
         s['wave_version'], s['track_version'], *counts, _ais_time_range_str(state),
     )
-
-
-# ---------------------------------------------------------------------------
-# Tide item dropdown: populate from _uploaded_files when tide is uploaded.
-# ---------------------------------------------------------------------------
-app.clientside_callback(
-    r"""
-    function(uf) {
-        const nu = window.dash_clientside.no_update;
-        if (!uf) return [[], null, {'display':'none'}];
-        const t = uf.tide;
-        if (!t || !t.items || t.items.length === 0) return [[], null, {'display':'none'}];
-        const opts = t.items.map(it => ({
-            label: it.name + (it.unit ? ' [' + it.unit + ']' : ''),
-            value: it.name,
-        }));
-        const val = t.chosen_item || opts[0].value;
-        return [opts, val, {'display':'block'}];
-    }
-    """,
-    Output('tide-item-dd', 'options'),
-    Output('tide-item-dd', 'value'),
-    Output('tide-item-row', 'style'),
-    Input('_uploaded_files', 'data'),
-    prevent_initial_call=False,
-)
 
 
 # ---------------------------------------------------------------------------
@@ -2714,7 +2642,7 @@ async function(n) {
         land:  {host: 'upload-land-host',  label: 'Land Mask Shapefile',
                 accept: '.shp,.shx,.dbf,.prj,.xml,.sbn,.sbx,.cpg',
                 multiple: true, previewStore: '_pv_land'},
-        bathy: {host: 'upload-bathy-host', label: 'Bathymetry .mesh/.dfsu',
+        bathy: {host: 'upload-bathy-host', label: 'Bathymetry',
                 accept: '.mesh,.dfsu', previewStore: '_pv_bathy'},
         tide:  {host: 'upload-tide-host',  label: 'Tide DFS0 (optional)', accept: '.dfs0'},
     };
@@ -2733,7 +2661,7 @@ async function(n) {
             `<div class="upload-control">` +
             `<label class="upload-control-label">${spec.label}</label>` +
             `<div class="upload-control-row">` +
-            `<button id="native-upload-${role}-button" type="button" class="upload-select-btn secondary-btn">` +
+            `<button id="native-upload-${role}-button" type="button" class="upload-select-btn">` +
             `Choose ${spec.label}</button>${preview}</div>` +
             `<input id="native-upload-${role}" type="file" accept="${spec.accept}"${multiple} hidden>` +
             `<div id="native-upload-${role}-status" class="upload-row-status"></div>` +
@@ -2779,10 +2707,6 @@ async function(n) {
                 rowStatus.textContent = j.warning || '';
                 // Merge into the uploaded-files mirror and push to Dash store.
                 const entry = {path: j.path, filename: j.filename};
-                if (role === 'tide') {
-                    entry.items = j.items || [];
-                    entry.chosen_item = j.chosen_item || null;
-                }
                 window.__uploaded[role] = entry;
                 if (window.dash_clientside?.set_props) {
                     window.dash_clientside.set_props('_uploaded_files',
@@ -4415,135 +4339,6 @@ async function(n) {
         initCascade();
         window.__buildCascadeMMSI = buildCascadePanel;
         window.__updateCascadeTrigger = updateCascadeTrigger;
-
-        // ---- Tide DFS0 file × item cascade (same UX as MMSI / Segment) ----
-        window.__tideFiles = window.__tideFiles || [];
-        window.__tideItems = window.__tideItems || [];
-        window.__tideFilePick = null;   // value pushed into _tide_file_pick on next button click
-        window.__tideItemPick = null;
-        window.__tideSelFile = null;    // currently selected file (path)
-        window.__tideSelItem = null;    // currently selected item name
-        window.__tideAwaitingItems = false; // true while waiting for server to return items after file pick
-
-        const _fileLabel = (path) => {
-            if (!path) return null;
-            const f = (window.__tideFiles || []).find(o => o.value === path);
-            return f ? f.label : path.split(/[\\/]/).pop();
-        };
-        const updateCascadeTideTrigger = () => {
-            const trig = document.getElementById('cascade-tide-trigger');
-            if (!trig) return;
-            if (!window.__tideSelFile) {
-                trig.textContent = 'No tide file';
-                trig.className = 'cascade-trigger';
-            } else if (!window.__tideSelItem) {
-                trig.textContent = `${_fileLabel(window.__tideSelFile)} · pick item`;
-                trig.className = 'cascade-trigger cascade-active';
-            } else {
-                trig.textContent = `${_fileLabel(window.__tideSelFile)} · ${window.__tideSelItem}`;
-                trig.className = 'cascade-trigger cascade-active';
-            }
-        };
-
-        const buildCascadeTidePanel = () => {
-            const panel = document.getElementById('cascade-tide-panel');
-            if (!panel) return;
-            panel.innerHTML = '';
-            const leftCol = document.createElement('div');
-            leftCol.className = 'cascade-col';
-            const rightCol = document.createElement('div');
-            rightCol.className = 'cascade-col cascade-seg-col';
-            rightCol.style.display = window.__tideSelFile ? 'block' : 'none';
-
-            const files = window.__tideFiles || [];
-            if (files.length === 0) {
-                leftCol.innerHTML = '<div class="cascade-empty">No .dfs0 files</div>';
-                panel.appendChild(leftCol);
-                return;
-            }
-
-            files.forEach(f => {
-                const row = document.createElement('div');
-                const isSel = window.__tideSelFile === f.value;
-                row.className = 'cascade-item' + (isSel ? ' cascade-selected' : '');
-                row.innerHTML = `<span>${f.label}</span><span class="cascade-arrow">▶</span>`;
-                row.addEventListener('click', (e) => {
-                    e.stopPropagation();
-                    window.__tideSelFile = f.value;
-                    window.__tideSelItem = null;
-                    window.__tideItems = [];      // clear stale items; will repopulate on server response
-                    window.__tideFilePick = f.value;
-                    window.__tideAwaitingItems = true;
-                    // __tideKeepPanel prevents the document click listener from closing the
-                    // panel when the programmatic btn.click() event bubbles up to document.
-                    window.__tideKeepPanel = true;
-                    document.getElementById('_tide-file-btn').click();
-                    window.__tideKeepPanel = false;
-                    buildCascadeTidePanel();      // render with "Loading..." in right col
-                    updateCascadeTideTrigger();
-                });
-                leftCol.appendChild(row);
-            });
-
-            if (window.__tideSelFile) {
-                const items = window.__tideItems || [];
-                if (items.length === 0) {
-                    rightCol.innerHTML = '<div class="cascade-empty">Loading items…</div>';
-                } else {
-                    items.forEach(it => {
-                        const sRow = document.createElement('div');
-                        const isSelI = window.__tideSelItem === it.name;
-                        sRow.className = 'cascade-item' + (isSelI ? ' cascade-selected' : '');
-                        sRow.textContent = it.label || it.name;
-                        sRow.title = it.label || it.name;
-                        sRow.addEventListener('click', (e) => {
-                            e.stopPropagation();
-                            window.__tideSelItem = it.name;
-                            window.__tideItemPick = it.name;
-                            document.getElementById('_tide-item-btn').click();
-                            updateCascadeTideTrigger();
-                            panel.style.display = 'none';
-                        });
-                        rightCol.appendChild(sRow);
-                    });
-                }
-            }
-            panel.appendChild(leftCol);
-            panel.appendChild(rightCol);
-        };
-
-        const initCascadeTide = () => {
-            const trig = document.getElementById('cascade-tide-trigger');
-            const panel = document.getElementById('cascade-tide-panel');
-            if (!trig || !panel) return;
-            trig.addEventListener('click', (e) => {
-                e.stopPropagation();
-                if (panel.style.display === 'none') {
-                    buildCascadeTidePanel();
-                    panel.style.display = 'flex';
-                } else {
-                    panel.style.display = 'none';
-                }
-            });
-            document.addEventListener('click', () => {
-                if (window.__tideKeepPanel) return;
-                if (panel) panel.style.display = 'none';
-            });
-        };
-        window.__tideKeepPanel = false;
-        initCascadeTide();
-        window.__rebuildCascadeTide = () => {
-            const panel = document.getElementById('cascade-tide-panel');
-            buildCascadeTidePanel();
-            if (panel && window.__tideAwaitingItems && (window.__tideItems || []).length > 0) {
-                panel.style.display = 'flex';
-                window.__tideAwaitingItems = false;
-            } else if (panel && panel.style.display === 'none') {
-                // panel already closed by user — leave it closed
-            }
-            updateCascadeTideTrigger();
-        };
-        updateCascadeTideTrigger();
 
         // Post-pipeline refresh hooks: show the same progress overlay as before, then rebuild layers,
         // then show a "Rendering..." pill until deck.gl has painted at least one frame.

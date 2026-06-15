@@ -209,16 +209,16 @@ input[type="number"] {
     height: 30px;
     padding: 4px 9px !important;
     overflow: hidden;
-    color: #3a6080 !important;
+    color: white !important;
     text-align: left;
     text-overflow: ellipsis;
-    text-shadow: none !important;
+    text-shadow: 0 1px 1px rgba(0,0,0,0.18) !important;
     white-space: nowrap;
-    background: #eef2f7 !important;
-    border-color: #a8c0d8 !important;
+    background: linear-gradient(180deg, #6aabda, #4a85b5) !important;
+    border-color: #4a85b5 !important;
 }
 #sidebar .upload-select-btn:hover {
-    background: #dce8f2 !important;
+    background: linear-gradient(180deg, #5a9bca, #3a75a5) !important;
 }
 .upload-preview {
     display: flex;
@@ -246,6 +246,27 @@ input[type="number"] {
 /* Remove top gap when coastline/land info divs are empty (no shapefile loaded yet) */
 #pv-ais-info:empty, #pv-bathy-info:empty,
 #pv-coast-info:empty, #pv-land-info:empty { margin-top: 0 !important; }
+
+#btn-run-example {
+    flex: 0 0 auto;
+    height: 26px;
+    padding: 3px 10px;
+    color: white;
+    font-size: 11px;
+    font-weight: 600;
+    cursor: pointer;
+    background: linear-gradient(180deg, #6aabda, #4a85b5);
+    border: 1px solid #4a85b5;
+    border-radius: 5px;
+}
+#btn-run-example:hover {
+    background: linear-gradient(180deg, #5a9bca, #3a75a5);
+}
+#btn-run-example:disabled {
+    cursor: wait;
+    background: #b8c8d8;
+    border-color: #a0b4c4;
+}
 
 /* ── Cascade trigger: identical to Dash dropdown (30px / 5px / 11px) ─────── */
 .cascade-trigger {

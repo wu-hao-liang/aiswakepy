@@ -104,6 +104,27 @@ def test_shapefile_upload_requires_shx_and_dbf(tmp_path, monkeypatch):
     assert "missing required sidecars" in resp.get_json()["error"]
 
 
+def test_build_config_uses_first_tide_item(tmp_path):
+    state = dash_app.SessionState(session_id="test", root=tmp_path)
+    paths = {}
+    for name in ("ais.csv", "land.shp", "bathy.mesh", "coast.shp", "tide.dfs0"):
+        path = tmp_path / name
+        path.touch()
+        paths[name] = name
+
+    cfg = dash_app._build_config(
+        state,
+        paths["ais.csv"],
+        paths["land.shp"],
+        paths["bathy.mesh"],
+        paths["coast.shp"],
+        paths["tide.dfs0"],
+    )
+
+    assert cfg["bathymetry"]["tide_dfs0"] == str(tmp_path / "tide.dfs0")
+    assert "tide_item" not in cfg["bathymetry"]
+
+
 def test_export_filtered_returns_rerun_zip(tmp_path, monkeypatch):
     _reset_sessions(tmp_path, monkeypatch)
     client = dash_app.server.test_client()
@@ -192,8 +213,7 @@ def test_example_endpoint_loads_all_roles(tmp_path, monkeypatch):
     # Tide is optional but should be present when example_data/tide/ exists.
     if "tide" in roles:
         assert roles["tide"].get("path")
-        # chosen_item must be populated (the dfs0 has at least one item).
-        assert roles["tide"].get("chosen_item"), "Tide chosen_item should be set"
+        assert "chosen_item" not in roles["tide"]
 
     # Verify the session state.files was actually populated.
     state = dash_app._sessions[sid]
