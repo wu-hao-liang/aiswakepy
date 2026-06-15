@@ -188,11 +188,63 @@ input[type="number"] {
     -moz-appearance: textfield !important;
 }
 
-/* ── Hide AIS point count info, tide item text list, and bathy preview text ── */
-#pv-ais-info { display: none !important; }
+/* ── Upload controls ─────────────────────────────────────────────────────── */
+.upload-control {
+    margin-top: 5px;
+}
+.upload-control-label {
+    display: block;
+    margin-bottom: 3px;
+    font-size: 11px;
+    font-weight: 700;
+    color: #445;
+}
+.upload-control-row {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+}
+#sidebar .upload-select-btn {
+    min-width: 0;
+    height: 30px;
+    padding: 4px 9px !important;
+    overflow: hidden;
+    color: #3a6080 !important;
+    text-align: left;
+    text-overflow: ellipsis;
+    text-shadow: none !important;
+    white-space: nowrap;
+    background: #eef2f7 !important;
+    border-color: #a8c0d8 !important;
+}
+#sidebar .upload-select-btn:hover {
+    background: #dce8f2 !important;
+}
+.upload-preview {
+    display: flex;
+    flex: 0 0 auto;
+    align-items: center;
+    gap: 3px;
+    margin: 0;
+    color: #556;
+    font-size: 10px;
+    font-weight: 400 !important;
+    white-space: nowrap;
+}
+.upload-preview input {
+    margin: 0;
+}
+.upload-row-status {
+    min-height: 0;
+    margin-top: 2px;
+    color: #b44;
+    font-size: 10px;
+}
+
+/* ── Hide tide item text list ───────────────────────────────────────────── */
 #pv-tide-info { display: none !important; }
-#pv-bathy-info { display: none !important; }
 /* Remove top gap when coastline/land info divs are empty (no shapefile loaded yet) */
+#pv-ais-info:empty, #pv-bathy-info:empty,
 #pv-coast-info:empty, #pv-land-info:empty { margin-top: 0 !important; }
 
 /* ── Cascade trigger: identical to Dash dropdown (30px / 5px / 11px) ─────── */

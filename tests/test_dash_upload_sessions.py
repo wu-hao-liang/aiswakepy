@@ -4,7 +4,9 @@ import io
 import zipfile
 from pathlib import Path
 
+import geopandas as gpd
 import pandas as pd
+from shapely.geometry import Polygon
 
 import dash_app
 
@@ -54,6 +56,52 @@ def test_ais_upload_validates_required_columns(tmp_path, monkeypatch):
 
     assert resp.status_code == 400
     assert "missing required columns" in resp.get_json()["error"]
+
+
+def test_shapefile_upload_accepts_selected_sidecars(tmp_path, monkeypatch):
+    _reset_sessions(tmp_path / "sessions", monkeypatch)
+    client = dash_app.server.test_client()
+    sid = _create_session(client)
+
+    source = tmp_path / "source"
+    source.mkdir()
+    shp = source / "layer.shp"
+    gpd.GeoDataFrame(
+        {"name": ["area"]},
+        geometry=[Polygon([(103.0, 1.0), (103.1, 1.0), (103.1, 1.1), (103.0, 1.0)])],
+        crs="EPSG:4326",
+    ).to_file(shp)
+
+    selected = []
+    for suffix in (".shp", ".shx", ".dbf", ".cpg"):
+        path = source / f"layer{suffix}"
+        selected.append((io.BytesIO(path.read_bytes()), path.name))
+    resp = client.post(
+        f"/api/upload/coast?session_id={sid}",
+        data={"files": selected},
+        content_type="multipart/form-data",
+    )
+
+    assert resp.status_code == 200, resp.get_json()
+    payload = resp.get_json()
+    assert payload["filename"] == "layer.shp"
+    assert set(payload["files"]) == {"layer.shp", "layer.shx", "layer.dbf", "layer.cpg"}
+    assert "assuming the coordinates are WGS84" in payload["warning"]
+
+
+def test_shapefile_upload_requires_shx_and_dbf(tmp_path, monkeypatch):
+    _reset_sessions(tmp_path, monkeypatch)
+    client = dash_app.server.test_client()
+    sid = _create_session(client)
+
+    resp = client.post(
+        f"/api/upload/land?session_id={sid}",
+        data={"files": [(io.BytesIO(b"not-a-real-shapefile"), "layer.shp")]},
+        content_type="multipart/form-data",
+    )
+
+    assert resp.status_code == 400
+    assert "missing required sidecars" in resp.get_json()["error"]
 
 
 def test_export_filtered_returns_rerun_zip(tmp_path, monkeypatch):

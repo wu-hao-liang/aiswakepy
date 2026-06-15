@@ -45,7 +45,7 @@ docker compose -f docker-compose.prod.yml up -d --build
 ```
 
 Edit `.env` before starting the service if the host port or Gunicorn settings need to change.
-The production defaults map `/opt/apps/aiswakepy/data` on the VPS to `/data` inside the container. `DATA_ROOT=/data` and `UPLOAD_FOLDER=/data/uploads` therefore persist outside the container.
+The production defaults still map `/opt/apps/aiswakepy/data` on the VPS to `/data` inside the container for future account-backed storage. Anonymous public uploads are stored below `UPLOAD_FOLDER=/data/uploads` as temporary page sessions and are cleaned up after `SESSION_TTL_SECONDS`.
 
 Without Compose:
 

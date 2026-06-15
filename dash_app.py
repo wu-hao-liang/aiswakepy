@@ -12,6 +12,7 @@ import json
 import os
 import shutil
 import sys
+import tempfile
 import threading
 import time
 import uuid
@@ -1092,7 +1093,10 @@ app.title = 'aiswakepy'
 app.index_string = INDEX_TEMPLATE
 server = app.server
 
-UPLOAD_FOLDER = Path(os.environ.get('UPLOAD_FOLDER', DATA_ROOT / 'uploads')).expanduser()
+_upload_folder_value = os.environ.get('UPLOAD_FOLDER')
+UPLOAD_FOLDER = Path(
+    _upload_folder_value or Path(tempfile.gettempdir()) / 'aiswakepy-uploads'
+).expanduser()
 if not UPLOAD_FOLDER.is_absolute():
     UPLOAD_FOLDER = REPO / UPLOAD_FOLDER
 UPLOAD_FOLDER.mkdir(parents=True, exist_ok=True)
@@ -1105,8 +1109,10 @@ EXAMPLE_DATA = REPO / 'example_data'
 # the config fields coastline/bathymetry — these are internal session keys only).
 ROLE_SPECS: dict[str, dict] = {
     'ais':   {'accept': '.csv',        'example_dir': 'ais',        'label': 'AIS CSV'},
-    'coast': {'accept': '.zip',        'example_dir': 'coastline',  'label': 'Coastline ZIP'},
-    'land':  {'accept': '.zip',        'example_dir': 'land',       'label': 'Land Mask ZIP'},
+    'coast': {'accept': '.shp,.shx,.dbf,.prj,.xml,.sbn,.sbx,.cpg',
+              'example_dir': 'coastline', 'label': 'Coastline Shapefile'},
+    'land':  {'accept': '.shp,.shx,.dbf,.prj,.xml,.sbn,.sbx,.cpg',
+              'example_dir': 'land', 'label': 'Land Mask Shapefile'},
     'bathy': {'accept': '.mesh,.dfsu', 'example_dir': 'bathymetry', 'label': 'Bathymetry .mesh/.dfsu'},
     'tide':  {'accept': '.dfs0',       'example_dir': 'tide',       'label': 'Tide DFS0 (optional)'},
 }
@@ -1126,8 +1132,6 @@ MAX_UPLOAD_FILE_BYTES = int(
 MAX_SESSION_BYTES = int(
     os.environ.get('MAX_SESSION_BYTES', 300 * 1024 * 1024))
 SESSION_TTL_SECONDS = int(os.environ.get('SESSION_TTL_SECONDS', 3600))
-MAX_ZIP_EXPANDED_BYTES = int(
-    os.environ.get('MAX_ZIP_EXPANDED_BYTES', 250 * 1024 * 1024))
 
 _sessions: dict[str, SessionState] = {}
 _sessions_lock = threading.RLock()
@@ -1192,42 +1196,26 @@ def _session_size(state: SessionState) -> int:
     return sum(p.stat().st_size for p in state.root.rglob('*') if p.is_file())
 
 
+def _shapefile_base_name(path: Path) -> str:
+    name = path.name.lower()
+    return name[:-8] if name.endswith('.shp.xml') else path.stem.lower()
+
+
 def _validate_loose_shapefile(directory: Path) -> Path:
     """Validate a directory already containing a shapefile bundle; return the .shp path."""
     shapefiles = sorted(directory.glob('*.shp'))
     if len(shapefiles) != 1:
         raise ValueError('shapefile directory must contain exactly one .shp file')
     stem = shapefiles[0].stem
-    missing = [
-        ext for ext in ('.shx', '.dbf', '.prj')
-        if not (directory / f'{stem}{ext}').exists()
-    ]
+    files_by_suffix = {p.suffix.lower(): p for p in directory.iterdir() if p.is_file()}
+    missing = [ext for ext in ('.shx', '.dbf') if ext not in files_by_suffix]
     if missing:
         raise ValueError(f'shapefile is missing required sidecars: {", ".join(missing)}')
     import geopandas as gpd
     layer = gpd.read_file(shapefiles[0])
     if layer.empty:
         raise ValueError('shapefile contains no features')
-    if layer.crs is None:
-        raise ValueError('shapefile has no CRS; include a valid .prj file')
     return shapefiles[0]
-
-
-def _extract_shapefile_zip(archive: Path, destination: Path) -> Path:
-    destination.mkdir(parents=True, exist_ok=True)
-    with zipfile.ZipFile(archive) as zf:
-        members = [info for info in zf.infolist() if not info.is_dir()]
-        if sum(info.file_size for info in members) > MAX_ZIP_EXPANDED_BYTES:
-            raise ValueError('expanded shapefile ZIP exceeds the configured limit')
-        for info in members:
-            member = Path(info.filename)
-            if member.is_absolute() or '..' in member.parts:
-                raise ValueError('shapefile ZIP contains an unsafe path')
-            target = (destination / member.name).resolve()
-            target.relative_to(destination.resolve())
-            with zf.open(info) as source, target.open('wb') as output:
-                shutil.copyfileobj(source, output)
-    return _validate_loose_shapefile(destination)
 
 
 def _validate_uploaded_file(role: str, path: Path, state: SessionState) -> Path:
@@ -1245,11 +1233,7 @@ def _validate_uploaded_file(role: str, path: Path, state: SessionState) -> Path:
             raise ValueError(f'AIS CSV is missing required columns: {missing}')
         return path
     if role in {'coast', 'land'}:
-        if suffix != '.zip':
-            raise ValueError(f'{role} input must be a ZIP shapefile bundle')
-        extracted = state.root / role
-        shutil.rmtree(extracted, ignore_errors=True)
-        return _extract_shapefile_zip(path, extracted)
+        raise ValueError('shapefiles must be uploaded with their sidecar files')
     if role == 'bathy':
         if suffix not in {'.mesh', '.dfsu'}:
             raise ValueError('bathymetry input must be .mesh or .dfsu')
@@ -1284,35 +1268,74 @@ def _r_upload(role: str):
         state = _get_session()
         if role not in ROLE_SPECS:
             return jsonify({'error': 'unknown upload role'}), 404
-        uploaded = request.files.get('file')
-        if uploaded is None or not uploaded.filename:
-            return jsonify({'error': 'file field is required'}), 400
-        filename = secure_filename(uploaded.filename)
-        if not filename:
-            return jsonify({'error': 'invalid filename'}), 400
+        uploads = request.files.getlist('files') if role in {'coast', 'land'} else []
+        if not uploads:
+            uploaded = request.files.get('file')
+            uploads = [uploaded] if uploaded is not None else []
+        uploads = [item for item in uploads if item and item.filename]
+        if not uploads:
+            return jsonify({'error': 'file upload is required'}), 400
         expected_len = request.content_length or 0
         if expected_len > MAX_UPLOAD_FILE_BYTES:
             return jsonify({'error': 'file exceeds the per-file upload limit'}), 413
         role_dir = state.root / 'uploads' / role
+        state.files.pop(role, None)
+        state.original_names.pop(role, None)
         shutil.rmtree(role_dir, ignore_errors=True)
         role_dir.mkdir(parents=True, exist_ok=True)
-        raw_path = role_dir / filename
-        uploaded.save(raw_path)
-        if raw_path.stat().st_size > MAX_UPLOAD_FILE_BYTES:
-            raw_path.unlink(missing_ok=True)
-            return jsonify({'error': 'file exceeds the per-file upload limit'}), 413
+
+        saved: list[Path] = []
+        allowed_sidecars = {'.shp', '.shx', '.dbf', '.prj', '.xml', '.sbn', '.sbx', '.cpg'}
+        for uploaded in uploads:
+            filename = secure_filename(uploaded.filename)
+            if not filename:
+                raise ValueError('invalid filename')
+            suffix = Path(filename).suffix.lower()
+            if role in {'coast', 'land'} and suffix not in allowed_sidecars:
+                continue
+            raw_path = role_dir / filename
+            uploaded.save(raw_path)
+            if raw_path.stat().st_size > MAX_UPLOAD_FILE_BYTES:
+                shutil.rmtree(role_dir, ignore_errors=True)
+                return jsonify({'error': f'{filename} exceeds the per-file upload limit'}), 413
+            saved.append(raw_path)
+        if not saved:
+            raise ValueError('no supported files were selected')
         if _session_size(state) > MAX_SESSION_BYTES:
             shutil.rmtree(role_dir, ignore_errors=True)
             return jsonify({'error': 'session upload storage limit exceeded'}), 413
-        path = _validate_uploaded_file(role, raw_path, state)
+
+        warning = None
+        if role in {'coast', 'land'}:
+            shapefiles = [p for p in saved if p.suffix.lower() == '.shp']
+            if len(shapefiles) != 1:
+                raise ValueError('select exactly one .shp file and its sidecars')
+            shp_stem = shapefiles[0].stem.lower()
+            mismatched = [p.name for p in saved if _shapefile_base_name(p) != shp_stem]
+            if mismatched:
+                raise ValueError(
+                    'all shapefile sidecars must have the same base name: '
+                    + ', '.join(mismatched)
+                )
+            path = _validate_loose_shapefile(role_dir)
+            if not any(p.suffix.lower() == '.prj' for p in saved):
+                warning = 'No .prj selected; assuming the coordinates are WGS84.'
+        else:
+            raw_path = saved[0]
+            path = _validate_uploaded_file(role, raw_path, state)
+
+        filename = path.name
         state.files[role] = path
         state.original_names[role] = filename
         resp: dict = {
             'role': role,
             'filename': filename,
             'path': str(path.relative_to(state.root)),
-            'bytes': raw_path.stat().st_size if raw_path.exists() else path.stat().st_size,
+            'bytes': sum(p.stat().st_size for p in saved),
+            'files': [p.name for p in saved],
         }
+        if warning:
+            resp['warning'] = warning
         # For tide uploads, include item metadata so the frontend can populate
         # the item picker without a separate round-trip.
         if role == 'tide':
@@ -1945,9 +1968,13 @@ app.layout = html.Div([
             html.Div('Files are temporary. Refreshing the page starts a new empty session.',
                      style={'fontSize': '10px', 'color': '#667', 'margin': '2px 0 6px'}),
             html.Div(id='upload-ais-host'),
+            html.Div(id='pv-ais-info', className='preview-info'),
             html.Div(id='upload-coast-host'),
+            html.Div(id='pv-coast-info', className='preview-info'),
             html.Div(id='upload-land-host'),
+            html.Div(id='pv-land-info', className='preview-info'),
             html.Div(id='upload-bathy-host'),
+            html.Div(id='pv-bathy-info', className='preview-info'),
             html.Div(id='upload-tide-host'),
             # ---- Tide item picker (shown after tide file is uploaded) ----
             html.Div([
@@ -1962,7 +1989,7 @@ app.layout = html.Div([
                      style={'fontSize': '10px', 'color': '#556', 'whiteSpace': 'pre-wrap',
                             'marginBottom': '4px'}),
             html.Div([
-                html.Button('Run example', id='btn-run-example', n_clicks=0,
+                html.Button('Run example', id='btn-run-example', n_clicks=0, disabled=True,
                             title='Load bundled example data (Singapore, JI channel)',
                             style={'padding': '3px 10px', 'fontSize': '11px',
                                    'background': '#e8f4e8', 'border': '1px solid #88c488',
@@ -1972,9 +1999,6 @@ app.layout = html.Div([
                                    'boxSizing': 'border-box'}),
             ], style={'marginBottom': '6px'}),
         ], id='upload-panel'),
-
-        # pv-ais-info kept as hidden dummy — used by the AIS preview clientside callback.
-        html.Span(id='pv-ais-info', style={'display': 'none'}),
 
         # ---- Calculate Waves button ----
         html.Div([
@@ -2478,24 +2502,46 @@ app.clientside_callback(
 # Run example: load bundled example_data/ into the session.
 # ---------------------------------------------------------------------------
 app.clientside_callback(
+    "function(session){ return !(session && session.session_id); }",
+    Output('btn-run-example', 'disabled'),
+    Input('_session', 'data'),
+    prevent_initial_call=False,
+)
+
+
+app.clientside_callback(
     r"""
-    async function(n) {
+    async function(n, session) {
         const nu = window.dash_clientside.no_update;
         if (!n) return nu;
         const uploadStatus = document.getElementById('upload-status');
         const setStatus = (msg) => { if (uploadStatus) uploadStatus.textContent = msg; };
+        const sessionId = session && session.session_id;
+        if (!sessionId) {
+            setStatus('Session is still initializing. Please wait a moment.');
+            return nu;
+        }
         setStatus('Loading example data...');
         try {
-            const resp = await fetch('/api/example', {method: 'POST'});
+            const resp = await fetch(
+                '/api/example?session_id=' + encodeURIComponent(sessionId),
+                {method: 'POST', headers: {'X-Session-ID': sessionId}},
+            );
             const j = await resp.json();
             if (!resp.ok || j.error) throw new Error(j.error || resp.statusText);
             // Populate the window mirror and the Dash store.
             window.__uploaded = {};
             for (const [role, info] of Object.entries(j.roles)) {
                 window.__uploaded[role] = info;
-                // Update the per-row status label if the upload row is present.
+                const button = document.getElementById(`native-upload-${role}-button`);
+                if (button) {
+                    button.textContent = info.filename;
+                    button.title = (info.files || [info.filename]).join('\n');
+                }
                 const rowStatus = document.getElementById(`native-upload-${role}-status`);
-                if (rowStatus) rowStatus.textContent = `ready: ${info.filename}`;
+                if (rowStatus) rowStatus.textContent = info.warning || '';
+                const previewInput = document.getElementById(`native-preview-${role}`);
+                if (previewInput) previewInput.checked = true;
             }
             if (window.dash_clientside?.set_props) {
                 window.dash_clientside.set_props('_uploaded_files',
@@ -2504,6 +2550,17 @@ app.clientside_callback(
                 if (ais) {
                     window.dash_clientside.set_props('_ais_import',
                         {data: {path: ais.path, nonce: Date.now()}});
+                }
+                const previewStores = {
+                    ais: '_pv_ais', coast: '_pv_coast',
+                    land: '_pv_land', bathy: '_pv_bathy',
+                };
+                for (const [role, storeId] of Object.entries(previewStores)) {
+                    const info = j.roles[role];
+                    if (info) {
+                        window.dash_clientside.set_props(storeId,
+                            {data: {visible: true, path: info.path}});
+                    }
                 }
             }
             setStatus('Example loaded — click Calculate Waves to run the pipeline.');
@@ -2515,6 +2572,7 @@ app.clientside_callback(
     """,
     Output('upload-status', 'children', allow_duplicate=True),
     Input('btn-run-example', 'n_clicks'),
+    State('_session', 'data'),
     prevent_initial_call=True,
 )
 
@@ -2648,11 +2706,17 @@ async function(n) {
     const uploadStatus = document.getElementById('upload-status');
     // Role specs: must match ROLE_SPECS in dash_app.py (backend canonical source).
     const labels = {
-        ais:   {host: 'upload-ais-host',   label: 'AIS CSV',               accept: '.csv'},
-        coast: {host: 'upload-coast-host', label: 'Coastline ZIP',         accept: '.zip'},
-        land:  {host: 'upload-land-host',  label: 'Land Mask ZIP',         accept: '.zip'},
-        bathy: {host: 'upload-bathy-host', label: 'Bathymetry .mesh/.dfsu', accept: '.mesh,.dfsu'},
-        tide:  {host: 'upload-tide-host',  label: 'Tide DFS0 (optional)',  accept: '.dfs0'},
+        ais:   {host: 'upload-ais-host',   label: 'AIS CSV', accept: '.csv',
+                previewStore: '_pv_ais'},
+        coast: {host: 'upload-coast-host', label: 'Coastline Shapefile',
+                accept: '.shp,.shx,.dbf,.prj,.xml,.sbn,.sbx,.cpg',
+                multiple: true, previewStore: '_pv_coast'},
+        land:  {host: 'upload-land-host',  label: 'Land Mask Shapefile',
+                accept: '.shp,.shx,.dbf,.prj,.xml,.sbn,.sbx,.cpg',
+                multiple: true, previewStore: '_pv_land'},
+        bathy: {host: 'upload-bathy-host', label: 'Bathymetry .mesh/.dfsu',
+                accept: '.mesh,.dfsu', previewStore: '_pv_bathy'},
+        tide:  {host: 'upload-tide-host',  label: 'Tide DFS0 (optional)', accept: '.dfs0'},
     };
     // Client-side mirror of _uploaded_files store (keyed by role).
     window.__uploaded = window.__uploaded || {};
@@ -2661,24 +2725,58 @@ async function(n) {
         const host = document.getElementById(spec.host);
         if (!host || host.dataset.ready) return;
         host.dataset.ready = '1';
-        host.innerHTML = `<label style="display:block;font-size:11px;font-weight:700;margin-top:4px">${spec.label}</label>` +
-                         `<input id="native-upload-${role}" type="file" accept="${spec.accept}" ` +
-                         `style="font-size:10px;width:100%;box-sizing:border-box" />` +
-                         `<div id="native-upload-${role}-status" style="font-size:10px;color:#667;min-height:13px"></div>`;
+        const multiple = spec.multiple ? ' multiple' : '';
+        const preview = spec.previewStore
+            ? `<label class="upload-preview"><input id="native-preview-${role}" type="checkbox"> preview</label>`
+            : '';
+        host.innerHTML =
+            `<div class="upload-control">` +
+            `<label class="upload-control-label">${spec.label}</label>` +
+            `<div class="upload-control-row">` +
+            `<button id="native-upload-${role}-button" type="button" class="upload-select-btn secondary-btn">` +
+            `Choose ${spec.label}</button>${preview}</div>` +
+            `<input id="native-upload-${role}" type="file" accept="${spec.accept}"${multiple} hidden>` +
+            `<div id="native-upload-${role}-status" class="upload-row-status"></div>` +
+            `</div>`;
         const input = document.getElementById(`native-upload-${role}`);
+        const button = document.getElementById(`native-upload-${role}-button`);
+        const previewInput = document.getElementById(`native-preview-${role}`);
         const rowStatus = document.getElementById(`native-upload-${role}-status`);
+        button.addEventListener('click', () => input.click());
+        if (previewInput) {
+            previewInput.addEventListener('change', () => {
+                const entry = window.__uploaded[role];
+                if (!entry || !entry.path) {
+                    previewInput.checked = false;
+                    return;
+                }
+                if (window.dash_clientside?.set_props) {
+                    window.dash_clientside.set_props(spec.previewStore, {
+                        data: {visible: previewInput.checked, path: entry.path},
+                    });
+                }
+            });
+        }
         input.addEventListener('change', async () => {
-            const file = input.files && input.files[0];
-            if (!file) return;
-            rowStatus.textContent = 'uploading...';
+            const files = Array.from(input.files || []);
+            if (files.length === 0) return;
+            button.textContent = 'Uploading...';
+            button.title = '';
+            rowStatus.textContent = '';
             setStatus('');
             const fd = new FormData();
-            fd.append('file', file, file.name);
+            if (spec.multiple) {
+                files.forEach(file => fd.append('files', file, file.name));
+            } else {
+                fd.append('file', files[0], files[0].name);
+            }
             try {
                 const resp = await fetch(`/api/upload/${role}`, {method: 'POST', body: fd});
                 const j = await resp.json();
                 if (!resp.ok || j.error) throw new Error(j.error || resp.statusText);
-                rowStatus.textContent = `ready: ${j.filename}`;
+                button.textContent = j.filename;
+                button.title = (j.files || [j.filename]).join('\n');
+                rowStatus.textContent = j.warning || '';
                 // Merge into the uploaded-files mirror and push to Dash store.
                 const entry = {path: j.path, filename: j.filename};
                 if (role === 'tide') {
@@ -2689,12 +2787,18 @@ async function(n) {
                 if (window.dash_clientside?.set_props) {
                     window.dash_clientside.set_props('_uploaded_files',
                         {data: Object.assign({}, window.__uploaded)});
+                    if (spec.previewStore) {
+                        previewInput.checked = true;
+                        window.dash_clientside.set_props(spec.previewStore,
+                            {data: {visible: true, path: j.path}});
+                    }
                     if (role === 'ais') {
                         window.dash_clientside.set_props('_ais_import',
                             {data: {path: j.path, nonce: Date.now()}});
                     }
                 }
             } catch (e) {
+                button.textContent = `Choose ${spec.label}`;
                 rowStatus.textContent = 'ERROR: ' + e.message;
                 setStatus('Upload failed: ' + e.message);
             }
@@ -4839,6 +4943,9 @@ async function(state) {
 
 
 _make_preview_clientside('_pv_ais',   'pv-ais-info',   '__setPreviewAis')
+_make_preview_clientside('_pv_bathy', 'pv-bathy-info', '__setPreviewBathy')
+_make_preview_clientside('_pv_coast', 'pv-coast-info', '__setPreviewCoast')
+_make_preview_clientside('_pv_land',  'pv-land-info',  '__setPreviewLand')
 
 
 # Load Results result → single combined progress overlay + zoom-to-fit, then bump stores

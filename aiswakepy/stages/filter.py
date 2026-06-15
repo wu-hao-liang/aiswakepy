@@ -21,6 +21,7 @@ Pipeline (execution order):
 
 from __future__ import annotations
 
+import warnings
 from pathlib import Path
 
 import geopandas as gpd
@@ -805,10 +806,10 @@ def mask_land(df: pd.DataFrame, land_shp: str | Path,
     spinner = Spinner(desc="mask_land")
     land_gdf = gpd.read_file(land_shp)
     if land_gdf.crs is None:
-        raise ValueError(
-            f"Land shapefile {land_shp!r} has no CRS.  Include a .prj file "
-            "defining the coordinate reference system as EPSG:4326 (WGS 84)."
+        warnings.warn(
+            f"Land shapefile {land_shp!r} has no CRS; assuming EPSG:4326 (WGS 84)."
         )
+        land_gdf = land_gdf.set_crs("EPSG:4326")
     if land_gdf.crs.to_epsg() != 4326:
         land_gdf = land_gdf.to_crs("EPSG:4326")
     # Sort so that adjacency after removal is meaningful.
