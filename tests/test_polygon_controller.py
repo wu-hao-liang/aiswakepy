@@ -47,11 +47,14 @@ def _click_map(page, x, y, *, ctrl=True):
     page.evaluate(
         """([x, y, ctrl]) => {
             const map = document.getElementById('map');
+            const rect = map.getBoundingClientRect();
+            const clientX = rect.left + x;
+            const clientY = rect.top + y;
             map.dispatchEvent(new PointerEvent('pointerdown', {
-                bubbles: true, button: 0, clientX: x, clientY: y, ctrlKey: ctrl,
+                bubbles: true, button: 0, clientX, clientY, ctrlKey: ctrl,
             }));
             map.dispatchEvent(new PointerEvent('pointerup', {
-                bubbles: true, button: 0, clientX: x, clientY: y, ctrlKey: ctrl,
+                bubbles: true, button: 0, clientX, clientY, ctrlKey: ctrl,
             }));
         }""",
         [x, y, ctrl],
@@ -129,11 +132,14 @@ def test_pan_does_not_add_vertex_and_repeated_sessions_work(polygon_page):
     page.evaluate(
         """() => {
             const map = document.getElementById('map');
+            const rect = map.getBoundingClientRect();
             map.dispatchEvent(new PointerEvent('pointerdown', {
-                bubbles: true, button: 0, clientX: 100, clientY: 100, ctrlKey: true,
+                bubbles: true, button: 0,
+                clientX: rect.left + 100, clientY: rect.top + 100, ctrlKey: true,
             }));
             map.dispatchEvent(new PointerEvent('pointerup', {
-                bubbles: true, button: 0, clientX: 180, clientY: 170, ctrlKey: true,
+                bubbles: true, button: 0,
+                clientX: rect.left + 180, clientY: rect.top + 170, ctrlKey: true,
             }));
         }"""
     )

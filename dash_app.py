@@ -3639,6 +3639,14 @@ async function(n) {
             getViewport: () => window.deckInstance.getViewports()[0],
             onComplete: applyWavePolygon,
             onStateChange: () => {
+                if (window._hoveredWave !== null) {
+                    window._hoveredWave = null;
+                    hideTip();
+                    if (window._pinnedWave === null &&
+                            typeof window.__rebuild === 'function') {
+                        window.__rebuild();
+                    }
+                }
                 if (typeof window.__updateDeckCursor === 'function') {
                     window.__updateDeckCursor();
                 }
@@ -3909,7 +3917,9 @@ async function(n) {
                     getFillColor: (_, {index}) => waveColor(wvIdx(index)),
                     updateTriggers: { getFillColor: [wH, wvFilter] },
                     onHover: ({x, y, index}) => {
-                        if (!window.__ctrlHeld || index < 0) {
+                        const polygonState = window.__polygonController?.getState();
+                        if (polygonState?.armed || polygonState?.drawing ||
+                                !window.__ctrlHeld || index < 0) {
                             hideTip();
                             if (window._hoveredWave !== null) {
                                 window._hoveredWave = null;
@@ -4025,7 +4035,8 @@ async function(n) {
         const getCursorForState = (isDragging = false, isHovering = false) => {
             const polygonState = window.__polygonController?.getState();
             if (window.__freehandMode) return CURSOR_PENCIL;
-            if (polygonState?.drawing) return 'crosshair';
+            if (polygonState?.drawing && window.__ctrlHeld) return 'crosshair';
+            if (polygonState?.drawing) return isDragging ? 'grabbing' : 'grab';
             if (window.__ctrlHeld) {
                 if (window.__freehandArmed) return CURSOR_PENCIL;
                 if (polygonState?.armed) return 'crosshair';
