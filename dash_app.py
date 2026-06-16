@@ -3268,6 +3268,7 @@ async function(n) {
             onChange: state => {
                 if (animationButton) {
                     animationButton.style.display = state.selection ? '' : 'none';
+                    animationButton.disabled = !state.selection;
                     animationButton.textContent = state.playing ? '⏸' : '▶';
                     animationButton.classList.toggle('playing', state.playing);
                 }
