@@ -69,7 +69,9 @@ ANIMATION_RAY_COLUMNS = [
     'EndLongitude', 'EndLatitude', 'SourceTime', 'Side',
     'Distance_m', 'ReachedShore', 'WakeDirection_deg', 'Theta_deg',
     'SOGms', 'PhaseSpeed_mps', 'GroupSpeed_mps',
-    'CuspAngle_deg', 'TransverseSpeed_mps',
+    'CuspAngle_deg', 'TransverseSpeed_mps', 'CuspDirection_deg',
+    'CuspEndLongitude', 'CuspEndLatitude', 'CuspDistance_m',
+    'CuspReachedShore',
 ]
 
 
@@ -271,7 +273,8 @@ def _build_animation_ray_cache(state: 'SessionState', df_rays: pd.DataFrame) -> 
         'SourceLongitude', 'SourceLatitude', 'EndLongitude', 'EndLatitude',
         'Distance_m', 'WakeDirection_deg', 'Theta_deg', 'SOGms',
         'PhaseSpeed_mps', 'GroupSpeed_mps', 'CuspAngle_deg',
-        'TransverseSpeed_mps',
+        'TransverseSpeed_mps', 'CuspDirection_deg', 'CuspEndLongitude',
+        'CuspEndLatitude', 'CuspDistance_m',
     ]
     for col in numeric:
         df[col] = pd.to_numeric(df[col], errors='coerce').astype('float32')
@@ -282,6 +285,7 @@ def _build_animation_ray_cache(state: 'SessionState', df_rays: pd.DataFrame) -> 
     df['SourceTime'] = pd.to_datetime(df['SourceTime'], errors='coerce').astype('int64')
     df['Side'] = df['Side'].fillna('').astype(str)
     df['ReachedShore'] = df['ReachedShore'].fillna(False).astype(bool)
+    df['CuspReachedShore'] = df['CuspReachedShore'].fillna(False).astype(bool)
     state.df_animation_rays = df
     state.ipc_animation_rays = _ipc(pa.Table.from_pandas(df, preserve_index=False))
 
@@ -3140,6 +3144,8 @@ async function(n) {
         let rSogMs = new Float32Array(0), rPhaseSpeed = new Float32Array(0);
         let rGroupSpeed = new Float32Array(0), rCuspAngle = new Float32Array(0);
         let rTransverseSpeed = new Float32Array(0);
+        let rCuspDir = new Float32Array(0), rCuspEndPos = new Float32Array(0);
+        let rCuspDistance = new Float32Array(0), rCuspReached = new Uint8Array(0);
         let raysBySegKey = new Map();
         // Precomputed mapping: wave index → track segment index (-1 = no match).
         // Rebuilt every time wave OR track data changes; values are Number-normalised
@@ -3221,18 +3227,25 @@ async function(n) {
             rGroupSpeed = get('GroupSpeed_mps') ? get('GroupSpeed_mps').toArray() : new Float32Array(n);
             rCuspAngle = get('CuspAngle_deg') ? get('CuspAngle_deg').toArray() : new Float32Array(n);
             rTransverseSpeed = get('TransverseSpeed_mps') ? get('TransverseSpeed_mps').toArray() : new Float32Array(n);
+            rCuspDir = get('CuspDirection_deg') ? get('CuspDirection_deg').toArray() : new Float32Array(n);
+            rCuspDistance = get('CuspDistance_m') ? get('CuspDistance_m').toArray() : new Float32Array(n);
+            rCuspReached = get('CuspReachedShore') ? get('CuspReachedShore').toArray() : new Uint8Array(n);
             const sideCol = get('Side');
             rSide = i => sideCol ? sideCol.get(i) : '';
             const srcLon = get('SourceLongitude')?.toArray() || new Float32Array(n);
             const srcLat = get('SourceLatitude')?.toArray() || new Float32Array(n);
             const endLon = get('EndLongitude')?.toArray() || new Float32Array(n);
             const endLat = get('EndLatitude')?.toArray() || new Float32Array(n);
+            const cuspEndLon = get('CuspEndLongitude')?.toArray() || new Float32Array(n);
+            const cuspEndLat = get('CuspEndLatitude')?.toArray() || new Float32Array(n);
             rSourcePos = new Float32Array(n * 2);
             rEndPos = new Float32Array(n * 2);
+            rCuspEndPos = new Float32Array(n * 2);
             raysBySegKey = new Map();
             for (let i = 0; i < n; i++) {
                 rSourcePos[i*2] = srcLon[i]; rSourcePos[i*2+1] = srcLat[i];
                 rEndPos[i*2] = endLon[i]; rEndPos[i*2+1] = endLat[i];
+                rCuspEndPos[i*2] = cuspEndLon[i]; rCuspEndPos[i*2+1] = cuspEndLat[i];
                 const key = `${Number(rMMSI[i])}|${Number(rSegId[i])}`;
                 if (!raysBySegKey.has(key)) raysBySegKey.set(key, []);
                 raysBySegKey.get(key).push(i);
@@ -3278,6 +3291,27 @@ async function(n) {
             if (Number.isFinite(group) && group > 0) return group * 2;
             return 0;
         };
+        const rayGroupSpeed = ri => {
+            const stored = Number(rGroupSpeed[ri]);
+            if (Number.isFinite(stored) && stored > 0) return stored;
+            return 0.5 * rayPhaseSpeed(ri);
+        };
+        const rayCog = ri => {
+            const wakeDir = Number(rWakeDir[ri]);
+            const theta = Number(rTheta[ri]);
+            if (!Number.isFinite(wakeDir) || !Number.isFinite(theta)) return wakeDir || 0;
+            return rSide(ri) === 'port' ? wakeDir + theta : wakeDir - theta;
+        };
+        const rayCuspDirection = ri => {
+            const stored = Number(rCuspDir[ri]);
+            if (Number.isFinite(stored) && Math.abs(stored) > 1e-9) return stored;
+            const cog = rayCog(ri);
+            const angle = Number(rCuspAngle[ri]);
+            if (Number.isFinite(cog) && Number.isFinite(angle)) {
+                return rSide(ri) === 'port' ? cog - angle : cog + angle;
+            }
+            return cog;
+        };
         const selectAnimationSegment = (segIdx, waveIdx = null) => {
             if (segIdx == null || segIdx < 0 || segIdx >= tMMSI.length) {
                 animation.clear();
@@ -3294,6 +3328,10 @@ async function(n) {
                 const speed = rayPhaseSpeed(ri);
                 const travelS = speed > 0 ? (Number(rDistance[ri]) || 0) / speed : 0;
                 loopDurationS = Math.max(loopDurationS, sourceOffsetS + travelS);
+                const cuspSpeed = rayGroupSpeed(ri);
+                const cuspDist = Number(rCuspDistance[ri]) || Number(rDistance[ri]) || 0;
+                const cuspTravelS = cuspSpeed > 0 ? cuspDist / cuspSpeed : 0;
+                loopDurationS = Math.max(loopDurationS, sourceOffsetS + cuspTravelS);
             }
             animation.select({
                 segIdx,
@@ -3936,14 +3974,40 @@ async function(n) {
             const dLon = eastM / Math.max(1e-6, 111111.0 * Math.cos(latRad));
             return [pos[0] + dLon, pos[1] + dLat];
         };
-        const crestEndpoints = (center, bearingDeg, halfWidthM) => {
-            const rad = (bearingDeg + 90) * Math.PI / 180;
-            const east = Math.sin(rad) * halfWidthM;
-            const north = Math.cos(rad) * halfWidthM;
+        const toMeters = (pos, origin) => {
+            const latRad = (origin[1] || 0) * Math.PI / 180;
             return [
-                offsetMeters(center, -east, -north),
-                offsetMeters(center, east, north),
+                (pos[0] - origin[0]) * Math.max(1e-6, 111111.0 * Math.cos(latRad)),
+                (pos[1] - origin[1]) * 111111.0,
             ];
+        };
+        const fromMeters = (xy, origin) => offsetMeters(origin, xy[0], xy[1]);
+        const bearingVector = bearingDeg => {
+            const rad = Number(bearingDeg) * Math.PI / 180;
+            return [Math.sin(rad), Math.cos(rad)];
+        };
+        const dot2 = (a, b) => a[0] * b[0] + a[1] * b[1];
+        const sub2 = (a, b) => [a[0] - b[0], a[1] - b[1]];
+        const add2 = (a, b) => [a[0] + b[0], a[1] + b[1]];
+        const mul2 = (a, s) => [a[0] * s, a[1] * s];
+        const cross2 = (a, b) => a[0] * b[1] - a[1] * b[0];
+        const lineIntersection = (a, da, b, db) => {
+            const denom = cross2(da, db);
+            if (Math.abs(denom) < 1e-9) return null;
+            const t = cross2(sub2(b, a), db) / denom;
+            const p = add2(a, mul2(da, t));
+            return Number.isFinite(p[0]) && Number.isFinite(p[1]) ? p : null;
+        };
+        const clampFrontToVesselPlane = (p0, p1, vesselM, headingVec) => {
+            const d0 = dot2(sub2(p0, vesselM), headingVec);
+            const d1 = dot2(sub2(p1, vesselM), headingVec);
+            if (d0 <= 0 && d1 <= 0) return [p0, p1];
+            if (d0 > 0 && d1 > 0) {
+                return d0 > d1 ? [vesselM, p1] : [p0, vesselM];
+            }
+            const t = d0 / (d0 - d1);
+            const cut = add2(p0, mul2(sub2(p1, p0), Math.max(0, Math.min(1, t))));
+            return d0 > 0 ? [cut, p1] : [p0, cut];
         };
         const selectedAnimationGeometry = state => {
             const selection = state.selection;
@@ -3963,12 +4027,19 @@ async function(n) {
                 cPos[row*2] + (cPos[(row+1)*2] - cPos[row*2]) * f,
                 cPos[row*2+1] + (cPos[(row+1)*2+1] - cPos[row*2+1]) * f,
             ];
+            const cog0 = pointCog ? Number(pointCog[row]) : NaN;
+            const cog1 = pointCog ? Number(pointCog[Math.min(row + 1, end - 1)]) : NaN;
+            const currentCog = Number.isFinite(cog0) && Number.isFinite(cog1)
+                ? cog0 + (cog1 - cog0) * f
+                : (Number.isFinite(cog0) ? cog0 : 0);
+            const vesselM = [0, 0];
+            const vesselHeadingVec = bearingVector(currentCog);
             const rayIdxs = raysBySegKey.get(
                 `${selection.mmsi}|${selection.segmentId}`
             ) || [];
-            const crestSegments = [];
+            const frontBySide = {port: [], stbd: []};
             const transverseCircles = [];
-            const cuspBySide = {port: [], stbd: []};
+            const cuspSegments = [];
             const emittedTransverse = new Set();
             const stride = Math.max(1, Math.ceil(rayIdxs.length / 220));
             for (const ri of rayIdxs) {
@@ -3984,16 +4055,48 @@ async function(n) {
                     source[1] + (endPos[1] - source[1]) * progress,
                 ];
                 const side = rSide(ri);
-                const halfWidthM = Math.max(25, Math.min(160, 20 + rDistance[ri] * 0.035));
-                const endpoints = crestEndpoints(front, rWakeDir[ri], halfWidthM);
-                crestSegments.push({
-                    source: endpoints[0],
-                    target: endpoints[1],
+                const halfWidthM = Math.max(35, Math.min(360, 35 + rDistance[ri] * 0.08));
+                const centerM = toMeters(front, vessel);
+                const frontDir = bearingVector(Number(rWakeDir[ri]) + 90);
+                const raw0 = add2(centerM, mul2(frontDir, -halfWidthM));
+                const raw1 = add2(centerM, mul2(frontDir, halfWidthM));
+                if (frontBySide[side]) frontBySide[side].push({
+                    ri,
+                    centerM,
+                    frontDir,
+                    p0: raw0,
+                    p1: raw1,
                     side,
                     reached: Boolean(rReached[ri]),
                     progress,
+                    sourceOffsetS,
                 });
-                if (cuspBySide[side]) cuspBySide[side].push(front);
+
+                const cuspDistance = Number(rCuspDistance[ri]) || Number(rDistance[ri]) || 0;
+                const cuspProgress = animation.frontProgress(
+                    sourceOffsetS, rayGroupSpeed(ri), cuspDistance);
+                if (cuspProgress > 0 && !(cuspProgress >= 1 && Boolean(rCuspReached[ri]))) {
+                    const cuspEnd = [
+                        rCuspEndPos[ri*2] || 0,
+                        rCuspEndPos[ri*2+1] || 0,
+                    ];
+                    const useStoredEnd = cuspEnd[0] !== 0 || cuspEnd[1] !== 0;
+                    const cuspTarget = useStoredEnd
+                        ? [
+                            source[0] + (cuspEnd[0] - source[0]) * cuspProgress,
+                            source[1] + (cuspEnd[1] - source[1]) * cuspProgress,
+                        ]
+                        : offsetMeters(source,
+                            bearingVector(rayCuspDirection(ri))[0] * cuspDistance * cuspProgress,
+                            bearingVector(rayCuspDirection(ri))[1] * cuspDistance * cuspProgress);
+                    cuspSegments.push({
+                        source,
+                        target: cuspTarget,
+                        side,
+                        progress: cuspProgress,
+                        direction: rayCuspDirection(ri),
+                    });
+                }
                 if (ri % stride === 0) {
                     const key = `${Number(rSourceTime[ri])}|${source[0].toFixed(6)}|${source[1].toFixed(6)}`;
                     if (!emittedTransverse.has(key)) {
@@ -4010,27 +4113,52 @@ async function(n) {
                     }
                 }
             }
-            const cuspLines = [];
-            const cuspSegments = [];
+            const crestSegments = [];
+            let frontIntersectionClips = 0;
+            let frontPlaneClips = 0;
             for (const side of ['port', 'stbd']) {
-                if (cuspBySide[side].length >= 2) {
-                    cuspLines.push({side, path: cuspBySide[side]});
-                    for (let i = 1; i < cuspBySide[side].length; i++) {
-                        cuspSegments.push({
-                            side,
-                            source: cuspBySide[side][i - 1],
-                            target: cuspBySide[side][i],
-                        });
+                const fronts = frontBySide[side].sort((a, b) => a.sourceOffsetS - b.sourceOffsetS);
+                for (let i = 0; i < fronts.length; i++) {
+                    const front = fronts[i];
+                    const candidates = [];
+                    for (const neighbor of [fronts[i - 1], fronts[i + 1]]) {
+                        if (!neighbor) continue;
+                        const p = lineIntersection(
+                            front.centerM, front.frontDir,
+                            neighbor.centerM, neighbor.frontDir);
+                        if (!p) continue;
+                        const dist = Math.hypot(p[0] - front.centerM[0], p[1] - front.centerM[1]);
+                        if (dist > 5000) continue;
+                        candidates.push({p, t: dot2(sub2(p, front.centerM), front.frontDir)});
                     }
+                    for (const c of candidates) {
+                        if (c.t < 0) { front.p0 = c.p; frontIntersectionClips++; }
+                        else if (c.t > 0) { front.p1 = c.p; frontIntersectionClips++; }
+                    }
+                    const before0 = front.p0, before1 = front.p1;
+                    [front.p0, front.p1] = clampFrontToVesselPlane(
+                        front.p0, front.p1, vesselM, vesselHeadingVec);
+                    if (front.p0 !== before0 || front.p1 !== before1) frontPlaneClips++;
+                    const length = Math.hypot(front.p1[0] - front.p0[0], front.p1[1] - front.p0[1]);
+                    if (length < 10) continue;
+                    crestSegments.push({
+                        source: fromMeters(front.p0, vessel),
+                        target: fromMeters(front.p1, vessel),
+                        side: front.side,
+                        reached: front.reached,
+                        progress: front.progress,
+                    });
                 }
             }
-            const geometry = {vessel, crestSegments, cuspLines, cuspSegments, transverseCircles};
+            const geometry = {vessel, crestSegments, cuspSegments, transverseCircles};
             window.__animationLastGeometry = {
                 state,
                 rayCount: rayIdxs.length,
                 crestCount: crestSegments.length,
                 cuspSegmentCount: cuspSegments.length,
                 transverseCount: transverseCircles.length,
+                frontIntersectionClips,
+                frontPlaneClips,
             };
             return geometry;
         };

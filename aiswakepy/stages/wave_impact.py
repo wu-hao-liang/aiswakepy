@@ -264,7 +264,9 @@ _ANIMATION_RAY_COLS = [
     "EndLongitude", "EndLatitude", "SourceTime", "Side",
     "Distance_m", "ReachedShore", "WakeDirection_deg", "Theta_deg",
     "SOGms", "PhaseSpeed_mps", "GroupSpeed_mps",
-    "CuspAngle_deg", "TransverseSpeed_mps",
+    "CuspAngle_deg", "TransverseSpeed_mps", "CuspDirection_deg",
+    "CuspEndLongitude", "CuspEndLatitude", "CuspDistance_m",
+    "CuspReachedShore",
 ]
 
 
@@ -345,10 +347,27 @@ def compute_wave_impact_with_rays(
         group_speed = 0.5 * phase_speed
         cusp_angle_deg = float(kelvin_cusp_angle(theta_deg))
         transverse_speed = float(row.SOGms) * math.sin(math.radians(cusp_angle_deg))
+        cog = float(row.cog)
         for side, wake_dir, limit_lon, limit_lat in [
             ("port", float(row.WakeDirPort), float(port_lon2[i]), float(port_lat2[i])),
             ("stbd", float(row.WakeDirStarboard), float(stbd_lon2[i]), float(stbd_lat2[i])),
         ]:
+            cusp_dir = cog - cusp_angle_deg if side == "port" else cog + cusp_angle_deg
+            cusp_limit_lon, cusp_limit_lat = forward_point(
+                float(row.longitude), float(row.latitude), cusp_dir, float(max_propagation_m)
+            )
+            cusp_ray = LineString([
+                (row.longitude, row.latitude),
+                (cusp_limit_lon, cusp_limit_lat),
+            ])
+            cusp_hit = find_shore_intersection_indexed(cusp_ray, strtree, segments)
+            cusp_reached_shore = cusp_hit is not None
+            if cusp_reached_shore:
+                cusp_end_lon, cusp_end_lat, cusp_distance_m = cusp_hit
+            else:
+                cusp_end_lon, cusp_end_lat, cusp_distance_m = (
+                    cusp_limit_lon, cusp_limit_lat, float(max_propagation_m)
+                )
             ray = LineString([
                 (row.longitude, row.latitude),
                 (limit_lon, limit_lat),
@@ -379,6 +398,11 @@ def compute_wave_impact_with_rays(
                 "GroupSpeed_mps": group_speed,
                 "CuspAngle_deg": cusp_angle_deg,
                 "TransverseSpeed_mps": transverse_speed,
+                "CuspDirection_deg": cusp_dir,
+                "CuspEndLongitude": float(cusp_end_lon),
+                "CuspEndLatitude": float(cusp_end_lat),
+                "CuspDistance_m": float(cusp_distance_m),
+                "CuspReachedShore": bool(cusp_reached_shore),
             })
             if not reached_shore:
                 continue

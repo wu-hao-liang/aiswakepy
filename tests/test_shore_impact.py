@@ -192,6 +192,21 @@ def test_animation_rays_include_shore_hits_and_distance_limit(tmp_path):
     assert hit["TransverseSpeed_mps"] == pytest.approx(
         sogms * np.sin(np.radians(hit["CuspAngle_deg"]))
     )
+    assert hit["CuspDirection_deg"] == pytest.approx(
+        float(df.iloc[0]["cog"]) - hit["CuspAngle_deg"]
+    )
+    assert miss["CuspDirection_deg"] == pytest.approx(
+        float(df.iloc[0]["cog"]) + miss["CuspAngle_deg"]
+    )
+    assert 0 < hit["CuspDistance_m"] <= 5000.0
+    assert bool(hit["CuspReachedShore"]) is True
+    assert 0 < miss["CuspDistance_m"] <= 5000.0
+    if bool(miss["CuspReachedShore"]):
+        assert miss["CuspDistance_m"] < miss["Distance_m"]
+    else:
+        assert miss["CuspDistance_m"] == pytest.approx(5000.0)
+    assert hit["CuspDirection_deg"] != pytest.approx(hit["WakeDirection_deg"])
+    assert hit["CuspDistance_m"] != pytest.approx(hit["Distance_m"])
 
 
 def test_kelvin_cusp_angle_deep_water_limit():
