@@ -1,0 +1,347 @@
+from __future__ import annotations
+
+import io
+import json
+import zipfile
+from pathlib import Path
+
+import geopandas as gpd
+import pandas as pd
+import pyarrow.ipc as ipc
+from shapely.geometry import Polygon
+
+import dash_app
+
+
+def _reset_sessions(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr(dash_app, "UPLOAD_FOLDER", tmp_path)
+    dash_app._sessions.clear()
+
+
+def _create_session(client) -> str:
+    resp = client.post("/api/session")
+    assert resp.status_code == 200
+    sid = resp.get_json()["session_id"]
+    assert sid
+    return sid
+
+
+def test_session_routes_are_isolated(tmp_path, monkeypatch):
+    _reset_sessions(tmp_path, monkeypatch)
+    client = dash_app.server.test_client()
+    sid1 = _create_session(client)
+    sid2 = _create_session(client)
+
+    s1 = dash_app._sessions[sid1]
+    s2 = dash_app._sessions[sid2]
+    s1.ipc_vessels = b"session-one"
+    s2.ipc_vessels = b"session-two"
+    s1.ipc_animation_rays = b"rays-one"
+    s2.ipc_animation_rays = b"rays-two"
+
+    r1 = client.get(f"/api/vessels.arrow?session_id={sid1}")
+    r2 = client.get(f"/api/vessels.arrow?session_id={sid2}")
+
+    assert r1.data == b"session-one"
+    assert r2.data == b"session-two"
+    a1 = client.get(f"/api/wave_animation.arrow?session_id={sid1}")
+    a2 = client.get(f"/api/wave_animation.arrow?session_id={sid2}")
+    assert a1.data == b"rays-one"
+    assert a2.data == b"rays-two"
+
+
+def test_animation_ray_cache_preserves_geometry_and_metadata(tmp_path):
+    state = dash_app.SessionState(session_id="test", root=tmp_path)
+    rays = pd.DataFrame([{
+        "MMSI": 123456789,
+        "segment_id": 7,
+        "SourceLongitude": 103.8,
+        "SourceLatitude": 1.2,
+        "EndLongitude": 103.9,
+        "EndLatitude": 1.3,
+        "SourceTime": pd.Timestamp("2024-01-01T00:00:00"),
+        "Side": "port",
+        "Distance_m": 1500.0,
+        "ReachedShore": True,
+    }])
+
+    dash_app._build_animation_ray_cache(state, rays)
+    table = ipc.open_stream(state.ipc_animation_rays).read_all()
+
+    assert table.num_rows == 1
+    assert table["MMSI"][0].as_py() == 123456789
+    assert table["segment_id"][0].as_py() == 7
+    assert table["Side"][0].as_py() == "port"
+    assert table["Distance_m"][0].as_py() == 1500.0
+    assert table["ReachedShore"][0].as_py() is True
+
+
+def test_ais_upload_validates_required_columns(tmp_path, monkeypatch):
+    _reset_sessions(tmp_path, monkeypatch)
+    client = dash_app.server.test_client()
+    sid = _create_session(client)
+
+    bad = io.BytesIO(b"mmsi,longitude,latitude\n1,103.7,1.2\n")
+    resp = client.post(
+        f"/api/upload/ais?session_id={sid}",
+        data={"file": (bad, "bad.csv")},
+        content_type="multipart/form-data",
+    )
+
+    assert resp.status_code == 400
+    assert "missing required columns" in resp.get_json()["error"]
+
+
+def test_shapefile_upload_accepts_selected_sidecars(tmp_path, monkeypatch):
+    _reset_sessions(tmp_path / "sessions", monkeypatch)
+    client = dash_app.server.test_client()
+    sid = _create_session(client)
+
+    source = tmp_path / "source"
+    source.mkdir()
+    shp = source / "layer.shp"
+    gpd.GeoDataFrame(
+        {"name": ["area"]},
+        geometry=[Polygon([(103.0, 1.0), (103.1, 1.0), (103.1, 1.1), (103.0, 1.0)])],
+        crs="EPSG:4326",
+    ).to_file(shp)
+
+    selected = []
+    for suffix in (".shp", ".shx", ".dbf", ".cpg"):
+        path = source / f"layer{suffix}"
+        selected.append((io.BytesIO(path.read_bytes()), path.name))
+    resp = client.post(
+        f"/api/upload/coast?session_id={sid}",
+        data={"files": selected},
+        content_type="multipart/form-data",
+    )
+
+    assert resp.status_code == 200, resp.get_json()
+    payload = resp.get_json()
+    assert payload["filename"] == "layer.shp"
+    assert set(payload["files"]) == {"layer.shp", "layer.shx", "layer.dbf", "layer.cpg"}
+    assert "assuming the coordinates are WGS84" in payload["warning"]
+
+
+def test_shapefile_upload_requires_shx_and_dbf(tmp_path, monkeypatch):
+    _reset_sessions(tmp_path, monkeypatch)
+    client = dash_app.server.test_client()
+    sid = _create_session(client)
+
+    resp = client.post(
+        f"/api/upload/land?session_id={sid}",
+        data={"files": [(io.BytesIO(b"not-a-real-shapefile"), "layer.shp")]},
+        content_type="multipart/form-data",
+    )
+
+    assert resp.status_code == 400
+    assert "missing required sidecars" in resp.get_json()["error"]
+
+
+def test_build_config_uses_first_tide_item(tmp_path):
+    state = dash_app.SessionState(session_id="test", root=tmp_path)
+    paths = {}
+    for name in ("ais.csv", "land.shp", "bathy.mesh", "coast.shp", "tide.dfs0"):
+        path = tmp_path / name
+        path.touch()
+        paths[name] = name
+
+    cfg = dash_app._build_config(
+        state,
+        paths["ais.csv"],
+        paths["land.shp"],
+        paths["bathy.mesh"],
+        paths["coast.shp"],
+        paths["tide.dfs0"],
+    )
+
+    assert cfg["bathymetry"]["tide_dfs0"] == str(tmp_path / "tide.dfs0")
+    assert "tide_item" not in cfg["bathymetry"]
+
+
+def test_export_filtered_returns_one_time_rerun_zip_download(tmp_path, monkeypatch):
+    _reset_sessions(tmp_path, monkeypatch)
+    report_inputs = {}
+
+    def _capture_reports(_cfg, vessels, waves, out_dir):
+        report_inputs["vessels"] = vessels.copy()
+        report_inputs["waves"] = waves.copy()
+        (out_dir / "WaveHeightMap.png").write_bytes(b"filtered report")
+
+    monkeypatch.setattr(dash_app, "_generate_report_plots", _capture_reports)
+    client = dash_app.server.test_client()
+    sid = _create_session(client)
+    state = dash_app._sessions[sid]
+
+    df = pd.DataFrame({
+        "mmsi": [111, 111, 222],
+        "segment_id": [7, 7, 8],
+        "width": [20.0, 20.0, 10.0],
+        "length": [100.0, 100.0, 50.0],
+        "draught": [5.0, 5.0, 2.0],
+        "obstime": pd.to_datetime(
+            ["2024-01-01", "2024-01-01 00:01", "2024-01-02"],
+            format="mixed",
+        ),
+        "longitude": [103.1, 103.2, 103.3],
+        "latitude": [1.1, 1.2, 1.3],
+        "sog": [5.0, 6.0, 7.0],
+        "cog": [90.0, 91.0, 92.0],
+        "typecargo": [70, 70, 80],
+    })
+    waves = pd.DataFrame({
+        "ShLongitude": [103.4, 103.5],
+        "ShLatitude": [1.4, 1.5],
+        "MMSI": [111, 111],
+        "WaveHeight": [0.2, 0.6],
+        "WavePeriod": [3.0, 4.0],
+        "Side": ["P", "S"],
+        "DistLoc_km": [0.5, 0.8],
+        "SOG": [6.0, 6.0],
+        "VesselLength": [100.0, 100.0],
+        "VesselWidth": [20.0, 20.0],
+        "DateTime": ["2024-01-01 00:01:00", "2024-01-01 00:02:00"],
+        "VesselLongitude": [103.2, 103.2],
+        "VesselLatitude": [1.2, 1.2],
+        "segment_id": [7, 7],
+        "VesselDraught": [5.0, 5.0],
+        "VesselCOG": [91.0, 91.0],
+    })
+    state.last_results["df_filtered"] = df
+    state.df_vessels = df
+    state.df_waves = waves
+    state.pipeline["cfg"] = {
+        "ais": {"raw_csv": "uploaded.csv", "land_shp": "land.shp"},
+        "bathymetry": {"source": "bathy.mesh"},
+        "coastline": {"shapefile": "coast.shp"},
+        "output": {"directory": "output", "save_stage_csv": True},
+    }
+
+    resp = client.post(
+        f"/api/export/filtered?session_id={sid}",
+        json={
+            "dest_name": "subset",
+            "filtered": True,
+            "seg_keys": [[111, 7]],
+            "wave_idxs": [1],
+            "sel_ais": "uploaded.csv",
+        },
+    )
+
+    assert resp.status_code == 200
+    prepared = resp.get_json()
+    assert prepared["filename"] == "subset.zip"
+
+    download = client.get(prepared["download_url"])
+    assert download.status_code == 200
+    assert download.mimetype == "application/zip"
+    assert "attachment; filename=subset.zip" in download.headers["Content-Disposition"]
+    with zipfile.ZipFile(io.BytesIO(download.data)) as zf:
+        names = set(zf.namelist())
+        assert "ais/uploaded.csv" in names
+        assert "output/vessels.parquet" in names
+        assert "output/waves.parquet" in names
+        assert "output/wave_track_link.csv" in names
+        assert "output/WaveHeightMap.png" in names
+        assert "config.json" in names
+        exported_ais = pd.read_csv(io.BytesIO(zf.read("ais/uploaded.csv")))
+        exported_vessels = pd.read_parquet(io.BytesIO(zf.read("output/vessels.parquet")))
+        exported_waves = pd.read_parquet(io.BytesIO(zf.read("output/waves.parquet")))
+        exported_links = pd.read_csv(io.BytesIO(zf.read("output/wave_track_link.csv")))
+        exported_config = json.loads(zf.read("config.json"))
+
+    assert set(exported_ais["mmsi"]) == {111}
+    assert set(exported_vessels["mmsi"]) == {111}
+    assert exported_waves["WaveHeight"].tolist() == [0.6]
+    assert exported_links[["MMSI", "segment_id"]].values.tolist() == [[111, 7]]
+    assert exported_config["ais"]["raw_csv"] == "ais/uploaded.csv"
+    assert report_inputs["vessels"]["mmsi"].unique().tolist() == [111]
+    assert report_inputs["waves"]["WaveHeight"].tolist() == [0.6]
+
+    expired = client.get(prepared["download_url"])
+    assert expired.status_code == 404
+    assert expired.get_json()["error"] == "download expired or already used"
+
+
+def test_export_without_filter_includes_original_ais_and_full_results(tmp_path, monkeypatch):
+    _reset_sessions(tmp_path, monkeypatch)
+    client = dash_app.server.test_client()
+    sid = _create_session(client)
+    state = dash_app._sessions[sid]
+
+    raw_ais = state.root / "uploads" / "ais" / "original.csv"
+    raw_ais.parent.mkdir(parents=True)
+    raw_ais.write_text("mmsi,longitude,latitude\n111,103.1,1.1\n", encoding="utf-8")
+    state.files["ais"] = raw_ais
+    state.original_names["ais"] = raw_ais.name
+
+    vessels = pd.DataFrame({
+        "mmsi": [111, 222],
+        "segment_id": [7, 8],
+        "longitude": [103.1, 103.2],
+        "latitude": [1.1, 1.2],
+    })
+    waves = pd.DataFrame({
+        "MMSI": [111, 222],
+        "segment_id": [7, 8],
+        "WaveHeight": [0.2, 0.3],
+    })
+    state.last_results["df_filtered"] = vessels
+    state.df_vessels = vessels
+    state.df_waves = waves
+    state.pipeline["cfg"] = {
+        "ais": {"raw_csv": str(raw_ais), "land_shp": ""},
+        "bathymetry": {"source": ""},
+        "coastline": {"shapefile": ""},
+        "output": {"directory": str(state.root / "output")},
+    }
+    output_dir = state.root / "output"
+    output_dir.mkdir()
+    (output_dir / "WaveHeightMap.png").write_bytes(b"report")
+
+    prepared = client.post(
+        f"/api/export/filtered?session_id={sid}",
+        json={"filtered": False},
+    ).get_json()
+    download = client.get(prepared["download_url"])
+
+    assert download.status_code == 200
+    with zipfile.ZipFile(io.BytesIO(download.data)) as zf:
+        assert zf.read("ais/original.csv") == raw_ais.read_bytes()
+        assert zf.read("output/WaveHeightMap.png") == b"report"
+        with zf.open("output/vessels.parquet") as src:
+            assert len(pd.read_parquet(io.BytesIO(src.read()))) == 2
+        with zf.open("output/waves.parquet") as src:
+            assert len(pd.read_parquet(io.BytesIO(src.read()))) == 2
+
+
+def test_example_endpoint_loads_all_roles(tmp_path, monkeypatch):
+    """POST /api/example should copy all example_data/ files into the session
+    and return a roles dict with paths for all 5 input types."""
+    _reset_sessions(tmp_path, monkeypatch)
+    client = dash_app.server.test_client()
+    sid = _create_session(client)
+
+    resp = client.post(f"/api/example?session_id={sid}")
+    assert resp.status_code == 200, resp.get_json()
+    j = resp.get_json()
+    assert "roles" in j, j
+
+    roles = j["roles"]
+    # All required roles must be present.
+    for role in ("ais", "coast", "land", "bathy"):
+        assert role in roles, f"Missing role: {role}"
+        assert roles[role].get("path"), f"No path for role: {role}"
+        assert roles[role].get("filename"), f"No filename for role: {role}"
+
+    # Tide is optional but should be present when example_data/tide/ exists.
+    if "tide" in roles:
+        assert roles["tide"].get("path")
+        assert "chosen_item" not in roles["tide"]
+
+    # Verify the session state.files was actually populated.
+    state = dash_app._sessions[sid]
+    assert state.files.get("ais") is not None
+    assert state.files.get("coast") is not None
+    assert state.files.get("land") is not None
+    assert state.files.get("bathy") is not None

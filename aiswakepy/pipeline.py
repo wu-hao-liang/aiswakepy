@@ -114,13 +114,16 @@ def run_pipeline(
         _save_stage_csv(results["df_vessel"], "02_vessel")
 
     if "wave_impact" in stages:
-        from aiswakepy.stages.wave_impact import compute_wave_impact
+        from aiswakepy.stages.wave_impact import compute_wave_impact_with_rays
         print("Stage 3/3: Wave impact...")
         t0 = time.perf_counter()
         df_in = results.get("df_vessel")
         if df_in is None:
             raise RuntimeError("Stage 'wave_impact' requires 'vessel' to have run first")
-        results["df_wave_impact"] = compute_wave_impact(
+        (
+            results["df_wave_impact"],
+            results["df_wave_animation"],
+        ) = compute_wave_impact_with_rays(
             df_vessel=df_in,
             coastline_shp=config.coastline.shapefile,
             formula=config.wave.formula,
