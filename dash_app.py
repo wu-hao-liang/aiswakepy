@@ -64,6 +64,11 @@ WAVE_COLUMNS = [
     'DateTime', 'VesselLongitude', 'VesselLatitude',
     'segment_id', 'VesselDraught', 'VesselCOG',
 ]
+ANIMATION_RAY_COLUMNS = [
+    'MMSI', 'segment_id', 'SourceLongitude', 'SourceLatitude',
+    'EndLongitude', 'EndLatitude', 'SourceTime', 'Side',
+    'Distance_m', 'ReachedShore',
+]
 
 
 def _ipc(table: pa.Table) -> bytes:
@@ -257,6 +262,26 @@ def _build_wave_caches(state: 'SessionState', df_w: pd.DataFrame) -> None:
     state.ipc_waves = _ipc(pa.Table.from_pandas(df_w, preserve_index=False))
 
 
+def _build_animation_ray_cache(state: 'SessionState', df_rays: pd.DataFrame) -> None:
+    """Encode exact wave propagation rays for browser animation."""
+    df = df_rays.reindex(columns=ANIMATION_RAY_COLUMNS).copy()
+    numeric = [
+        'SourceLongitude', 'SourceLatitude', 'EndLongitude', 'EndLatitude',
+        'Distance_m',
+    ]
+    for col in numeric:
+        df[col] = pd.to_numeric(df[col], errors='coerce').astype('float32')
+    df['MMSI'] = pd.to_numeric(df['MMSI'], errors='coerce').fillna(-1).astype('int64')
+    df['segment_id'] = (
+        pd.to_numeric(df['segment_id'], errors='coerce').fillna(-1).astype('int32')
+    )
+    df['SourceTime'] = pd.to_datetime(df['SourceTime'], errors='coerce').astype('int64')
+    df['Side'] = df['Side'].fillna('').astype(str)
+    df['ReachedShore'] = df['ReachedShore'].fillna(False).astype(bool)
+    state.df_animation_rays = df
+    state.ipc_animation_rays = _ipc(pa.Table.from_pandas(df, preserve_index=False))
+
+
 # ---------------------------------------------------------------------------
 # Initial state: empty caches. The page boots showing only the basemap.
 # Tracks appear after Step 1 (Filter AIS); waves after Step 2 (Calculate waves);
@@ -280,6 +305,10 @@ EMPTY_IPC_TRACK_OFFSETS = _ipc(pa.table({'offset': pa.array([0], pa.int32())}))
 _empty_wave_state = type('_EmptyWaveState', (), {})()
 _build_wave_caches(_empty_wave_state, pd.DataFrame(columns=WAVE_COLUMNS))
 EMPTY_IPC_WAVES = _empty_wave_state.ipc_waves
+_build_animation_ray_cache(
+    _empty_wave_state, pd.DataFrame(columns=ANIMATION_RAY_COLUMNS)
+)
+EMPTY_IPC_ANIMATION_RAYS = _empty_wave_state.ipc_animation_rays
 # 1x1 transparent PNG placeholder so /api/raster.png never 500s before data exists
 EMPTY_PNG_BYTES = bytes.fromhex(
     '89504e470d0a1a0a0000000d49484452000000010000000108060000001f15c4'
@@ -310,9 +339,12 @@ class SessionState:
         default_factory=lambda: pd.DataFrame(columns=VESSEL_COLUMNS))
     df_waves: pd.DataFrame = field(
         default_factory=lambda: pd.DataFrame(columns=WAVE_COLUMNS))
+    df_animation_rays: pd.DataFrame = field(
+        default_factory=lambda: pd.DataFrame(columns=ANIMATION_RAY_COLUMNS))
     seg_meta: list[dict] = field(default_factory=list)
     ipc_vessels: bytes = EMPTY_IPC_VESSELS
     ipc_waves: bytes = EMPTY_IPC_WAVES
+    ipc_animation_rays: bytes = EMPTY_IPC_ANIMATION_RAYS
     ipc_track_coords: bytes = EMPTY_IPC_TRACK_COORDS
     ipc_track_meta: bytes = EMPTY_IPC_TRACK_META
     ipc_track_offsets: bytes = EMPTY_IPC_TRACK_OFFSETS
@@ -551,6 +583,12 @@ def _pipeline_thread(
             # back-fill, so no join needed here. The helper is kept around for
             # _load_results also handles legacy CSV imports.
             _build_wave_caches(state, results['df_wave_impact'])
+            _build_animation_ray_cache(
+                state, results.get(
+                    'df_wave_animation',
+                    pd.DataFrame(columns=ANIMATION_RAY_COLUMNS),
+                )
+            )
             print(f'  -> {len(results["df_wave_impact"]):,} wave events '
                   f'({time.perf_counter()-t0:.1f}s)')
             # Save wave parquet for dev-loading
@@ -559,6 +597,14 @@ def _pipeline_thread(
                 print(f'  ✓ saved results: waves.parquet')
             except Exception as e:
                 print(f'  WARN: could not save waves.parquet: {e}')
+            try:
+                results.get(
+                    'df_wave_animation',
+                    pd.DataFrame(columns=ANIMATION_RAY_COLUMNS),
+                ).to_parquet(out_dir / 'wave_animation.parquet', index=False)
+                print('  ✓ saved results: wave_animation.parquet')
+            except Exception as e:
+                print(f'  WARN: could not save wave_animation.parquet: {e}')
             try:
                 _write_wave_track_link(results['df_wave_impact'], out_dir)
                 print(f'  ✓ saved wave_track_link.csv')
@@ -814,6 +860,7 @@ INDEX_TEMPLATE = """<!DOCTYPE html>
     {%favicon%}
     {%css%}
     <script src="https://unpkg.com/deck.gl@9.1.13/dist.min.js"></script>
+    <script src="/assets/animation_controller.js"></script>
     <script type="importmap">
     {
       "imports": {
@@ -1042,6 +1089,15 @@ INDEX_TEMPLATE = """<!DOCTYPE html>
                         border-radius: 3px; margin: 4px 0; }
         #deck-container { position: fixed; top: 40px; left: 340px; right: 0; bottom: 0;
                           z-index: 1; overflow: hidden; transition: right 0.2s ease; }
+        #btn-animation { position: fixed; top: 48px; right: 18px; z-index: 12;
+                         min-width: 82px; padding: 8px 14px; border-radius: 5px;
+                         border: 1px solid #4a85b5; color: white; font-weight: 700;
+                         background: linear-gradient(180deg, #6aabda, #4a85b5);
+                         box-shadow: 0 2px 8px rgba(0,0,0,0.28); cursor: pointer; }
+        #btn-animation:disabled { background: #8798a8; border-color: #748595;
+                                  color: #d7dee5; cursor: default; opacity: 0.75; }
+        #btn-animation.playing { background: linear-gradient(180deg, #5abaaa, #3a9a8a);
+                                 border-color: #3a9a8a; }
         #copy-toast { position: fixed; top: 0; left: 0;
                       background: rgba(10,20,40,0.88); color: #8df;
                       border: 1px solid rgba(80,180,240,0.35); border-radius: 6px;
@@ -1489,6 +1545,11 @@ def _r_vessels():
 @app.server.route('/api/waves.arrow')
 def _r_waves():
     return _bytes_response(_get_session().ipc_waves)
+
+
+@app.server.route('/api/wave_animation.arrow')
+def _r_wave_animation():
+    return _bytes_response(_get_session().ipc_animation_rays)
 
 
 @app.server.route('/api/track_coords.arrow')
@@ -2149,6 +2210,8 @@ app.layout = html.Div([
     ], id='sidebar'),
 
     html.Div(id='deck-container'),
+    html.Button('Play', id='btn-animation', disabled=True,
+                title='Ctrl+click a track, track point, or wave to select an animation'),
     # MMSI copy toast — appears briefly after Ctrl+click copies MMSI
     html.Div('', id='copy-toast'),
     # Ctrl hint — permanent floating label at bottom-left of canvas
@@ -3065,6 +3128,11 @@ async function(n) {
         let wVesselLon = new Float32Array(0), wVesselLat = new Float32Array(0);
         let wSegId = new Int32Array(0);
         let wSourceIdx = new Int32Array(0);
+        let rMMSI = new BigInt64Array(0), rSegId = new Int32Array(0);
+        let rSourcePos = new Float32Array(0), rEndPos = new Float32Array(0);
+        let rSourceTime = new BigInt64Array(0), rDistance = new Float32Array(0);
+        let rReached = new Uint8Array(0), rSide = (_i) => '';
+        let raysBySegKey = new Map();
         // Precomputed mapping: wave index → track segment index (-1 = no match).
         // Rebuilt every time wave OR track data changes; values are Number-normalised
         // so BigInt (int64) vs Number (int32) representations never disagree.
@@ -3130,6 +3198,31 @@ async function(n) {
             }
             buildWaveSegMapping();
         }
+        function rebuildAnimationRayArrays(rT) {
+            const n = rT.numRows;
+            const get = name => rT.getChild(name);
+            rMMSI = get('MMSI') ? get('MMSI').toArray() : new BigInt64Array(0);
+            rSegId = get('segment_id') ? get('segment_id').toArray() : new Int32Array(n);
+            rSourceTime = get('SourceTime') ? get('SourceTime').toArray() : new BigInt64Array(n);
+            rDistance = get('Distance_m') ? get('Distance_m').toArray() : new Float32Array(n);
+            rReached = get('ReachedShore') ? get('ReachedShore').toArray() : new Uint8Array(n);
+            const sideCol = get('Side');
+            rSide = i => sideCol ? sideCol.get(i) : '';
+            const srcLon = get('SourceLongitude')?.toArray() || new Float32Array(n);
+            const srcLat = get('SourceLatitude')?.toArray() || new Float32Array(n);
+            const endLon = get('EndLongitude')?.toArray() || new Float32Array(n);
+            const endLat = get('EndLatitude')?.toArray() || new Float32Array(n);
+            rSourcePos = new Float32Array(n * 2);
+            rEndPos = new Float32Array(n * 2);
+            raysBySegKey = new Map();
+            for (let i = 0; i < n; i++) {
+                rSourcePos[i*2] = srcLon[i]; rSourcePos[i*2+1] = srcLat[i];
+                rEndPos[i*2] = endLon[i]; rEndPos[i*2+1] = endLat[i];
+                const key = `${Number(rMMSI[i])}|${Number(rSegId[i])}`;
+                if (!raysBySegKey.has(key)) raysBySegKey.set(key, []);
+                raysBySegKey.get(key).push(i);
+            }
+        }
 
         // ---- Preview state (set by clientside callbacks) ----
         window.__previews = { ais: null, bathy: null, coast: null, land: null, tide: null };
@@ -3140,6 +3233,36 @@ async function(n) {
         // Track whether we have data so layers gate themselves.
         window.__hasTracks = false;
         window.__hasWaves = false;
+
+        const animationButton = document.getElementById('btn-animation');
+        const animation = new window.VesselWaveAnimationController({
+            durationMs: 12000,
+            trackFraction: 0.7,
+            onChange: state => {
+                if (animationButton) {
+                    animationButton.disabled = !state.selection;
+                    animationButton.textContent = state.playing ? 'Pause' : 'Play';
+                    animationButton.classList.toggle('playing', state.playing);
+                }
+                if (window.deckInstance && typeof window.__rebuild === 'function') {
+                    window.__rebuild();
+                }
+            },
+        });
+        window.__animationController = animation;
+        if (animationButton) animationButton.addEventListener('click', () => animation.toggle());
+        const selectAnimationSegment = (segIdx, waveIdx = null) => {
+            if (segIdx == null || segIdx < 0 || segIdx >= tMMSI.length) {
+                animation.clear();
+                return;
+            }
+            animation.select({
+                segIdx,
+                mmsi: Number(tMMSI[segIdx]),
+                segmentId: Number(tSeg[segIdx]),
+                waveIdx,
+            });
+        };
 
         // ---- Track colour by vessel type ----
         const _typeCategory = (c) => {
@@ -3756,8 +3879,64 @@ async function(n) {
             } catch(e) { return 'Similar error: ' + e.message; }
         };
 
+        const pointRowToSegIdx = row => {
+            let lo = 0, hi = startIndices.length - 1;
+            while (lo < hi - 1) {
+                const mid = (lo + hi) >> 1;
+                if (startIndices[mid] <= row) lo = mid;
+                else hi = mid;
+            }
+            return lo;
+        };
+        const selectedAnimationGeometry = state => {
+            const selection = state.selection;
+            if (!selection) return null;
+            const si = selection.segIdx;
+            const start = startIndices[si], end = startIndices[si + 1];
+            if (start == null || end == null || end <= start) return null;
+            const firstNs = Number(pointTime[start]);
+            const lastNs = Number(pointTime[end - 1]);
+            const spanNs = Math.max(1, lastNs - firstNs);
+            const targetNs = firstNs + state.trackProgress * spanNs;
+            let row = start;
+            while (row < end - 2 && Number(pointTime[row + 1]) < targetNs) row++;
+            const t0 = Number(pointTime[row]), t1 = Number(pointTime[Math.min(row + 1, end - 1)]);
+            const f = t1 > t0 ? Math.max(0, Math.min(1, (targetNs - t0) / (t1 - t0))) : 0;
+            const vessel = [
+                cPos[row*2] + (cPos[(row+1)*2] - cPos[row*2]) * f,
+                cPos[row*2+1] + (cPos[(row+1)*2+1] - cPos[row*2+1]) * f,
+            ];
+            const rayIdxs = raysBySegKey.get(
+                `${selection.mmsi}|${selection.segmentId}`
+            ) || [];
+            const rays = [];
+            for (const ri of rayIdxs) {
+                const sourceFraction = Math.max(
+                    0, Math.min(1, (Number(rSourceTime[ri]) - firstNs) / spanNs)
+                );
+                const progress = animation.rayProgress(sourceFraction);
+                if (progress <= 0) continue;
+                const source = [rSourcePos[ri*2], rSourcePos[ri*2+1]];
+                const endPos = [rEndPos[ri*2], rEndPos[ri*2+1]];
+                rays.push({
+                    source,
+                    target: [
+                        source[0] + (endPos[0] - source[0]) * progress,
+                        source[1] + (endPos[1] - source[1]) * progress,
+                    ],
+                    side: rSide(ri),
+                    reached: Boolean(rReached[ri]),
+                    distance: rDistance[ri],
+                });
+            }
+            return {vessel, rays};
+        };
+
         const buildLayers = (zoom, hoveredIdx) => {
-            const useRaster = zoom < """ + str(ZOOM_RASTER_THRESHOLD) + r""";
+            const animationState = animation.getState();
+            const selectedSegIdx = animationState.selection?.segIdx ?? null;
+            const useRaster = zoom < """ + str(ZOOM_RASTER_THRESHOLD) + r"""
+                && selectedSegIdx == null;
             const layers = [
                 new deck.TileLayer({
                     id: 'basemap',
@@ -3834,9 +4013,12 @@ async function(n) {
                         data: { length: tMMSI.length, startIndices,
                                 attributes: { getPath: { value: cPos, size: 2 } } },
                         pickable: true, _pathType: 'open',
-                        getColor: (_, {index}) => trackColor(tType[index], 80),
+                        getColor: (_, {index}) => trackColor(
+                            tType[index],
+                            selectedSegIdx == null ? 80 : (index === selectedSegIdx ? 240 : 18),
+                        ),
                         getWidth: 1.5, widthUnits: 'pixels', widthMinPixels: 1.5,
-                        updateTriggers: { getColor: [tType] },
+                        updateTriggers: { getColor: [tType, selectedSegIdx] },
                         onHover: ({x, y, index}) => {
                             if (!window.__ctrlHeld) { hideTip(); return; }
                             if (index < 0) { hideTip(); return; }
@@ -3850,9 +4032,15 @@ async function(n) {
                         data: { length: filteredSegIdxs.length, startIndices: filteredStarts,
                                 attributes: { getPath: { value: filteredCoords, size: 2 } } },
                         pickable: true, _pathType: 'open',
-                        getColor: (_, {index}) => trackColor(tType[filteredSegIdxs[index]], 160),
+                        getColor: (_, {index}) => {
+                            const si = filteredSegIdxs[index];
+                            return trackColor(
+                                tType[si],
+                                selectedSegIdx == null ? 160 : (si === selectedSegIdx ? 240 : 18),
+                            );
+                        },
                         getWidth: 2.5, widthUnits: 'pixels', widthMinPixels: 2,
-                        updateTriggers: { getColor: [filteredSegIdxs] },
+                        updateTriggers: { getColor: [filteredSegIdxs, selectedSegIdx] },
                         onHover: ({x, y, index}) => {
                             if (!window.__ctrlHeld) { hideTip(); return; }
                             if (index < 0) { hideTip(); return; }
@@ -3870,7 +4058,10 @@ async function(n) {
                             getRadius: 3.5, radiusUnits: 'pixels', radiusMinPixels: 2,
                             getFillColor: (_, {index}) => {
                                 const si = filteredPointSeg[index];
-                                return trackColor(tType[si], 160);
+                                return trackColor(
+                                    tType[si],
+                                    selectedSegIdx == null ? 160 : (si === selectedSegIdx ? 240 : 12),
+                                );
                             },
                             pickable: true,
                             onHover: ({x, y, index}) => {
@@ -3898,6 +4089,16 @@ async function(n) {
                     }
                 }
                 // else: vis.size === 0 → nothing added → all hidden
+                if (vis === null && cPos.length / 2 <= MAX_FILTERED_POINTS) {
+                    layers.push(new deck.ScatterplotLayer({
+                        id: 'tracks-pts',
+                        data: { length: cPos.length / 2,
+                                attributes: { getPosition: { value: cPos, size: 2 } } },
+                        getRadius: 4, radiusUnits: 'pixels', radiusMinPixels: 2,
+                        getFillColor: [255, 255, 255, 0],
+                        pickable: true,
+                    }));
+                }
             }
             // Wave layer — when a filter is active, render only visible waves and
             // remap the layer's local index back to the original wave index for
@@ -3991,6 +4192,32 @@ async function(n) {
                 }
             }
 
+            const animationGeometry = selectedAnimationGeometry(animationState);
+            if (animationGeometry) {
+                if (animationGeometry.rays.length > 0) {
+                    layers.push(new deck.LineLayer({
+                        id: 'animation-rays',
+                        data: animationGeometry.rays,
+                        getSourcePosition: d => d.source,
+                        getTargetPosition: d => d.target,
+                        getColor: d => d.side === 'port'
+                            ? [60, 190, 255, d.reached ? 235 : 150]
+                            : [255, 135, 70, d.reached ? 235 : 150],
+                        getWidth: 2.5, widthUnits: 'pixels', widthMinPixels: 2,
+                        pickable: false,
+                    }));
+                }
+                layers.push(new deck.ScatterplotLayer({
+                    id: 'animation-vessel',
+                    data: [{position: animationGeometry.vessel}],
+                    getPosition: d => d.position,
+                    getRadius: 9, radiusUnits: 'pixels', radiusMinPixels: 7,
+                    getFillColor: [255, 255, 255, 255],
+                    stroked: true, getLineColor: [0, 110, 210, 255],
+                    lineWidthMinPixels: 3, pickable: false,
+                }));
+            }
+
             // ---- Preview layers (AIS points, rendered on top) ----
             // AIS preview: rendered only when visible flag is on (import is separate).
             if (pv.ais && pv.ais.visible && pv.ais.pos && pv.ais.pos.length > 0) {
@@ -4080,6 +4307,7 @@ async function(n) {
                 }
                 if (!layer || index < 0) {
                     // Click on empty space: unpin wave highlight
+                    animation.clear();
                     if (window._pinnedWave !== null) {
                         window._pinnedWave = null;
                         window.deckInstance.setProps({ layers: buildLayers(window._currentZoom, window._hoveredWave) });
@@ -4103,12 +4331,25 @@ async function(n) {
                         msg = `📌 wave MMSI=${wMMSI[origIdx]} H=${wH[origIdx].toFixed(3)}m`;
                     }
                     copyMmsi = wMMSI[origIdx];
+                    const si = waveToSegIdx ? waveToSegIdx[origIdx] : -1;
+                    selectAnimationSegment(si, origIdx);
                     window.deckInstance.setProps({ layers: buildLayers(window._currentZoom, window._hoveredWave) });
                 } else if (layer.id === 'tracks') {
                     const si = (window.__visibleSegIdxs !== null && filteredSegIdxs.length > 0)
                         ? filteredSegIdxs[index] : index;
                     copyMmsi = tMMSI[si];
                     msg = `track MMSI=${tMMSI[si]} seg=${tSeg[si]}`;
+                    window._pinnedWave = null;
+                    selectAnimationSegment(si);
+                } else if (layer.id === 'tracks-pts') {
+                    const row = window.__visibleSegIdxs !== null
+                        ? filteredPointRow[index] : index;
+                    const si = window.__visibleSegIdxs !== null
+                        ? filteredPointSeg[index] : pointRowToSegIdx(row);
+                    copyMmsi = tMMSI[si];
+                    msg = `track point MMSI=${tMMSI[si]} seg=${tSeg[si]}`;
+                    window._pinnedWave = null;
+                    selectAnimationSegment(si);
                 }
                 if (copyMmsi != null) {
                     window.__copyText(String(copyMmsi));
@@ -4456,11 +4697,15 @@ async function(n) {
         // Post-pipeline refresh hooks: show the same progress overlay as before, then rebuild layers,
         // then show a "Rendering..." pill until deck.gl has painted at least one frame.
         window.__refreshWaveLayer = async (version) => {
-            const [buf] = await fetchAssetsWithProgress([
+            animation.clear();
+            const [buf, rayBuf] = await fetchAssetsWithProgress([
                 { key: 'waves', url: `/api/waves.arrow?v=${version}`, label: 'wave impacts' },
+                { key: 'wave_animation', url: `/api/wave_animation.arrow?v=${version}`,
+                  label: 'wave animation rays' },
             ], 'Loading wave impacts');
             setRenderStatus('Rendering waves...', false);
             rebuildWaveArrays(window.tableFromIPC(buf));
+            rebuildAnimationRayArrays(window.tableFromIPC(rayBuf));
             window.__hasWaves = wMMSI.length > 0;
             window.__waveCount = wMMSI.length;
             window._hoveredWave = null;
@@ -4475,6 +4720,7 @@ async function(n) {
             }
         };
         window.__refreshTrackCaches = async (version) => {
+            animation.clear();
             const [c, m, o] = await fetchAssetsWithProgress([
                 { key: 'track_coords',  url: `/api/track_coords.arrow?v=${version}`,  label: 'track coords' },
                 { key: 'track_meta',    url: `/api/track_meta.arrow?v=${version}`,    label: 'track metadata' },
@@ -4499,6 +4745,7 @@ async function(n) {
         // ---- Load Results: fetch tracks + waves under one overlay, then zoom-to-fit
         window.__loadResults = async (result) => {
             if (!result) return;
+            animation.clear();
             const tv = result.track_version || 0;
             const wv = result.wave_version || 0;
             const hasWaves = (result.n_waves || 0) > 0;
@@ -4508,6 +4755,8 @@ async function(n) {
                 { key: 'track_offsets', url: `/api/track_offsets.arrow?v=${tv}`, label: 'track offsets' },
             ];
             if (hasWaves) assets.push({ key: 'waves', url: `/api/waves.arrow?v=${wv}`, label: 'wave impacts' });
+            assets.push({ key: 'wave_animation', url: `/api/wave_animation.arrow?v=${wv}`,
+                          label: 'wave animation rays' });
             try {
                 const buffers = await fetchAssetsWithProgress(assets, 'Loading saved results');
                 setRenderStatus('Rendering...', false);
@@ -4521,10 +4770,12 @@ async function(n) {
                     rebuildWaveArrays(window.tableFromIPC(buffers[3]));
                     window.__hasWaves = wMMSI.length > 0;
                     window.__waveCount = wMMSI.length;
+                    rebuildAnimationRayArrays(window.tableFromIPC(buffers[4]));
                 } else {
                     // Empty wave caches so cross-filter logic stays consistent
                     window.__hasWaves = false;
                     window.__waveCount = 0;
+                    rebuildAnimationRayArrays(window.tableFromIPC(buffers[3]));
                 }
                 window._hoveredWave = null;
                 window._pinnedWave  = null;

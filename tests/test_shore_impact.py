@@ -8,7 +8,10 @@ import pandas as pd
 import pytest
 from shapely.geometry import Polygon
 
-from aiswakepy.stages.wave_impact import compute_wave_impact
+from aiswakepy.stages.wave_impact import (
+    compute_wave_impact,
+    compute_wave_impact_with_rays,
+)
 
 _G = 9.78
 
@@ -154,3 +157,45 @@ def test_dist_loc_positive(tmp_path):
     if len(result) > 0:
         assert (result["DistLoc_km"] > 0).all()
 
+
+def test_animation_rays_include_shore_hits_and_distance_limit(tmp_path):
+    poly = Polygon([
+        (103.86, 1.28), (103.90, 1.28),
+        (103.90, 1.30), (103.86, 1.30),
+    ])
+    shp = _write_shp(tmp_path, poly)
+    df = _make_vessel_row(WakeDirPort=90.0, WakeDirStarboard=270.0)
+
+    impacts, rays = compute_wave_impact_with_rays(
+        df, shp, max_propagation_m=5000.0, wake_cutoff_m=0.0
+    )
+
+    assert len(impacts) == 1
+    assert set(rays["Side"]) == {"port", "stbd"}
+    hit = rays.loc[rays["Side"] == "port"].iloc[0]
+    miss = rays.loc[rays["Side"] == "stbd"].iloc[0]
+    assert bool(hit["ReachedShore"]) is True
+    assert 0 < hit["Distance_m"] < 5000.0
+    assert hit["EndLongitude"] == pytest.approx(
+        impacts.iloc[0]["ShLongitude"], abs=1e-7
+    )
+    assert bool(miss["ReachedShore"]) is False
+    assert miss["Distance_m"] == pytest.approx(5000.0)
+    assert miss["EndLongitude"] < miss["SourceLongitude"]
+    assert hit["SourceTime"] == pd.Timestamp("2024-01-01")
+
+
+def test_compute_wave_impact_public_return_is_unchanged(tmp_path):
+    poly = Polygon([
+        (103.86, 1.28), (103.90, 1.28),
+        (103.90, 1.30), (103.86, 1.30),
+    ])
+    shp = _write_shp(tmp_path, poly)
+    result = compute_wave_impact(
+        _make_vessel_row(WakeDirPort=90.0, WakeDirStarboard=270.0),
+        shp,
+        max_propagation_m=5000.0,
+        wake_cutoff_m=0.0,
+    )
+    assert isinstance(result, pd.DataFrame)
+    assert "ReachedShore" not in result.columns

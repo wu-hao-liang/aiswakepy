@@ -7,6 +7,7 @@ from pathlib import Path
 
 import geopandas as gpd
 import pandas as pd
+import pyarrow.ipc as ipc
 from shapely.geometry import Polygon
 
 import dash_app
@@ -35,12 +36,44 @@ def test_session_routes_are_isolated(tmp_path, monkeypatch):
     s2 = dash_app._sessions[sid2]
     s1.ipc_vessels = b"session-one"
     s2.ipc_vessels = b"session-two"
+    s1.ipc_animation_rays = b"rays-one"
+    s2.ipc_animation_rays = b"rays-two"
 
     r1 = client.get(f"/api/vessels.arrow?session_id={sid1}")
     r2 = client.get(f"/api/vessels.arrow?session_id={sid2}")
 
     assert r1.data == b"session-one"
     assert r2.data == b"session-two"
+    a1 = client.get(f"/api/wave_animation.arrow?session_id={sid1}")
+    a2 = client.get(f"/api/wave_animation.arrow?session_id={sid2}")
+    assert a1.data == b"rays-one"
+    assert a2.data == b"rays-two"
+
+
+def test_animation_ray_cache_preserves_geometry_and_metadata(tmp_path):
+    state = dash_app.SessionState(session_id="test", root=tmp_path)
+    rays = pd.DataFrame([{
+        "MMSI": 123456789,
+        "segment_id": 7,
+        "SourceLongitude": 103.8,
+        "SourceLatitude": 1.2,
+        "EndLongitude": 103.9,
+        "EndLatitude": 1.3,
+        "SourceTime": pd.Timestamp("2024-01-01T00:00:00"),
+        "Side": "port",
+        "Distance_m": 1500.0,
+        "ReachedShore": True,
+    }])
+
+    dash_app._build_animation_ray_cache(state, rays)
+    table = ipc.open_stream(state.ipc_animation_rays).read_all()
+
+    assert table.num_rows == 1
+    assert table["MMSI"][0].as_py() == 123456789
+    assert table["segment_id"][0].as_py() == 7
+    assert table["Side"][0].as_py() == "port"
+    assert table["Distance_m"][0].as_py() == 1500.0
+    assert table["ReachedShore"][0].as_py() is True
 
 
 def test_ais_upload_validates_required_columns(tmp_path, monkeypatch):

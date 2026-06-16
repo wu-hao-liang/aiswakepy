@@ -259,6 +259,161 @@ def compute_point_impact(
     return pd.DataFrame(records_out).reset_index(drop=True)
 
 
+_ANIMATION_RAY_COLS = [
+    "MMSI", "segment_id", "SourceLongitude", "SourceLatitude",
+    "EndLongitude", "EndLatitude", "SourceTime", "Side",
+    "Distance_m", "ReachedShore",
+]
+
+
+def compute_wave_impact_with_rays(
+    df_vessel: pd.DataFrame,
+    coastline_shp: str | Path,
+    formula: str = "kriebel",
+    max_propagation_m: float = 2000.0,
+    wake_cutoff_m: float = 0.01,
+    g: float = 9.78,
+    rho: float = 1026.0,
+    **formula_kwargs,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Compute shoreline impacts and the exact rays used by the calculation.
+
+    The ray frame contains both coastline hits and misses. Misses terminate at
+    ``max_propagation_m`` so the frontend can animate the same geometry that
+    was evaluated by this stage.
+    """
+    if formula not in _FORMULA_REGISTRY:
+        raise ValueError(
+            f"Unknown formula {formula!r}. Supported: {list(_FORMULA_REGISTRY)}"
+        )
+    compute_fn, h_col = _FORMULA_REGISTRY[formula]
+
+    _OUT_COLS = [
+        "MMSI", "ShLongitude", "ShLatitude", "WaveHeight", "WavePeriod",
+        "E_max", "E_tot", "DistLoc_km", "DateTime", "Froude_D",
+        "VesselLongitude", "VesselLatitude", "VesselCOG", "VesselDraught",
+        "VesselWidth", "VesselLength", "SOG", "Side", "segment_id", "typecargo",
+    ]
+
+    if df_vessel.empty:
+        return (
+            pd.DataFrame(columns=_OUT_COLS),
+            pd.DataFrame(columns=_ANIMATION_RAY_COLS),
+        )
+
+    coastline = load_coastline(coastline_shp)
+    strtree, segments = build_coastline_index(coastline)
+
+    lons = df_vessel["longitude"].to_numpy()
+    lats = df_vessel["latitude"].to_numpy()
+    dist = np.full(len(lons), max_propagation_m)
+    port_lon2, port_lat2 = forward_point(
+        lons, lats, df_vessel["WakeDirPort"].to_numpy(), dist
+    )
+    stbd_lon2, stbd_lat2 = forward_point(
+        lons, lats, df_vessel["WakeDirStarboard"].to_numpy(), dist
+    )
+
+    from aiswakepy._progress import Spinner
+    total = len(df_vessel)
+    spinner = Spinner(total=total, desc="Wave impact")
+
+    hit_records: list[dict] = []
+    hit_vessel_rows: list[int] = []
+    hit_dist_perp: list[float] = []
+    ray_records: list[dict] = []
+
+    for i, row in enumerate(df_vessel.itertuples(index=False)):
+        spinner.update(i + 1)
+        for side, limit_lon, limit_lat in [
+            ("port", float(port_lon2[i]), float(port_lat2[i])),
+            ("stbd", float(stbd_lon2[i]), float(stbd_lat2[i])),
+        ]:
+            ray = LineString([
+                (row.longitude, row.latitude),
+                (limit_lon, limit_lat),
+            ])
+            hit = find_shore_intersection_indexed(ray, strtree, segments)
+            reached_shore = hit is not None
+            if reached_shore:
+                end_lon, end_lat, distance_m = hit
+            else:
+                end_lon, end_lat, distance_m = (
+                    limit_lon, limit_lat, float(max_propagation_m)
+                )
+            ray_records.append({
+                "MMSI": int(row.mmsi),
+                "segment_id": int(row.segment_id),
+                "SourceLongitude": float(row.longitude),
+                "SourceLatitude": float(row.latitude),
+                "EndLongitude": float(end_lon),
+                "EndLatitude": float(end_lat),
+                "SourceTime": row.obstime,
+                "Side": side,
+                "Distance_m": float(distance_m),
+                "ReachedShore": bool(reached_shore),
+            })
+            if not reached_shore:
+                continue
+
+            sh_lon, sh_lat = end_lon, end_lat
+            theta_rad = np.radians(row.Theta)
+            dist_perp = distance_m * np.sin(theta_rad)
+            if dist_perp <= 0:
+                continue
+
+            hit_records.append({
+                "MMSI":             int(row.mmsi),
+                "ShLongitude":      sh_lon,
+                "ShLatitude":       sh_lat,
+                "WavePeriod":       row.Tc,
+                "DistLoc_km":       dist_perp / 1000.0,
+                "DateTime":         row.obstime,
+                "Froude_D":         row.Froude_D,
+                "VesselLongitude":  row.longitude,
+                "VesselLatitude":   row.latitude,
+                "VesselCOG":        row.cog,
+                "VesselDraught":    row.draught,
+                "VesselWidth":      row.width,
+                "VesselLength":     row.length,
+                "SOG":              row.sog,
+                "Side":             side,
+                "segment_id":       int(row.segment_id),
+                "typecargo":        int(getattr(row, "typecargo", 0)),
+            })
+            hit_vessel_rows.append(i)
+            hit_dist_perp.append(dist_perp)
+
+    spinner.done(total)
+    rays = pd.DataFrame(ray_records, columns=_ANIMATION_RAY_COLS)
+    if not hit_records:
+        return pd.DataFrame(columns=_OUT_COLS), rays
+
+    hit_df = df_vessel.iloc[hit_vessel_rows].copy().reset_index(drop=True)
+    hit_df["dist_perp"] = hit_dist_perp
+    h_series = compute_fn(hit_df, g=g, **formula_kwargs)
+
+    records_out: list[dict] = []
+    for rec, h_val in zip(hit_records, h_series):
+        if np.isnan(h_val) or h_val < wake_cutoff_m:
+            continue
+        T_val = rec["WavePeriod"]
+        E_max = rho * g * g * h_val * h_val * T_val * T_val / (16.0 * math.pi)
+        E_tot = 10.8 * E_max ** 0.82
+        records_out.append({
+            **rec,
+            "WaveHeight": h_val,
+            "E_max": E_max,
+            "E_tot": E_tot,
+        })
+
+    impacts = (
+        pd.DataFrame(records_out).reset_index(drop=True)
+        if records_out else pd.DataFrame(columns=_OUT_COLS)
+    )
+    return impacts, rays
+
+
 def compute_wave_impact(
     df_vessel: pd.DataFrame,
     coastline_shp: str | Path,
@@ -304,117 +459,14 @@ def compute_wave_impact(
         E_max = ρ g² H² T² / (16π)         [J/m]
         E_tot = 10.8 · E_max^0.82          [J/m]  (empirical scaling)
     """
-    if formula not in _FORMULA_REGISTRY:
-        raise ValueError(
-            f"Unknown formula {formula!r}. Supported: {list(_FORMULA_REGISTRY)}"
-        )
-    compute_fn, h_col = _FORMULA_REGISTRY[formula]
-
-    _OUT_COLS = [
-        "MMSI", "ShLongitude", "ShLatitude", "WaveHeight", "WavePeriod",
-        "E_max", "E_tot", "DistLoc_km", "DateTime", "Froude_D",
-        "VesselLongitude", "VesselLatitude", "VesselCOG", "VesselDraught",
-        "VesselWidth", "VesselLength", "SOG", "Side", "segment_id", "typecargo",
-    ]
-
-    if df_vessel.empty:
-        return pd.DataFrame(columns=_OUT_COLS)
-
-    coastline = load_coastline(coastline_shp)
-    strtree, segments = build_coastline_index(coastline)
-
-    # Vectorize ray endpoint computation for both sides
-    lons = df_vessel["longitude"].to_numpy()
-    lats = df_vessel["latitude"].to_numpy()
-    dist = np.full(len(lons), max_propagation_m)
-    port_lon2, port_lat2 = forward_point(
-        lons, lats, df_vessel["WakeDirPort"].to_numpy(), dist
+    impacts, _ = compute_wave_impact_with_rays(
+        df_vessel=df_vessel,
+        coastline_shp=coastline_shp,
+        formula=formula,
+        max_propagation_m=max_propagation_m,
+        wake_cutoff_m=wake_cutoff_m,
+        g=g,
+        rho=rho,
+        **formula_kwargs,
     )
-    stbd_lon2, stbd_lat2 = forward_point(
-        lons, lats, df_vessel["WakeDirStarboard"].to_numpy(), dist
-    )
-
-    from aiswakepy._progress import Spinner
-    total = len(df_vessel)
-    spinner = Spinner(total=total, desc="Wave impact")
-
-    # Step 1: Geometry — collect all ray-coastline hits
-    hit_records: list[dict] = []
-    hit_vessel_rows: list[int] = []
-    hit_dist_perp: list[float] = []
-
-    for i, row in enumerate(df_vessel.itertuples(index=False)):
-        spinner.update(i + 1)
-        for side, end_lon, end_lat in [
-            ("port", float(port_lon2[i]), float(port_lat2[i])),
-            ("stbd", float(stbd_lon2[i]), float(stbd_lat2[i])),
-        ]:
-            ray = LineString([(row.longitude, row.latitude), (end_lon, end_lat)])
-            hit = find_shore_intersection_indexed(ray, strtree, segments)
-            if hit is None:
-                continue
-
-            sh_lon, sh_lat, dist_m = hit
-
-            # Perpendicular distance from the sailing track to the intersection:
-            #   dist_perp = dist_ray * sin(Theta)
-            # This is the lateral distance variable in all empirical formulae.
-            theta_rad = np.radians(row.Theta)
-            dist_perp = dist_m * np.sin(theta_rad)
-
-            if dist_perp <= 0:
-                continue
-
-            hit_records.append({
-                "MMSI":             int(row.mmsi),
-                "ShLongitude":      sh_lon,
-                "ShLatitude":       sh_lat,
-                "WavePeriod":       row.Tc,
-                "DistLoc_km":       dist_perp / 1000.0,
-                "DateTime":         row.obstime,
-                "Froude_D":         row.Froude_D,
-                "VesselLongitude":  row.longitude,
-                "VesselLatitude":   row.latitude,
-                "VesselCOG":        row.cog,
-                "VesselDraught":    row.draught,
-                "VesselWidth":      row.width,
-                "VesselLength":     row.length,
-                "SOG":              row.sog,
-                "Side":             side,
-                "segment_id":       int(row.segment_id),
-                "typecargo":        int(getattr(row, "typecargo", 0)),
-            })
-            hit_vessel_rows.append(i)
-            hit_dist_perp.append(dist_perp)
-
-    spinner.done(total)
-
-    if not hit_records:
-        return pd.DataFrame(columns=_OUT_COLS)
-
-    # Step 2: Formula — batch compute wave heights
-    # Build a slice of df_vessel for all hits (preserving all vessel columns)
-    hit_df = df_vessel.iloc[hit_vessel_rows].copy().reset_index(drop=True)
-    hit_df["dist_perp"] = hit_dist_perp
-
-    h_series = compute_fn(hit_df, g=g, **formula_kwargs)
-
-    # Step 3: Filtering and output
-    records_out: list[dict] = []
-    for rec, h_val in zip(hit_records, h_series):
-        if np.isnan(h_val) or h_val < wake_cutoff_m:
-            continue
-        T_val = rec["WavePeriod"]
-        E_max = rho * g * g * h_val * h_val * T_val * T_val / (16.0 * math.pi)
-        E_tot = 10.8 * E_max ** 0.82
-        records_out.append({
-            **rec,
-            "WaveHeight": h_val,
-            "E_max": E_max,
-            "E_tot": E_tot,
-        })
-
-    if not records_out:
-        return pd.DataFrame(columns=_OUT_COLS)
-
-    return pd.DataFrame(records_out).reset_index(drop=True)
+    return impacts
