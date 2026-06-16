@@ -3251,8 +3251,7 @@ async function(n) {
 
         const animationButton = document.getElementById('btn-animation');
         const animation = new window.VesselWaveAnimationController({
-            durationMs: 12000,
-            trackFraction: 0.7,
+            realTimeScale: 10,
             onChange: state => {
                 if (animationButton) {
                     animationButton.disabled = !state.selection;
@@ -3279,7 +3278,7 @@ async function(n) {
             const rayIdxs = raysBySegKey.get(`${Number(tMMSI[segIdx])}|${Number(tSeg[segIdx])}`) || [];
             for (const ri of rayIdxs) {
                 const sourceOffsetS = Math.max(0, (Number(rSourceTime[ri]) - firstNs) / 1e9);
-                const speed = Math.max(0, Number(rGroupSpeed[ri]) || 0);
+                const speed = Math.max(0, Number(rPhaseSpeed[ri]) || 0);
                 const travelS = speed > 0 ? (Number(rDistance[ri]) || 0) / speed : 0;
                 loopDurationS = Math.max(loopDurationS, sourceOffsetS + travelS);
             }
@@ -3962,8 +3961,9 @@ async function(n) {
             for (const ri of rayIdxs) {
                 const sourceOffsetS = Math.max(0, (Number(rSourceTime[ri]) - firstNs) / 1e9);
                 const progress = animation.frontProgress(
-                    sourceOffsetS, rGroupSpeed[ri], rDistance[ri]);
+                    sourceOffsetS, rPhaseSpeed[ri], rDistance[ri]);
                 if (progress <= 0) continue;
+                if (progress >= 1 && Boolean(rReached[ri])) continue;
                 const source = [rSourcePos[ri*2], rSourcePos[ri*2+1]];
                 const endPos = [rEndPos[ri*2], rEndPos[ri*2+1]];
                 const front = [
@@ -4286,11 +4286,11 @@ async function(n) {
                         data: animationGeometry.cuspLines,
                         getPath: d => d.path,
                         getColor: d => d.side === 'port'
-                            ? [60, 190, 255, 210]
-                            : [255, 135, 70, 210],
-                        getWidth: 2,
+                            ? [60, 190, 255, 245]
+                            : [255, 135, 70, 245],
+                        getWidth: 3.5,
                         widthUnits: 'pixels',
-                        widthMinPixels: 1.5,
+                        widthMinPixels: 3,
                         _pathType: 'open',
                         pickable: false,
                     }));
@@ -4301,11 +4301,11 @@ async function(n) {
                         data: animationGeometry.crestSegments,
                         getPath: d => d.path,
                         getColor: d => d.side === 'port'
-                            ? [60, 190, 255, d.reached ? 230 : 145]
-                            : [255, 135, 70, d.reached ? 230 : 145],
-                        getWidth: 2.4,
+                            ? [60, 190, 255, d.reached ? 245 : 175]
+                            : [255, 135, 70, d.reached ? 245 : 175],
+                        getWidth: 3,
                         widthUnits: 'pixels',
-                        widthMinPixels: 1.5,
+                        widthMinPixels: 2.5,
                         _pathType: 'open',
                         pickable: false,
                     }));

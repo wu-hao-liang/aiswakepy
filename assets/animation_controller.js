@@ -3,7 +3,7 @@
 
     class VesselWaveAnimationController {
         constructor(options = {}) {
-            this.durationMs = options.durationMs || 12000;
+            this.realTimeScale = options.realTimeScale || 10;
             this.now = options.now || (() => performance.now());
             this.requestFrame = options.requestFrame || (fn => requestAnimationFrame(fn));
             this.cancelFrame = options.cancelFrame || (id => cancelAnimationFrame(id));
@@ -14,6 +14,11 @@
             this.startedAt = null;
             this.frameId = null;
             this._tick = this._tick.bind(this);
+        }
+
+        _displayDurationMs() {
+            const loopDurationS = this.selection?.loopDurationS || 1;
+            return Math.max(1, loopDurationS / Math.max(1e-9, this.realTimeScale) * 1000);
         }
 
         select(selection) {
@@ -38,7 +43,7 @@
         play() {
             if (!this.selection || this.playing) return;
             this.playing = true;
-            this.startedAt = this.now() - this.progress * this.durationMs;
+            this.startedAt = this.now() - this.progress * this._displayDurationMs();
             this.frameId = this.requestFrame(this._tick);
             this.onChange(this.getState());
         }
@@ -59,7 +64,8 @@
         _tick(timestamp) {
             if (!this.playing) return;
             const elapsed = Math.max(0, timestamp - this.startedAt);
-            this.progress = (elapsed % this.durationMs) / this.durationMs;
+            const durationMs = this._displayDurationMs();
+            this.progress = (elapsed % durationMs) / durationMs;
             this.onChange(this.getState());
             this.frameId = this.requestFrame(this._tick);
         }
@@ -75,6 +81,7 @@
                 simElapsedS,
                 loopDurationS,
                 trackDurationS,
+                realTimeScale: this.realTimeScale,
                 trackProgress: Math.min(1, simElapsedS / Math.max(1e-9, trackDurationS)),
             };
         }
