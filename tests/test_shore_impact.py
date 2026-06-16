@@ -11,6 +11,7 @@ from shapely.geometry import Polygon
 from aiswakepy.stages.wave_impact import (
     compute_wave_impact,
     compute_wave_impact_with_rays,
+    kelvin_cusp_angle,
 )
 
 _G = 9.78
@@ -183,6 +184,20 @@ def test_animation_rays_include_shore_hits_and_distance_limit(tmp_path):
     assert miss["Distance_m"] == pytest.approx(5000.0)
     assert miss["EndLongitude"] < miss["SourceLongitude"]
     assert hit["SourceTime"] == pd.Timestamp("2024-01-01")
+    assert hit["Theta_deg"] == pytest.approx(35.0)
+    sogms = float(df.iloc[0]["SOGms"])
+    assert hit["PhaseSpeed_mps"] == pytest.approx(sogms * np.cos(np.radians(35.0)))
+    assert hit["GroupSpeed_mps"] == pytest.approx(0.5 * hit["PhaseSpeed_mps"])
+    assert hit["CuspAngle_deg"] == pytest.approx(kelvin_cusp_angle(35.0))
+    assert hit["TransverseSpeed_mps"] == pytest.approx(
+        sogms * np.sin(np.radians(hit["CuspAngle_deg"]))
+    )
+
+
+def test_kelvin_cusp_angle_deep_water_limit():
+    theta = np.degrees(np.arcsin(1.0 / np.sqrt(3.0)))
+    assert theta == pytest.approx(35.264, abs=0.001)
+    assert kelvin_cusp_angle(theta) == pytest.approx(19.471, abs=0.001)
 
 
 def test_compute_wave_impact_public_return_is_unchanged(tmp_path):

@@ -262,8 +262,23 @@ def compute_point_impact(
 _ANIMATION_RAY_COLS = [
     "MMSI", "segment_id", "SourceLongitude", "SourceLatitude",
     "EndLongitude", "EndLatitude", "SourceTime", "Side",
-    "Distance_m", "ReachedShore",
+    "Distance_m", "ReachedShore", "WakeDirection_deg", "Theta_deg",
+    "SOGms", "PhaseSpeed_mps", "GroupSpeed_mps",
+    "CuspAngle_deg", "TransverseSpeed_mps",
 ]
+
+
+def kelvin_cusp_angle(theta_deg: float | np.ndarray) -> float | np.ndarray:
+    """Return the Kelvin cusp/envelope angle for a divergent-wave angle.
+
+    ``theta_deg`` is the divergent-wave propagation angle relative to vessel
+    heading. In the deep-water Kelvin case theta=asin(1/sqrt(3)), this returns
+    atan(1/(2*sqrt(2))) ≈ 19.47 degrees.
+    """
+    theta = np.radians(theta_deg)
+    numerator = 0.5 * np.sin(theta) * np.cos(theta)
+    denominator = 1.0 - 0.5 * np.cos(theta) ** 2
+    return np.degrees(np.arctan2(numerator, denominator))
 
 
 def compute_wave_impact_with_rays(
@@ -325,9 +340,14 @@ def compute_wave_impact_with_rays(
 
     for i, row in enumerate(df_vessel.itertuples(index=False)):
         spinner.update(i + 1)
-        for side, limit_lon, limit_lat in [
-            ("port", float(port_lon2[i]), float(port_lat2[i])),
-            ("stbd", float(stbd_lon2[i]), float(stbd_lat2[i])),
+        theta_deg = float(row.Theta)
+        phase_speed = float(row.SOGms) * math.cos(math.radians(theta_deg))
+        group_speed = 0.5 * phase_speed
+        cusp_angle_deg = float(kelvin_cusp_angle(theta_deg))
+        transverse_speed = float(row.SOGms) * math.sin(math.radians(cusp_angle_deg))
+        for side, wake_dir, limit_lon, limit_lat in [
+            ("port", float(row.WakeDirPort), float(port_lon2[i]), float(port_lat2[i])),
+            ("stbd", float(row.WakeDirStarboard), float(stbd_lon2[i]), float(stbd_lat2[i])),
         ]:
             ray = LineString([
                 (row.longitude, row.latitude),
@@ -352,6 +372,13 @@ def compute_wave_impact_with_rays(
                 "Side": side,
                 "Distance_m": float(distance_m),
                 "ReachedShore": bool(reached_shore),
+                "WakeDirection_deg": wake_dir,
+                "Theta_deg": theta_deg,
+                "SOGms": float(row.SOGms),
+                "PhaseSpeed_mps": phase_speed,
+                "GroupSpeed_mps": group_speed,
+                "CuspAngle_deg": cusp_angle_deg,
+                "TransverseSpeed_mps": transverse_speed,
             })
             if not reached_shore:
                 continue

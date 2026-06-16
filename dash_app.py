@@ -67,7 +67,9 @@ WAVE_COLUMNS = [
 ANIMATION_RAY_COLUMNS = [
     'MMSI', 'segment_id', 'SourceLongitude', 'SourceLatitude',
     'EndLongitude', 'EndLatitude', 'SourceTime', 'Side',
-    'Distance_m', 'ReachedShore',
+    'Distance_m', 'ReachedShore', 'WakeDirection_deg', 'Theta_deg',
+    'SOGms', 'PhaseSpeed_mps', 'GroupSpeed_mps',
+    'CuspAngle_deg', 'TransverseSpeed_mps',
 ]
 
 
@@ -267,7 +269,9 @@ def _build_animation_ray_cache(state: 'SessionState', df_rays: pd.DataFrame) -> 
     df = df_rays.reindex(columns=ANIMATION_RAY_COLUMNS).copy()
     numeric = [
         'SourceLongitude', 'SourceLatitude', 'EndLongitude', 'EndLatitude',
-        'Distance_m',
+        'Distance_m', 'WakeDirection_deg', 'Theta_deg', 'SOGms',
+        'PhaseSpeed_mps', 'GroupSpeed_mps', 'CuspAngle_deg',
+        'TransverseSpeed_mps',
     ]
     for col in numeric:
         df[col] = pd.to_numeric(df[col], errors='coerce').astype('float32')
@@ -3132,6 +3136,10 @@ async function(n) {
         let rSourcePos = new Float32Array(0), rEndPos = new Float32Array(0);
         let rSourceTime = new BigInt64Array(0), rDistance = new Float32Array(0);
         let rReached = new Uint8Array(0), rSide = (_i) => '';
+        let rWakeDir = new Float32Array(0), rTheta = new Float32Array(0);
+        let rSogMs = new Float32Array(0), rPhaseSpeed = new Float32Array(0);
+        let rGroupSpeed = new Float32Array(0), rCuspAngle = new Float32Array(0);
+        let rTransverseSpeed = new Float32Array(0);
         let raysBySegKey = new Map();
         // Precomputed mapping: wave index → track segment index (-1 = no match).
         // Rebuilt every time wave OR track data changes; values are Number-normalised
@@ -3206,6 +3214,13 @@ async function(n) {
             rSourceTime = get('SourceTime') ? get('SourceTime').toArray() : new BigInt64Array(n);
             rDistance = get('Distance_m') ? get('Distance_m').toArray() : new Float32Array(n);
             rReached = get('ReachedShore') ? get('ReachedShore').toArray() : new Uint8Array(n);
+            rWakeDir = get('WakeDirection_deg') ? get('WakeDirection_deg').toArray() : new Float32Array(n);
+            rTheta = get('Theta_deg') ? get('Theta_deg').toArray() : new Float32Array(n);
+            rSogMs = get('SOGms') ? get('SOGms').toArray() : new Float32Array(n);
+            rPhaseSpeed = get('PhaseSpeed_mps') ? get('PhaseSpeed_mps').toArray() : new Float32Array(n);
+            rGroupSpeed = get('GroupSpeed_mps') ? get('GroupSpeed_mps').toArray() : new Float32Array(n);
+            rCuspAngle = get('CuspAngle_deg') ? get('CuspAngle_deg').toArray() : new Float32Array(n);
+            rTransverseSpeed = get('TransverseSpeed_mps') ? get('TransverseSpeed_mps').toArray() : new Float32Array(n);
             const sideCol = get('Side');
             rSide = i => sideCol ? sideCol.get(i) : '';
             const srcLon = get('SourceLongitude')?.toArray() || new Float32Array(n);
@@ -3256,11 +3271,26 @@ async function(n) {
                 animation.clear();
                 return;
             }
+            const start = startIndices[segIdx], end = startIndices[segIdx + 1];
+            const firstNs = Number(pointTime[start] || 0);
+            const lastNs = Number(pointTime[Math.max(start, end - 1)] || firstNs);
+            const trackDurationS = Math.max(1, (lastNs - firstNs) / 1e9);
+            let loopDurationS = trackDurationS;
+            const rayIdxs = raysBySegKey.get(`${Number(tMMSI[segIdx])}|${Number(tSeg[segIdx])}`) || [];
+            for (const ri of rayIdxs) {
+                const sourceOffsetS = Math.max(0, (Number(rSourceTime[ri]) - firstNs) / 1e9);
+                const speed = Math.max(0, Number(rGroupSpeed[ri]) || 0);
+                const travelS = speed > 0 ? (Number(rDistance[ri]) || 0) / speed : 0;
+                loopDurationS = Math.max(loopDurationS, sourceOffsetS + travelS);
+            }
             animation.select({
                 segIdx,
                 mmsi: Number(tMMSI[segIdx]),
                 segmentId: Number(tSeg[segIdx]),
                 waveIdx,
+                firstNs,
+                trackDurationS,
+                loopDurationS: Math.max(1, loopDurationS),
             });
         };
 
@@ -3888,13 +3918,28 @@ async function(n) {
             }
             return lo;
         };
+        const offsetMeters = (pos, eastM, northM) => {
+            const latRad = (pos[1] || 0) * Math.PI / 180;
+            const dLat = northM / 111111.0;
+            const dLon = eastM / Math.max(1e-6, 111111.0 * Math.cos(latRad));
+            return [pos[0] + dLon, pos[1] + dLat];
+        };
+        const crestEndpoints = (center, bearingDeg, halfWidthM) => {
+            const rad = (bearingDeg + 90) * Math.PI / 180;
+            const east = Math.sin(rad) * halfWidthM;
+            const north = Math.cos(rad) * halfWidthM;
+            return [
+                offsetMeters(center, -east, -north),
+                offsetMeters(center, east, north),
+            ];
+        };
         const selectedAnimationGeometry = state => {
             const selection = state.selection;
             if (!selection) return null;
             const si = selection.segIdx;
             const start = startIndices[si], end = startIndices[si + 1];
             if (start == null || end == null || end <= start) return null;
-            const firstNs = Number(pointTime[start]);
+            const firstNs = selection.firstNs != null ? Number(selection.firstNs) : Number(pointTime[start]);
             const lastNs = Number(pointTime[end - 1]);
             const spanNs = Math.max(1, lastNs - firstNs);
             const targetNs = firstNs + state.trackProgress * spanNs;
@@ -3909,27 +3954,54 @@ async function(n) {
             const rayIdxs = raysBySegKey.get(
                 `${selection.mmsi}|${selection.segmentId}`
             ) || [];
-            const rays = [];
+            const crestSegments = [];
+            const transverseCircles = [];
+            const cuspBySide = {port: [], stbd: []};
+            const emittedTransverse = new Set();
+            const stride = Math.max(1, Math.ceil(rayIdxs.length / 220));
             for (const ri of rayIdxs) {
-                const sourceFraction = Math.max(
-                    0, Math.min(1, (Number(rSourceTime[ri]) - firstNs) / spanNs)
-                );
-                const progress = animation.rayProgress(sourceFraction);
+                const sourceOffsetS = Math.max(0, (Number(rSourceTime[ri]) - firstNs) / 1e9);
+                const progress = animation.frontProgress(
+                    sourceOffsetS, rGroupSpeed[ri], rDistance[ri]);
                 if (progress <= 0) continue;
                 const source = [rSourcePos[ri*2], rSourcePos[ri*2+1]];
                 const endPos = [rEndPos[ri*2], rEndPos[ri*2+1]];
-                rays.push({
-                    source,
-                    target: [
-                        source[0] + (endPos[0] - source[0]) * progress,
-                        source[1] + (endPos[1] - source[1]) * progress,
-                    ],
-                    side: rSide(ri),
+                const front = [
+                    source[0] + (endPos[0] - source[0]) * progress,
+                    source[1] + (endPos[1] - source[1]) * progress,
+                ];
+                const side = rSide(ri);
+                const halfWidthM = Math.max(25, Math.min(160, 20 + rDistance[ri] * 0.035));
+                crestSegments.push({
+                    path: crestEndpoints(front, rWakeDir[ri], halfWidthM),
+                    side,
                     reached: Boolean(rReached[ri]),
-                    distance: rDistance[ri],
+                    progress,
                 });
+                if (cuspBySide[side]) cuspBySide[side].push(front);
+                if (ri % stride === 0) {
+                    const key = `${Number(rSourceTime[ri])}|${source[0].toFixed(6)}|${source[1].toFixed(6)}`;
+                    if (!emittedTransverse.has(key)) {
+                        emittedTransverse.add(key);
+                        const radius = animation.transverseRadius(
+                            sourceOffsetS, rTransverseSpeed[ri]);
+                        if (radius > 0) {
+                            transverseCircles.push({
+                                position: source,
+                                radius: Math.min(radius, rDistance[ri]),
+                                age: progress,
+                            });
+                        }
+                    }
+                }
             }
-            return {vessel, rays};
+            const cuspLines = [];
+            for (const side of ['port', 'stbd']) {
+                if (cuspBySide[side].length >= 2) {
+                    cuspLines.push({side, path: cuspBySide[side]});
+                }
+            }
+            return {vessel, crestSegments, cuspLines, transverseCircles};
         };
 
         const buildLayers = (zoom, hoveredIdx) => {
@@ -4194,16 +4266,47 @@ async function(n) {
 
             const animationGeometry = selectedAnimationGeometry(animationState);
             if (animationGeometry) {
-                if (animationGeometry.rays.length > 0) {
-                    layers.push(new deck.LineLayer({
-                        id: 'animation-rays',
-                        data: animationGeometry.rays,
-                        getSourcePosition: d => d.source,
-                        getTargetPosition: d => d.target,
+                if (animationGeometry.transverseCircles.length > 0) {
+                    layers.push(new deck.ScatterplotLayer({
+                        id: 'animation-transverse',
+                        data: animationGeometry.transverseCircles,
+                        getPosition: d => d.position,
+                        getRadius: d => d.radius,
+                        radiusUnits: 'meters',
+                        stroked: true,
+                        filled: false,
+                        getLineColor: d => [255, 255, 255, Math.max(35, 150 - d.age * 80)],
+                        lineWidthMinPixels: 1,
+                        pickable: false,
+                    }));
+                }
+                if (animationGeometry.cuspLines.length > 0) {
+                    layers.push(new deck.PathLayer({
+                        id: 'animation-cusp-lines',
+                        data: animationGeometry.cuspLines,
+                        getPath: d => d.path,
                         getColor: d => d.side === 'port'
-                            ? [60, 190, 255, d.reached ? 235 : 150]
-                            : [255, 135, 70, d.reached ? 235 : 150],
-                        getWidth: 2.5, widthUnits: 'pixels', widthMinPixels: 2,
+                            ? [60, 190, 255, 210]
+                            : [255, 135, 70, 210],
+                        getWidth: 2,
+                        widthUnits: 'pixels',
+                        widthMinPixels: 1.5,
+                        _pathType: 'open',
+                        pickable: false,
+                    }));
+                }
+                if (animationGeometry.crestSegments.length > 0) {
+                    layers.push(new deck.PathLayer({
+                        id: 'animation-divergent-crests',
+                        data: animationGeometry.crestSegments,
+                        getPath: d => d.path,
+                        getColor: d => d.side === 'port'
+                            ? [60, 190, 255, d.reached ? 230 : 145]
+                            : [255, 135, 70, d.reached ? 230 : 145],
+                        getWidth: 2.4,
+                        widthUnits: 'pixels',
+                        widthMinPixels: 1.5,
+                        _pathType: 'open',
                         pickable: false,
                     }));
                 }

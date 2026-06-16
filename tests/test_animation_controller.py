@@ -26,7 +26,6 @@ def animation_page(playwright):
             window.changes = [];
             window.controller = new VesselWaveAnimationController({
                 durationMs: 12000,
-                trackFraction: 0.7,
                 now: () => window.testNow,
                 requestFrame: fn => { window.pendingFrame = fn; return 1; },
                 cancelFrame: () => { window.pendingFrame = null; },
@@ -64,13 +63,17 @@ def test_selection_enables_play_pause_and_resets(animation_page):
 
 def test_recursive_loop_and_source_timed_ray_progress(animation_page):
     page = animation_page
-    page.evaluate("controller.select({segIdx: 1}); controller.play()")
+    page.evaluate(
+        "controller.select({segIdx: 1, trackDurationS: 70, loopDurationS: 100});"
+        "controller.play()"
+    )
     page.evaluate("testNow = 12500; pendingFrame(12500)")
     assert page.evaluate("controller.getState().progress") == pytest.approx(500 / 12000)
 
     page.evaluate("controller.pause(); controller.setProgress(0.5)")
-    assert page.evaluate("controller.getState().trackProgress") == pytest.approx(5 / 7)
-    assert page.evaluate("controller.rayProgress(0.5)") == pytest.approx(
-        (0.5 - 0.35) / 0.65
-    )
-    assert page.evaluate("controller.rayProgress(0.9)") == 0
+    state = page.evaluate("controller.getState()")
+    assert state["simElapsedS"] == pytest.approx(50.0)
+    assert state["trackProgress"] == pytest.approx(5 / 7)
+    assert page.evaluate("controller.frontProgress(30, 2, 100)") == pytest.approx(0.4)
+    assert page.evaluate("controller.frontProgress(90, 2, 100)") == 0
+    assert page.evaluate("controller.transverseRadius(30, 1.5)") == pytest.approx(30.0)

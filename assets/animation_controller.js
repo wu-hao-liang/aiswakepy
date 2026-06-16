@@ -4,7 +4,6 @@
     class VesselWaveAnimationController {
         constructor(options = {}) {
             this.durationMs = options.durationMs || 12000;
-            this.trackFraction = options.trackFraction || 0.7;
             this.now = options.now || (() => performance.now());
             this.requestFrame = options.requestFrame || (fn => requestAnimationFrame(fn));
             this.cancelFrame = options.cancelFrame || (id => cancelAnimationFrame(id));
@@ -66,21 +65,34 @@
         }
 
         getState() {
+            const loopDurationS = this.selection?.loopDurationS || 1;
+            const trackDurationS = this.selection?.trackDurationS || loopDurationS;
+            const simElapsedS = this.progress * loopDurationS;
             return {
                 selection: this.selection,
                 playing: this.playing,
                 progress: this.progress,
-                trackProgress: Math.min(1, this.progress / this.trackFraction),
-                trackFraction: this.trackFraction,
+                simElapsedS,
+                loopDurationS,
+                trackDurationS,
+                trackProgress: Math.min(1, simElapsedS / Math.max(1e-9, trackDurationS)),
             };
         }
 
-        rayProgress(sourceFraction) {
-            const start = Math.max(
-                0, Math.min(1, Number(sourceFraction) || 0)
-            ) * this.trackFraction;
-            if (this.progress <= start) return 0;
-            return Math.min(1, (this.progress - start) / Math.max(1e-9, 1 - start));
+        frontProgress(sourceOffsetS, speedMps, distanceM) {
+            const state = this.getState();
+            const elapsed = state.simElapsedS - Math.max(0, Number(sourceOffsetS) || 0);
+            if (elapsed <= 0) return 0;
+            const speed = Math.max(0, Number(speedMps) || 0);
+            const distance = Math.max(1e-9, Number(distanceM) || 0);
+            return Math.min(1, (elapsed * speed) / distance);
+        }
+
+        transverseRadius(sourceOffsetS, speedMps) {
+            const state = this.getState();
+            const elapsed = state.simElapsedS - Math.max(0, Number(sourceOffsetS) || 0);
+            if (elapsed <= 0) return 0;
+            return elapsed * Math.max(0, Number(speedMps) || 0);
         }
     }
 
