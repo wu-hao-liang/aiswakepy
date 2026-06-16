@@ -3265,6 +3265,19 @@ async function(n) {
         });
         window.__animationController = animation;
         if (animationButton) animationButton.addEventListener('click', () => animation.toggle());
+        const rayPhaseSpeed = ri => {
+            const stored = Number(rPhaseSpeed[ri]);
+            if (Number.isFinite(stored) && stored > 0) return stored;
+            const sog = Number(rSogMs[ri]);
+            const theta = Number(rTheta[ri]);
+            if (Number.isFinite(sog) && sog > 0 && Number.isFinite(theta)) {
+                const computed = sog * Math.cos(theta * Math.PI / 180);
+                if (computed > 0) return computed;
+            }
+            const group = Number(rGroupSpeed[ri]);
+            if (Number.isFinite(group) && group > 0) return group * 2;
+            return 0;
+        };
         const selectAnimationSegment = (segIdx, waveIdx = null) => {
             if (segIdx == null || segIdx < 0 || segIdx >= tMMSI.length) {
                 animation.clear();
@@ -3278,7 +3291,7 @@ async function(n) {
             const rayIdxs = raysBySegKey.get(`${Number(tMMSI[segIdx])}|${Number(tSeg[segIdx])}`) || [];
             for (const ri of rayIdxs) {
                 const sourceOffsetS = Math.max(0, (Number(rSourceTime[ri]) - firstNs) / 1e9);
-                const speed = Math.max(0, Number(rPhaseSpeed[ri]) || 0);
+                const speed = rayPhaseSpeed(ri);
                 const travelS = speed > 0 ? (Number(rDistance[ri]) || 0) / speed : 0;
                 loopDurationS = Math.max(loopDurationS, sourceOffsetS + travelS);
             }
@@ -3961,7 +3974,7 @@ async function(n) {
             for (const ri of rayIdxs) {
                 const sourceOffsetS = Math.max(0, (Number(rSourceTime[ri]) - firstNs) / 1e9);
                 const progress = animation.frontProgress(
-                    sourceOffsetS, rPhaseSpeed[ri], rDistance[ri]);
+                    sourceOffsetS, rayPhaseSpeed(ri), rDistance[ri]);
                 if (progress <= 0) continue;
                 if (progress >= 1 && Boolean(rReached[ri])) continue;
                 const source = [rSourcePos[ri*2], rSourcePos[ri*2+1]];
@@ -3972,8 +3985,10 @@ async function(n) {
                 ];
                 const side = rSide(ri);
                 const halfWidthM = Math.max(25, Math.min(160, 20 + rDistance[ri] * 0.035));
+                const endpoints = crestEndpoints(front, rWakeDir[ri], halfWidthM);
                 crestSegments.push({
-                    path: crestEndpoints(front, rWakeDir[ri], halfWidthM),
+                    source: endpoints[0],
+                    target: endpoints[1],
                     side,
                     reached: Boolean(rReached[ri]),
                     progress,
@@ -3996,12 +4011,28 @@ async function(n) {
                 }
             }
             const cuspLines = [];
+            const cuspSegments = [];
             for (const side of ['port', 'stbd']) {
                 if (cuspBySide[side].length >= 2) {
                     cuspLines.push({side, path: cuspBySide[side]});
+                    for (let i = 1; i < cuspBySide[side].length; i++) {
+                        cuspSegments.push({
+                            side,
+                            source: cuspBySide[side][i - 1],
+                            target: cuspBySide[side][i],
+                        });
+                    }
                 }
             }
-            return {vessel, crestSegments, cuspLines, transverseCircles};
+            const geometry = {vessel, crestSegments, cuspLines, cuspSegments, transverseCircles};
+            window.__animationLastGeometry = {
+                state,
+                rayCount: rayIdxs.length,
+                crestCount: crestSegments.length,
+                cuspSegmentCount: cuspSegments.length,
+                transverseCount: transverseCircles.length,
+            };
+            return geometry;
         };
 
         const buildLayers = (zoom, hoveredIdx) => {
@@ -4266,7 +4297,9 @@ async function(n) {
 
             const animationGeometry = selectedAnimationGeometry(animationState);
             if (animationGeometry) {
+                const animationLayerIds = [];
                 if (animationGeometry.transverseCircles.length > 0) {
+                    animationLayerIds.push('animation-transverse');
                     layers.push(new deck.ScatterplotLayer({
                         id: 'animation-transverse',
                         data: animationGeometry.transverseCircles,
@@ -4280,36 +4313,37 @@ async function(n) {
                         pickable: false,
                     }));
                 }
-                if (animationGeometry.cuspLines.length > 0) {
-                    layers.push(new deck.PathLayer({
+                if (animationGeometry.cuspSegments.length > 0) {
+                    animationLayerIds.push('animation-cusp-lines');
+                    layers.push(new deck.LineLayer({
                         id: 'animation-cusp-lines',
-                        data: animationGeometry.cuspLines,
-                        getPath: d => d.path,
+                        data: animationGeometry.cuspSegments,
+                        getSourcePosition: d => d.source,
+                        getTargetPosition: d => d.target,
                         getColor: d => d.side === 'port'
                             ? [60, 190, 255, 245]
                             : [255, 135, 70, 245],
                         getWidth: 3.5,
-                        widthUnits: 'pixels',
                         widthMinPixels: 3,
-                        _pathType: 'open',
                         pickable: false,
                     }));
                 }
                 if (animationGeometry.crestSegments.length > 0) {
-                    layers.push(new deck.PathLayer({
+                    animationLayerIds.push('animation-divergent-crests');
+                    layers.push(new deck.LineLayer({
                         id: 'animation-divergent-crests',
                         data: animationGeometry.crestSegments,
-                        getPath: d => d.path,
+                        getSourcePosition: d => d.source,
+                        getTargetPosition: d => d.target,
                         getColor: d => d.side === 'port'
                             ? [60, 190, 255, d.reached ? 245 : 175]
                             : [255, 135, 70, d.reached ? 245 : 175],
                         getWidth: 3,
-                        widthUnits: 'pixels',
                         widthMinPixels: 2.5,
-                        _pathType: 'open',
                         pickable: false,
                     }));
                 }
+                animationLayerIds.push('animation-vessel');
                 layers.push(new deck.ScatterplotLayer({
                     id: 'animation-vessel',
                     data: [{position: animationGeometry.vessel}],
@@ -4319,6 +4353,7 @@ async function(n) {
                     stroked: true, getLineColor: [0, 110, 210, 255],
                     lineWidthMinPixels: 3, pickable: false,
                 }));
+                window.__animationLastLayerIds = animationLayerIds;
             }
 
             // ---- Preview layers (AIS points, rendered on top) ----
