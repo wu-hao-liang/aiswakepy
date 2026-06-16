@@ -1097,22 +1097,13 @@ INDEX_TEMPLATE = """<!DOCTYPE html>
                         border-radius: 3px; margin: 4px 0; }
         #deck-container { position: fixed; top: 40px; left: 340px; right: 0; bottom: 0;
                           z-index: 1; overflow: hidden; transition: right 0.2s ease; }
-        #btn-animation { position: fixed; top: 48px; right: 18px; z-index: 12;
-                         min-width: 82px; padding: 8px 14px; border-radius: 5px;
+        #btn-animation { padding: 3px 11px; border-radius: 5px; font-size: 15px;
                          border: 1px solid #4a85b5; color: white; font-weight: 700;
                          background: linear-gradient(180deg, #6aabda, #4a85b5);
-                         box-shadow: 0 2px 8px rgba(0,0,0,0.28); cursor: pointer; }
-        #btn-animation:disabled { background: #8798a8; border-color: #748595;
-                                  color: #d7dee5; cursor: default; opacity: 0.75; }
+                         box-shadow: 0 1px 4px rgba(0,0,0,0.28); cursor: pointer;
+                         flex-shrink: 0; line-height: 1; }
         #btn-animation.playing { background: linear-gradient(180deg, #5abaaa, #3a9a8a);
                                  border-color: #3a9a8a; }
-        #btn-cusp-debug { position: fixed; top: 48px; right: 110px; z-index: 12;
-                          min-width: 66px; padding: 8px 12px; border-radius: 5px;
-                          border: 1px solid #9a7bb5; color: white; font-weight: 700;
-                          background: linear-gradient(180deg, #a98ad0, #7d5fa8);
-                          box-shadow: 0 2px 8px rgba(0,0,0,0.28); cursor: pointer; }
-        #btn-cusp-debug.active { background: linear-gradient(180deg, #d08a8a, #a85f5f);
-                                 border-color: #a85f5f; }
         #copy-toast { position: fixed; top: 0; left: 0;
                       background: rgba(10,20,40,0.88); color: #8df;
                       border: 1px solid rgba(80,180,240,0.35); border-radius: 6px;
@@ -2093,6 +2084,10 @@ app.layout = html.Div([
         html.Span('', id='load-results-status', style={'display': 'none'}),
         html.Button('Run example', id='btn-run-example', n_clicks=0, disabled=True,
                     title='Load bundled example data (Singapore, JI channel)'),
+        html.Span('', id='upload-status',
+                  style={'fontSize': '11px', 'color': '#556', 'whiteSpace': 'nowrap',
+                         'overflow': 'hidden', 'textOverflow': 'ellipsis',
+                         'maxWidth': '260px', 'flexShrink': '1'}),
         html.Div('AISWAKEPY_PUBLIC', id='banner-title'),
         html.Div([
             html.Span(id='ais-time-range', style={'color': '#558', 'marginRight': '4px'}),
@@ -2102,14 +2097,14 @@ app.layout = html.Div([
             ' | ', html.Span(id='status', children='loading...'),
             ' | ', html.Span(id='click-info', style={'fontWeight': 'bold'}),
         ], id='banner-meta'),
+        html.Button('▶', id='btn-animation', disabled=True,
+                    title='Ctrl+click a track, track point, or wave to select an animation',
+                    style={'display': 'none'}),
     ], id='status-banner'),
 
     html.Div([
 
         html.Div([
-            html.Div(id='upload-status',
-                     style={'fontSize': '10px', 'color': '#556', 'whiteSpace': 'pre-wrap',
-                            'marginBottom': '4px'}),
             html.Div(id='upload-ais-host'),
             html.Div(id='pv-ais-info', className='preview-info'),
             html.Div(id='upload-coast-host'),
@@ -2225,10 +2220,6 @@ app.layout = html.Div([
     ], id='sidebar'),
 
     html.Div(id='deck-container'),
-    html.Button('Play', id='btn-animation', disabled=True,
-                title='Ctrl+click a track, track point, or wave to select an animation'),
-    html.Button('Debug', id='btn-cusp-debug',
-                title='Toggle cusp debug tags (propagation speed / line orientation / live moving direction)'),
     # MMSI copy toast — appears briefly after Ctrl+click copies MMSI
     html.Div('', id='copy-toast'),
     # Ctrl hint — permanent floating label at bottom-left of canvas
@@ -3276,8 +3267,8 @@ async function(n) {
             realTimeScale: 50,
             onChange: state => {
                 if (animationButton) {
-                    animationButton.disabled = !state.selection;
-                    animationButton.textContent = state.playing ? 'Pause' : 'Play';
+                    animationButton.style.display = state.selection ? '' : 'none';
+                    animationButton.textContent = state.playing ? '⏸' : '▶';
                     animationButton.classList.toggle('playing', state.playing);
                 }
                 if (window.deckInstance && typeof window.__rebuild === 'function') {
@@ -3287,19 +3278,6 @@ async function(n) {
         });
         window.__animationController = animation;
         if (animationButton) animationButton.addEventListener('click', () => animation.toggle());
-        // Cusp debug overlay toggle (propagation speed / orientation / moving dir tags)
-        window.__cuspDebug = window.__cuspDebug || false;
-        const cuspDebugButton = document.getElementById('btn-cusp-debug');
-        if (cuspDebugButton) {
-            cuspDebugButton.classList.toggle('active', window.__cuspDebug);
-            cuspDebugButton.addEventListener('click', () => {
-                window.__cuspDebug = !window.__cuspDebug;
-                cuspDebugButton.classList.toggle('active', window.__cuspDebug);
-                if (window.deckInstance && typeof window.__rebuild === 'function') {
-                    window.__rebuild();
-                }
-            });
-        }
         const rayPhaseSpeed = ri => {
             const stored = Number(rPhaseSpeed[ri]);
             if (Number.isFinite(stored) && stored > 0) return stored;
@@ -5313,11 +5291,11 @@ async function(n) {
                 return null;
             }
             const enc = encodeURIComponent(state.path);
-            // Server filters mesh elements to AIS bbox expanded 4× in each dimension.
+            // Server filters mesh elements to AIS bbox expanded to 2× range (0.5× padding each side).
             let bboxParam = '';
             if (window.__aisBbox) {
                 const [bw, bs, be, bn] = window.__aisBbox;
-                const dLon = (be - bw), dLat = (bn - bs);
+                const dLon = (be - bw) * 0.5, dLat = (bn - bs) * 0.5;
                 const pw = bw - dLon, pe = be + dLon;
                 const ps = bs - dLat, pn = bn + dLat;
                 bboxParam = `&bbox=${pw},${ps},${pe},${pn}`;
