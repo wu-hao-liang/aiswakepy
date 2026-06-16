@@ -352,7 +352,7 @@ def compute_wave_impact_with_rays(
             ("port", float(row.WakeDirPort), float(port_lon2[i]), float(port_lat2[i])),
             ("stbd", float(row.WakeDirStarboard), float(stbd_lon2[i]), float(stbd_lat2[i])),
         ]:
-            cusp_dir = cog - cusp_angle_deg if side == "port" else cog + cusp_angle_deg
+            cusp_dir = cog + cusp_angle_deg if side == "port" else cog - cusp_angle_deg
             cusp_limit_lon, cusp_limit_lat = forward_point(
                 float(row.longitude), float(row.latitude), cusp_dir, float(max_propagation_m)
             )

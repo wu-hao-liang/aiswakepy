@@ -193,10 +193,10 @@ def test_animation_rays_include_shore_hits_and_distance_limit(tmp_path):
         sogms * np.sin(np.radians(hit["CuspAngle_deg"]))
     )
     assert hit["CuspDirection_deg"] == pytest.approx(
-        float(df.iloc[0]["cog"]) - hit["CuspAngle_deg"]
+        float(df.iloc[0]["cog"]) + hit["CuspAngle_deg"]
     )
     assert miss["CuspDirection_deg"] == pytest.approx(
-        float(df.iloc[0]["cog"]) + miss["CuspAngle_deg"]
+        float(df.iloc[0]["cog"]) - miss["CuspAngle_deg"]
     )
     assert 0 < hit["CuspDistance_m"] <= 5000.0
     assert bool(hit["CuspReachedShore"]) is True

@@ -3308,7 +3308,7 @@ async function(n) {
             const cog = rayCog(ri);
             const angle = Number(rCuspAngle[ri]);
             if (Number.isFinite(cog) && Number.isFinite(angle)) {
-                return rSide(ri) === 'port' ? cog - angle : cog + angle;
+                return rSide(ri) === 'port' ? cog + angle : cog - angle;
             }
             return cog;
         };
@@ -3986,29 +3986,8 @@ async function(n) {
             const rad = Number(bearingDeg) * Math.PI / 180;
             return [Math.sin(rad), Math.cos(rad)];
         };
-        const dot2 = (a, b) => a[0] * b[0] + a[1] * b[1];
-        const sub2 = (a, b) => [a[0] - b[0], a[1] - b[1]];
         const add2 = (a, b) => [a[0] + b[0], a[1] + b[1]];
         const mul2 = (a, s) => [a[0] * s, a[1] * s];
-        const cross2 = (a, b) => a[0] * b[1] - a[1] * b[0];
-        const lineIntersection = (a, da, b, db) => {
-            const denom = cross2(da, db);
-            if (Math.abs(denom) < 1e-9) return null;
-            const t = cross2(sub2(b, a), db) / denom;
-            const p = add2(a, mul2(da, t));
-            return Number.isFinite(p[0]) && Number.isFinite(p[1]) ? p : null;
-        };
-        const clampFrontToVesselPlane = (p0, p1, vesselM, headingVec) => {
-            const d0 = dot2(sub2(p0, vesselM), headingVec);
-            const d1 = dot2(sub2(p1, vesselM), headingVec);
-            if (d0 <= 0 && d1 <= 0) return [p0, p1];
-            if (d0 > 0 && d1 > 0) {
-                return d0 > d1 ? [vesselM, p1] : [p0, vesselM];
-            }
-            const t = d0 / (d0 - d1);
-            const cut = add2(p0, mul2(sub2(p1, p0), Math.max(0, Math.min(1, t))));
-            return d0 > 0 ? [cut, p1] : [p0, cut];
-        };
         const selectedAnimationGeometry = state => {
             const selection = state.selection;
             if (!selection) return null;
@@ -4027,50 +4006,17 @@ async function(n) {
                 cPos[row*2] + (cPos[(row+1)*2] - cPos[row*2]) * f,
                 cPos[row*2+1] + (cPos[(row+1)*2+1] - cPos[row*2+1]) * f,
             ];
-            const cog0 = pointCog ? Number(pointCog[row]) : NaN;
-            const cog1 = pointCog ? Number(pointCog[Math.min(row + 1, end - 1)]) : NaN;
-            const currentCog = Number.isFinite(cog0) && Number.isFinite(cog1)
-                ? cog0 + (cog1 - cog0) * f
-                : (Number.isFinite(cog0) ? cog0 : 0);
-            const vesselM = [0, 0];
-            const vesselHeadingVec = bearingVector(currentCog);
             const rayIdxs = raysBySegKey.get(
                 `${selection.mmsi}|${selection.segmentId}`
             ) || [];
-            const frontBySide = {port: [], stbd: []};
             const transverseCircles = [];
             const cuspSegments = [];
             const emittedTransverse = new Set();
             const stride = Math.max(1, Math.ceil(rayIdxs.length / 220));
             for (const ri of rayIdxs) {
                 const sourceOffsetS = Math.max(0, (Number(rSourceTime[ri]) - firstNs) / 1e9);
-                const progress = animation.frontProgress(
-                    sourceOffsetS, rayPhaseSpeed(ri), rDistance[ri]);
-                if (progress <= 0) continue;
-                if (progress >= 1 && Boolean(rReached[ri])) continue;
                 const source = [rSourcePos[ri*2], rSourcePos[ri*2+1]];
-                const endPos = [rEndPos[ri*2], rEndPos[ri*2+1]];
-                const front = [
-                    source[0] + (endPos[0] - source[0]) * progress,
-                    source[1] + (endPos[1] - source[1]) * progress,
-                ];
                 const side = rSide(ri);
-                const halfWidthM = Math.max(35, Math.min(360, 35 + rDistance[ri] * 0.08));
-                const centerM = toMeters(front, vessel);
-                const frontDir = bearingVector(Number(rWakeDir[ri]) + 90);
-                const raw0 = add2(centerM, mul2(frontDir, -halfWidthM));
-                const raw1 = add2(centerM, mul2(frontDir, halfWidthM));
-                if (frontBySide[side]) frontBySide[side].push({
-                    ri,
-                    centerM,
-                    frontDir,
-                    p0: raw0,
-                    p1: raw1,
-                    side,
-                    reached: Boolean(rReached[ri]),
-                    progress,
-                    sourceOffsetS,
-                });
 
                 const cuspDistance = Number(rCuspDistance[ri]) || Number(rDistance[ri]) || 0;
                 const cuspProgress = animation.frontProgress(
@@ -4089,9 +4035,14 @@ async function(n) {
                         : offsetMeters(source,
                             bearingVector(rayCuspDirection(ri))[0] * cuspDistance * cuspProgress,
                             bearingVector(rayCuspDirection(ri))[1] * cuspDistance * cuspProgress);
+                    const cuspCenterM = toMeters(cuspTarget, vessel);
+                    const cuspDir = bearingVector(rayCuspDirection(ri));
+                    const halfLengthM = Math.max(35, Math.min(220, 35 + cuspDistance * 0.04));
+                    const p0 = add2(cuspCenterM, mul2(cuspDir, -halfLengthM));
+                    const p1 = add2(cuspCenterM, mul2(cuspDir, halfLengthM));
                     cuspSegments.push({
-                        source,
-                        target: cuspTarget,
+                        source: fromMeters(p0, vessel),
+                        target: fromMeters(p1, vessel),
                         side,
                         progress: cuspProgress,
                         direction: rayCuspDirection(ri),
@@ -4101,64 +4052,26 @@ async function(n) {
                     const key = `${Number(rSourceTime[ri])}|${source[0].toFixed(6)}|${source[1].toFixed(6)}`;
                     if (!emittedTransverse.has(key)) {
                         emittedTransverse.add(key);
+                        const phaseProgress = animation.frontProgress(
+                            sourceOffsetS, rayPhaseSpeed(ri), rDistance[ri]);
                         const radius = animation.transverseRadius(
                             sourceOffsetS, rTransverseSpeed[ri]);
                         if (radius > 0) {
                             transverseCircles.push({
                                 position: source,
                                 radius: Math.min(radius, rDistance[ri]),
-                                age: progress,
+                                age: phaseProgress,
                             });
                         }
                     }
                 }
             }
-            const crestSegments = [];
-            let frontIntersectionClips = 0;
-            let frontPlaneClips = 0;
-            for (const side of ['port', 'stbd']) {
-                const fronts = frontBySide[side].sort((a, b) => a.sourceOffsetS - b.sourceOffsetS);
-                for (let i = 0; i < fronts.length; i++) {
-                    const front = fronts[i];
-                    const candidates = [];
-                    for (const neighbor of [fronts[i - 1], fronts[i + 1]]) {
-                        if (!neighbor) continue;
-                        const p = lineIntersection(
-                            front.centerM, front.frontDir,
-                            neighbor.centerM, neighbor.frontDir);
-                        if (!p) continue;
-                        const dist = Math.hypot(p[0] - front.centerM[0], p[1] - front.centerM[1]);
-                        if (dist > 5000) continue;
-                        candidates.push({p, t: dot2(sub2(p, front.centerM), front.frontDir)});
-                    }
-                    for (const c of candidates) {
-                        if (c.t < 0) { front.p0 = c.p; frontIntersectionClips++; }
-                        else if (c.t > 0) { front.p1 = c.p; frontIntersectionClips++; }
-                    }
-                    const before0 = front.p0, before1 = front.p1;
-                    [front.p0, front.p1] = clampFrontToVesselPlane(
-                        front.p0, front.p1, vesselM, vesselHeadingVec);
-                    if (front.p0 !== before0 || front.p1 !== before1) frontPlaneClips++;
-                    const length = Math.hypot(front.p1[0] - front.p0[0], front.p1[1] - front.p0[1]);
-                    if (length < 10) continue;
-                    crestSegments.push({
-                        source: fromMeters(front.p0, vessel),
-                        target: fromMeters(front.p1, vessel),
-                        side: front.side,
-                        reached: front.reached,
-                        progress: front.progress,
-                    });
-                }
-            }
-            const geometry = {vessel, crestSegments, cuspSegments, transverseCircles};
+            const geometry = {vessel, cuspSegments, transverseCircles};
             window.__animationLastGeometry = {
                 state,
                 rayCount: rayIdxs.length,
-                crestCount: crestSegments.length,
                 cuspSegmentCount: cuspSegments.length,
                 transverseCount: transverseCircles.length,
-                frontIntersectionClips,
-                frontPlaneClips,
             };
             return geometry;
         };
@@ -4453,21 +4366,6 @@ async function(n) {
                             : [255, 135, 70, 245],
                         getWidth: 3.5,
                         widthMinPixels: 3,
-                        pickable: false,
-                    }));
-                }
-                if (animationGeometry.crestSegments.length > 0) {
-                    animationLayerIds.push('animation-divergent-crests');
-                    layers.push(new deck.LineLayer({
-                        id: 'animation-divergent-crests',
-                        data: animationGeometry.crestSegments,
-                        getSourcePosition: d => d.source,
-                        getTargetPosition: d => d.target,
-                        getColor: d => d.side === 'port'
-                            ? [60, 190, 255, d.reached ? 245 : 175]
-                            : [255, 135, 70, d.reached ? 245 : 175],
-                        getWidth: 3,
-                        widthMinPixels: 2.5,
                         pickable: false,
                     }));
                 }
