@@ -1112,15 +1112,23 @@ INDEX_TEMPLATE = """<!DOCTYPE html>
                       opacity: 0; transition: opacity 0.25s ease; }
         #copy-toast.visible { opacity: 1; }
         #ctrl-hint { position: fixed; bottom: 20px; left: 350px; z-index: 5;
-                     pointer-events: none; background: rgba(16,18,28,0.88);
+                     pointer-events: auto; background: rgba(16,18,28,0.88);
                      border-radius: 8px; padding: 10px 14px;
                      border: 1px solid rgba(255,255,255,0.08);
-                     box-shadow: 0 2px 12px rgba(0,0,0,0.45); }
+                     box-shadow: 0 2px 12px rgba(0,0,0,0.45);
+                     cursor: pointer; touch-action: manipulation;
+                     user-select: none; -webkit-user-select: none; }
+        #ctrl-hint.ctrl-active { background: rgba(255,215,55,0.96);
+                     border-color: rgba(255,235,120,1);
+                     box-shadow: 0 0 0 4px rgba(255,215,55,0.30),
+                                 0 2px 18px rgba(0,0,0,0.55); }
         #ctrl-hint-title { font-size: 13px; font-weight: 800;
                            color: #eee; letter-spacing: 0.4px;
                            line-height: 1.2; }
         #ctrl-hint-body { font-size: 10px; color: rgba(200,220,255,0.75);
                           margin-top: 4px; line-height: 1.7; }
+        #ctrl-hint.ctrl-active #ctrl-hint-title,
+        #ctrl-hint.ctrl-active #ctrl-hint-body { color: #17243a; }
         .status-highlight { animation: status-highlight 1.1s ease-out; }
         #ctrl-hint.ctrl-highlight { animation: ctrl-highlight 2.6s ease-out; }
         @keyframes status-highlight {
@@ -2229,7 +2237,7 @@ app.layout = html.Div([
             html.Div('+ hover for vessel / track / wave'),
             html.Div('+ click to pin & copy MMSI'),
         ], id='ctrl-hint-body'),
-    ], id='ctrl-hint'),
+    ], id='ctrl-hint', role='button', tabIndex=0, **{'aria-pressed': 'false'}),
     # Freehand draw canvas (overlaid on deck-container, managed by JS)
     html.Canvas(id='freehand-canvas', style={
         'position': 'fixed', 'top': '40px', 'left': '340px', 'right': '0', 'bottom': '0',
@@ -4626,6 +4634,7 @@ async function(n) {
         const initialZoom = 10;
         const CURSOR_PENCIL = `url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='22' height='22' viewBox='0 0 22 22'%3E%3Cpath fill='%23ffffff' stroke='%23222222' stroke-width='1.3' stroke-linejoin='round' d='M3 19L15 2l4 4L5 21z'/%3E%3Cpath fill='%23cccccc' stroke='%23555555' stroke-width='1' d='M3 19l4 2-5-5z'/%3E%3Ccircle cx='18' cy='5' r='1' fill='%2380c0ff'/%3E%3C/svg%3E") 0 22, crosshair`;
         window.__ctrlHeld = false;
+        window.__ctrlSources = { keyboard: false, touchToggle: false };
         // Pan + zoom always on. Ctrl key gates hover/click (inspect mode).
         const DEFAULT_CONTROLLER = { type: deck.MapController, dragPan: true,
             dragRotate: false, scrollZoom: true, doubleClickZoom: true, touchZoom: true };
@@ -4742,43 +4751,84 @@ async function(n) {
         window.__updateDeckCursor = (isDragging = false) => {
             container.style.cursor = getCursorForState(isDragging);
         };
+        const syncCtrlHint = () => {
+            const hint = document.getElementById('ctrl-hint');
+            if (!hint) return;
+            const active = !!window.__ctrlHeld;
+            hint.classList.toggle('ctrl-active', active);
+            hint.setAttribute('aria-pressed', active ? 'true' : 'false');
+            hint.title = active ? 'Tap to leave inspect mode' : 'Tap to enter inspect mode';
+            const title = document.getElementById('ctrl-hint-title');
+            if (title) title.textContent = active ? 'Inspect mode ON' : 'Hold Ctrl / Tap:';
+        };
+        window.__syncCtrlMode = () => {
+            const nextHeld = !!(window.__ctrlSources.keyboard || window.__ctrlSources.touchToggle);
+            const changed = nextHeld !== window.__ctrlHeld;
+            window.__ctrlHeld = nextHeld;
+            syncCtrlHint();
+            if (changed) {
+                if (!nextHeld) {
+                    hideTip();
+                    if (window.__freehandMode &&
+                            typeof window.__cancelFreehandDraw === 'function') {
+                        window.__cancelFreehandDraw();
+                    }
+                }
+                if (window.__polygonController) {
+                    window.__polygonController.setCtrlHeld(nextHeld);
+                }
+                if (typeof window.__rebuild === 'function') window.__rebuild();
+            }
+            if (nextHeld) {
+                if (window.__freehandArmed && !window.__freehandMode) {
+                    window.__activateFreehandDraw();
+                }
+                if (window.__polygonController) {
+                    window.__polygonController.setCtrlHeld(true);
+                }
+            }
+            window.__updateDeckCursor();
+            return window.__ctrlHeld;
+        };
+        window.__setCtrlSource = (source, value) => {
+            if (!window.__ctrlSources || !(source in window.__ctrlSources)) return window.__ctrlHeld;
+            window.__ctrlSources[source] = !!value;
+            return window.__syncCtrlMode();
+        };
+        const ctrlHint = document.getElementById('ctrl-hint');
+        if (ctrlHint) {
+            ctrlHint.addEventListener('click', (e) => {
+                e.preventDefault();
+                e.stopPropagation();
+                window.__setCtrlSource('touchToggle', !window.__ctrlSources.touchToggle);
+            });
+            ctrlHint.addEventListener('keydown', (e) => {
+                if (e.key !== 'Enter' && e.key !== ' ') return;
+                e.preventDefault();
+                window.__setCtrlSource('touchToggle', !window.__ctrlSources.touchToggle);
+            });
+            syncCtrlHint();
+        }
         // Ctrl held = inspect mode (hover tooltips + click picking enabled).
         // No INPUT/TEXTAREA guard — __ctrlHeld only affects the map, not DOM inputs;
         // those handle Ctrl+A/C/V natively regardless of this flag.
         window.addEventListener('keydown', (e) => {
-            if (e.key !== 'Control' || window.__ctrlHeld) return;
-            window.__ctrlHeld = true;
-            window.__updateDeckCursor();
-            if (typeof window.__rebuild === 'function') window.__rebuild();
-            if (window.__freehandArmed && !window.__freehandMode) window.__activateFreehandDraw();
-            if (window.__polygonController) window.__polygonController.setCtrlHeld(true);
+            if (e.key !== 'Control') return;
+            window.__setCtrlSource('keyboard', true);
         });
         window.addEventListener('keyup', (e) => {
-            if (e.key !== 'Control' || !window.__ctrlHeld) return;
-            window.__ctrlHeld = false;
-            hideTip();
-            if (window.__freehandMode && typeof window.__cancelFreehandDraw === 'function') window.__cancelFreehandDraw();
-            if (window.__polygonController) window.__polygonController.setCtrlHeld(false);
-            window.__updateDeckCursor();
+            if (e.key !== 'Control') return;
+            window.__setCtrlSource('keyboard', false);
         });
         // Clear inspect mode if window loses focus while Ctrl is held (otherwise
         // ctrl-tabbing away leaves the flag stuck on with no key event to clear it)
         window.addEventListener('blur', () => {
-            if (!window.__ctrlHeld) return;
-            window.__ctrlHeld = false;
-            hideTip();
-            if (window.__freehandMode && typeof window.__cancelFreehandDraw === 'function') window.__cancelFreehandDraw();
-            if (window.__polygonController) window.__polygonController.setCtrlHeld(false);
-            window.__updateDeckCursor();
+            window.__setCtrlSource('keyboard', false);
         });
         container.addEventListener('mousedown', (e) => {
             // Sync Ctrl state from the real event so first-interaction Ctrl+click works
-            if (e.ctrlKey && !window.__ctrlHeld) {
-                window.__ctrlHeld = true;
-                window.__updateDeckCursor();
-                // Activate armed modes in case keydown didn't fire before Ctrl was held
-                if (window.__freehandArmed && !window.__freehandMode) window.__activateFreehandDraw();
-                if (window.__polygonController) window.__polygonController.setCtrlHeld(true);
+            if (e.ctrlKey && !window.__ctrlSources.keyboard) {
+                window.__setCtrlSource('keyboard', true);
             }
             if (!window.__freehandMode && !window.__polygonController?.getState().drawing) {
                 window.__updateDeckCursor(true);

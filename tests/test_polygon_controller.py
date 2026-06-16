@@ -148,3 +148,17 @@ def test_pan_does_not_add_vertex_and_repeated_sessions_work(polygon_page):
     page.evaluate("controller.cancel(); controller.arm()")
     _click_map(page, 120, 120)
     assert page.evaluate("controller.getState().vertices") == [[120, 120]]
+
+
+def test_touch_toggle_allows_vertices_without_pointer_ctrl(polygon_page):
+    page = polygon_page
+    page.evaluate("controller.arm()")
+
+    page.evaluate("controller.setCtrlHeld(true)")
+    _click_map(page, 100, 100, ctrl=False)
+    _click_map(page, 180, 100, ctrl=False)
+    assert page.evaluate("controller.getState().vertices") == [[100, 100], [180, 100]]
+
+    page.evaluate("controller.setCtrlHeld(false)")
+    _click_map(page, 180, 180, ctrl=False)
+    assert page.evaluate("controller.getState().vertices.length") == 2
