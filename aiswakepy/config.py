@@ -13,7 +13,7 @@ class AisConfig(BaseModel):
     raw_csv: str
     # Shapefile used to mask out AIS points on land (separate from the coastline
     # shapefile used for wave-impact shore intersection).
-    land_shp: str
+    land_shp: str | None = None
     min_speed_knots: float = 0.0
     traj_gap_s: float = 180.0
     max_velocity_knots: float = 36.0
@@ -52,10 +52,18 @@ class VesselConfig(BaseModel):
 
 
 class BathymetryConfig(BaseModel):
-    source: str
+    source: str | None = None
+    constant_depth_m: float = 15.0
     tide_dfs0: str | None = None
     tide_item: str | None = None
     underkeel_margin_m: float = 1.0
+
+    @field_validator("constant_depth_m")
+    @classmethod
+    def constant_depth_positive(cls, v: float) -> float:
+        if v <= 0:
+            raise ValueError("constant_depth_m must be positive")
+        return v
 
 
 class CoastlineConfig(BaseModel):

@@ -39,6 +39,14 @@ _REQUIRED_COLS = [
     "sog", "cog", "typecargo",
 ]
 
+_NOAA_COLUMN_ALIASES = {
+    "basedatetime": "obstime",
+    "lon": "longitude",
+    "lat": "latitude",
+    "draft": "draught",
+    "vesseltype": "typecargo",
+}
+
 
 # ---------------------------------------------------------------------------
 # 1. Load
@@ -51,6 +59,11 @@ def load_ais(csv_path: str | Path) -> pd.DataFrame:
 
     df = pd.read_csv(csv_path, low_memory=False)
     df.columns = [c.strip().lower() for c in df.columns]
+    df = df.rename(columns={
+        source: target
+        for source, target in _NOAA_COLUMN_ALIASES.items()
+        if source in df.columns and target not in df.columns
+    })
 
     missing = [c for c in _REQUIRED_COLS if c not in df.columns]
     if missing:
@@ -835,7 +848,7 @@ def mask_land(df: pd.DataFrame, land_shp: str | Path,
 
 def filter_ais(
     csv_path: str | Path,
-    land_shp: str | Path,
+    land_shp: str | Path | None,
     coastline_shp: str | Path,
     gap_s: float = 180.0,
     max_velocity_knots: float = 36.0,
@@ -850,6 +863,7 @@ def filter_ais(
     speed_consistency_ratio: float = 0.5,
     # --- Depth-clearance check, applied AFTER interpolation/land masking ---
     bathy_path: str | Path | None = None,
+    constant_depth_m: float = 15.0,
     tide_dfs0_path: str | Path | None = None,
     tide_item: str | None = None,
     underkeel_margin_m: float = 1.0,
@@ -893,7 +907,8 @@ def filter_ais(
     df = remove_invalid_draught(df, max_draught_to_width=max_draught_to_width)
     # 6. Remove raw land points — before segmentation.
     #    track_breaks=True → surviving points after a land gap get _force_break.
-    df = mask_land(df, land_shp, track_breaks=True)
+    if land_shp is not None:
+        df = mask_land(df, land_shp, track_breaks=True)
     df = mask_land(df, coastline_shp, track_breaks=True)
     # 7. Segment with force-break flags so land crossings start new segments.
     df = segment_trajectories(df, gap_s=gap_s, use_force_break=True)
@@ -916,20 +931,21 @@ def filter_ais(
     # on surviving points so the single segment_trajectories at the end picks
     # up every break in one pass.
     # 13a. Drop points on land and flag breaks.
-    df = mask_land(df, land_shp, track_breaks=True)
+    if land_shp is not None:
+        df = mask_land(df, land_shp, track_breaks=True)
     # 13b. Drop points inside coastline and flag breaks.
     df = mask_land(df, coastline_shp, track_breaks=True)
     # 13c. Add WaterDepth and drop points failing the under-keel clearance
-    # check (skipped when no bathymetry is provided — e.g. unit tests).
-    if bathy_path is not None:
-        from aiswakepy.stages.depth import assign_depth
-        df = assign_depth(
-            df,
-            bathy_path=bathy_path,
-            tide_dfs0_path=tide_dfs0_path,
-            tide_item=tide_item,
-            underkeel_margin_m=underkeel_margin_m,
-        )
+    # check using either uploaded bathymetry or the configured constant depth.
+    from aiswakepy.stages.depth import assign_depth
+    df = assign_depth(
+        df,
+        bathy_path=bathy_path,
+        constant_depth_m=constant_depth_m,
+        tide_dfs0_path=tide_dfs0_path,
+        tide_item=tide_item,
+        underkeel_margin_m=underkeel_margin_m,
+    )
     # 13d. Re-segment with force-break flags so land + depth gaps split tracks.
     df = segment_trajectories(df, gap_s=gap_s, use_force_break=True)
     # 14. Study-area filter — optional, last.

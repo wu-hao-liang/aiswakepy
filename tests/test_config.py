@@ -50,9 +50,30 @@ def test_defaults_applied():
     assert cfg.output.save_parquet is True
 
 
+def test_optional_land_and_bathymetry_use_constant_depth():
+    cfg = load_config({
+        "ais": {"raw_csv": "data/test.csv"},
+        "bathymetry": {},
+        "coastline": {"shapefile": "shp/coast.shp"},
+    })
+    assert cfg.ais.land_shp is None
+    assert cfg.bathymetry.source is None
+    assert cfg.bathymetry.constant_depth_m == 15.0
+
+
+def test_constant_depth_must_be_positive():
+    bad = {
+        "ais": {"raw_csv": "data/test.csv"},
+        "bathymetry": {"constant_depth_m": 0},
+        "coastline": {"shapefile": "shp/coast.shp"},
+    }
+    with pytest.raises(ValidationError):
+        load_config(bad)
+
+
 def test_missing_required_field_raises():
-    bad = {"ais": {"raw_csv": "x.csv"}, "coastline": {"shapefile": "c.shp"}}
-    # missing bathymetry
+    bad = {"ais": {"raw_csv": "x.csv"}, "bathymetry": {}}
+    # coastline remains required
     with pytest.raises(ValidationError):
         load_config(bad)
 

@@ -67,6 +67,21 @@ def test_load_basic(tmp_path):
     assert pd.api.types.is_datetime64_any_dtype(df["obstime"])
 
 
+def test_load_normalizes_accessais_columns(tmp_path):
+    path = tmp_path / "accessais.csv"
+    pd.DataFrame({
+        "MMSI": [123], "Width": [12], "Length": [60], "Draft": [4],
+        "BaseDateTime": ["2024-01-01T00:00:00"], "LON": [-75.0], "LAT": [36.0],
+        "SOG": [8.0], "COG": [90.0], "VesselType": [70],
+    }).to_csv(path, index=False)
+    result = load_ais(path)
+    assert list(result.columns) == [
+        "mmsi", "width", "length", "draught", "obstime",
+        "longitude", "latitude", "sog", "cog", "typecargo",
+    ]
+    assert result.loc[0, "typecargo"] == 70
+
+
 def test_load_drops_extra_columns(tmp_path):
     rows = [_base_row()]
     csv = _make_ais_csv(rows) + "\n"

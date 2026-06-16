@@ -18,7 +18,8 @@ from aiswakepy.geo.bathymetry import BathymetryMesh, load_bathymetry, load_tide,
 
 def assign_depth(
     df: pd.DataFrame,
-    bathy_path: str | Path,
+    bathy_path: str | Path | None = None,
+    constant_depth_m: float = 15.0,
     tide_dfs0_path: str | Path | None = None,
     tide_item: str | None = None,
     underkeel_margin_m: float = 1.0,
@@ -29,7 +30,8 @@ def assign_depth(
     Parameters
     ----------
     df:               Filtered AIS DataFrame (output of filter_ais).
-    bathy_path:       Path to .mesh or .dfsu bathymetry file.
+    bathy_path:       Optional path to .mesh or .dfsu bathymetry file.
+    constant_depth_m: Depth used when no bathymetry file is supplied.
     tide_dfs0_path:   Optional path to .dfs0 tidal prediction file.
     tide_item:        Item name to read from the .dfs0 file.
     underkeel_margin_m: Minimum required clearance above draught (m).
@@ -45,11 +47,16 @@ def assign_depth(
 
     df = df.copy()
 
-    bathy = _bathy if _bathy is not None else load_bathymetry(bathy_path)
-
     lons = df["longitude"].to_numpy()
     lats = df["latitude"].to_numpy()
-    depths = bathy.get_depth(lons, lats)
+    if _bathy is not None:
+        depths = _bathy.get_depth(lons, lats)
+    elif bathy_path is not None:
+        depths = load_bathymetry(bathy_path).get_depth(lons, lats)
+    else:
+        if constant_depth_m <= 0:
+            raise ValueError("constant_depth_m must be positive")
+        depths = np.full(len(df), float(constant_depth_m), dtype=float)
 
     # Add tidal level if provided
     if tide_dfs0_path is not None:

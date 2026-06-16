@@ -59,6 +59,26 @@ def test_ais_upload_validates_required_columns(tmp_path, monkeypatch):
     assert "missing required columns" in resp.get_json()["error"]
 
 
+def test_accessais_upload_is_normalized(tmp_path, monkeypatch):
+    _reset_sessions(tmp_path, monkeypatch)
+    client = dash_app.server.test_client()
+    sid = _create_session(client)
+    csv = io.BytesIO(
+        b"MMSI,Width,Length,Draft,BaseDateTime,LON,LAT,SOG,COG,VesselType\n"
+        b"1,10,50,3,2024-01-01T00:00:00,-75,36,8,90,70\n"
+    )
+    resp = client.post(
+        f"/api/upload/ais?session_id={sid}",
+        data={"file": (csv, "accessais.csv")},
+        content_type="multipart/form-data",
+    )
+    assert resp.status_code == 200, resp.get_json()
+    saved = dash_app._sessions[sid].files["ais"]
+    assert set(pd.read_csv(saved).columns) >= {
+        "mmsi", "draught", "obstime", "longitude", "latitude", "typecargo",
+    }
+
+
 def test_shapefile_upload_accepts_selected_sidecars(tmp_path, monkeypatch):
     _reset_sessions(tmp_path / "sessions", monkeypatch)
     client = dash_app.server.test_client()
@@ -124,6 +144,83 @@ def test_build_config_uses_first_tide_item(tmp_path):
 
     assert cfg["bathymetry"]["tide_dfs0"] == str(tmp_path / "tide.dfs0")
     assert "tide_item" not in cfg["bathymetry"]
+
+
+def test_build_config_allows_optional_land_and_bathymetry(tmp_path):
+    state = dash_app.SessionState(session_id="test", root=tmp_path)
+    for name in ("ais.csv", "coast.shp"):
+        (tmp_path / name).touch()
+    cfg = dash_app._build_config(
+        state, "ais.csv", None, None, "coast.shp", None, constant_depth=18.0,
+    )
+    assert cfg["ais"]["land_shp"] is None
+    assert cfg["bathymetry"] == {"source": None, "constant_depth_m": 18.0}
+
+
+def test_generated_polygon_creates_wgs84_shapefile(tmp_path, monkeypatch):
+    _reset_sessions(tmp_path, monkeypatch)
+    client = dash_app.server.test_client()
+    sid = _create_session(client)
+    resp = client.post(
+        f"/api/generated-shapefile/coast?session_id={sid}",
+        json={"polygon": [[-75.0, 36.0], [-74.9, 36.0], [-74.9, 36.1], [-75.0, 36.1]]},
+    )
+    assert resp.status_code == 200, resp.get_json()
+    payload = resp.get_json()
+    assert {"coast.shp", "coast.shx", "coast.dbf", "coast.prj"} <= set(payload["files"])
+    layer = gpd.read_file(dash_app._sessions[sid].files["coast"])
+    assert layer.crs.to_epsg() == 4326
+
+
+def test_accessais_estimate_and_order_are_mocked(tmp_path, monkeypatch):
+    _reset_sessions(tmp_path, monkeypatch)
+    calls = []
+
+    def fake_http(url, payload=None):
+        calls.append((url, payload))
+        if url.endswith("/search/limit"):
+            return {"data": {"estimate": {"n_bytes": 1234}}}
+        return {"data": {"id": "ORDER-123"}}
+
+    monkeypatch.setattr(dash_app, "_http_json", fake_http)
+    client = dash_app.server.test_client()
+    sid = _create_session(client)
+    body = {
+        "email": "test@example.com",
+        "from_date": "2024-01-01",
+        "to_date": "2024-01-02",
+        "polygon": [[-75, 36], [-74, 36], [-74, 37]],
+        "accept_terms": True,
+    }
+    estimate = client.post(f"/api/noaa/ais/estimate?session_id={sid}", json=body)
+    order = client.post(f"/api/noaa/ais/order?session_id={sid}", json=body)
+    assert estimate.get_json()["bytes"] == 1234
+    assert order.get_json()["order_id"] == "ORDER-123"
+    assert calls[0][1]["xMin"] == -75
+    assert calls[1][1]["selections"][0]["aoiID"] == "aiswakepy-aoi"
+
+
+def test_noaa_tide_route_writes_temporary_dfs0(tmp_path, monkeypatch):
+    _reset_sessions(tmp_path, monkeypatch)
+    monkeypatch.setattr(dash_app, "_http_json", lambda *_: {
+        "predictions": [
+            {"t": "2024-01-01 00:00", "v": "0.2"},
+            {"t": "2024-01-01 00:06", "v": "0.3"},
+        ],
+    })
+    client = dash_app.server.test_client()
+    sid = _create_session(client)
+    resp = client.post(f"/api/noaa/tide?session_id={sid}", json={
+        "station": "9414290",
+        "from_date": "2024-01-01",
+        "to_date": "2024-01-01",
+        "datum": "MLLW",
+        "interval": "6",
+    })
+    assert resp.status_code == 200, resp.get_json()
+    path = dash_app._sessions[sid].files["tide"]
+    assert path.suffix == ".dfs0"
+    assert path.is_file()
 
 
 def test_export_filtered_returns_one_time_rerun_zip_download(tmp_path, monkeypatch):

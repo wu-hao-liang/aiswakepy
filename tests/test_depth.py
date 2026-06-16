@@ -86,6 +86,11 @@ def test_assign_depth_adds_column():
     np.testing.assert_allclose(result["WaterDepth"].to_numpy(), 15.0)
 
 
+def test_assign_depth_uses_constant_when_bathymetry_missing():
+    result = assign_depth(_make_df(n=3, draught=3.0), constant_depth_m=12.5)
+    np.testing.assert_allclose(result["WaterDepth"].to_numpy(), 12.5)
+
+
 def test_assign_depth_filters_nan():
     """Points outside the mesh (NaN depth) should be removed."""
     df = _make_df(n=3)

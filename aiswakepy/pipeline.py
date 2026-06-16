@@ -78,6 +78,7 @@ def run_pipeline(
             # interpolation step; only the final, interpolated frame is checked
             # against bathymetry + tide.
             bathy_path=config.bathymetry.source,
+            constant_depth_m=config.bathymetry.constant_depth_m,
             tide_dfs0_path=config.bathymetry.tide_dfs0,
             tide_item=config.bathymetry.tide_item,
             underkeel_margin_m=config.bathymetry.underkeel_margin_m,

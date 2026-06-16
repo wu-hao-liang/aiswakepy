@@ -259,6 +259,65 @@ input[type="number"] {
     border: 1px solid #4a85b5;
     border-radius: 5px;
 }
+
+.input-generation-row {
+    display: flex;
+    margin-top: 3px;
+}
+#sidebar .input-generation-btn {
+    padding: 5px 8px !important;
+    font-size: 10px !important;
+}
+.generated-input-modal {
+    position: fixed;
+    inset: 0;
+    z-index: 500;
+    display: none;
+    align-items: center;
+    justify-content: center;
+    background: rgba(10, 18, 30, 0.55);
+}
+.generated-input-modal.open { display: flex; }
+.generated-input-dialog {
+    width: min(460px, calc(100vw - 30px));
+    max-height: calc(100vh - 50px);
+    overflow: auto;
+    padding: 16px;
+    background: white;
+    border-radius: 7px;
+    box-shadow: 0 8px 30px rgba(0,0,0,0.35);
+    font: 12px system-ui, sans-serif;
+}
+.generated-input-dialog h3 { margin: 0 0 10px; }
+.generated-input-dialog label { display: block; margin: 7px 0 2px; font-weight: 600; }
+.generated-input-dialog input,
+.generated-input-dialog select {
+    width: 100%;
+    box-sizing: border-box;
+    padding: 5px 7px;
+}
+.generated-input-dialog .modal-check {
+    display: flex;
+    align-items: center;
+    gap: 5px;
+    font-weight: 400;
+}
+.generated-input-dialog .modal-check input { width: auto; }
+.generated-input-actions {
+    display: flex;
+    gap: 7px;
+    margin-top: 12px;
+}
+.generated-input-actions button {
+    flex: 1;
+    padding: 7px;
+}
+.generated-input-status {
+    min-height: 16px;
+    margin-top: 8px;
+    color: #445;
+    white-space: pre-wrap;
+}
 #btn-run-example:hover {
     background: linear-gradient(180deg, #5a9bca, #3a75a5);
 }

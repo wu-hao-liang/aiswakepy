@@ -17,8 +17,12 @@ import threading
 import time
 import uuid
 import zipfile
+from datetime import date
 from dataclasses import dataclass, field
 from pathlib import Path
+from urllib.error import HTTPError, URLError
+from urllib.parse import urlencode
+from urllib.request import Request, urlopen
 
 import datashader as ds
 import datashader.transfer_functions as tf
@@ -50,6 +54,8 @@ RASTER_AOI = (103.55, 1.20, 103.78, 1.32)  # west, south, east, north
 ZOOM_RASTER_THRESHOLD = 11
 PREVIEW_AIS_MAX_POINTS = 5000          # subsample raw AIS to this many points for preview
 PREVIEW_BATHY_MAX_TRIANGLES = 500000    # cap mesh element count for preview
+ACCESSAIS_API_URL = 'https://marinecadastre.gov/accessais/api/v1'
+COOPS_API_URL = 'https://api.tidesandcurrents.noaa.gov/api/prod/datagetter'
 
 # ---------------------------------------------------------------------------
 # Empty runtime templates
@@ -1252,6 +1258,7 @@ def _validate_uploaded_file(role: str, path: Path, state: SessionState) -> Path:
     if role == 'ais':
         if suffix != '.csv':
             raise ValueError('AIS input must be a .csv file')
+        _normalise_ais_csv(path)
         cols = {str(c).strip().lower() for c in pd.read_csv(path, nrows=5).columns}
         required = {
             'mmsi', 'width', 'length', 'draught', 'obstime',
@@ -1275,6 +1282,121 @@ def _validate_uploaded_file(role: str, path: Path, state: SessionState) -> Path:
         _preview_tide(path)
         return path
     raise ValueError(f'unsupported upload role: {role}')
+
+
+def _normalise_ais_csv(path: Path) -> None:
+    """Rewrite known AccessAIS columns to the app's canonical CSV schema."""
+    aliases = {
+        'basedatetime': 'obstime',
+        'lon': 'longitude',
+        'lat': 'latitude',
+        'draft': 'draught',
+        'vesseltype': 'typecargo',
+    }
+    df = pd.read_csv(path, low_memory=False)
+    lower = {str(column).strip().lower(): column for column in df.columns}
+    rename = {}
+    for source, target in aliases.items():
+        original = lower.get(source)
+        if original is not None and target not in lower:
+            rename[original] = target
+    for canonical in (
+        'mmsi', 'width', 'length', 'draught', 'obstime',
+        'longitude', 'latitude', 'sog', 'cog', 'typecargo',
+    ):
+        original = lower.get(canonical)
+        if original is not None and original != canonical:
+            rename[original] = canonical
+    if rename:
+        df = df.rename(columns=rename)
+        df.to_csv(path, index=False)
+
+
+def _http_json(url: str, payload: dict | None = None) -> dict:
+    data = None if payload is None else json.dumps(payload).encode('utf-8')
+    req = Request(
+        url,
+        data=data,
+        headers={
+            'Accept': 'application/json',
+            'Content-Type': 'application/json',
+            'User-Agent': 'aiswakepy/0.1',
+        },
+        method='POST' if payload is not None else 'GET',
+    )
+    try:
+        with urlopen(req, timeout=45) as response:
+            result = json.loads(response.read().decode('utf-8'))
+    except HTTPError as exc:
+        message = exc.read().decode('utf-8', errors='replace')
+        raise RuntimeError(f'NOAA request failed ({exc.code}): {message}') from exc
+    except (URLError, TimeoutError) as exc:
+        raise RuntimeError(f'NOAA request failed: {exc}') from exc
+    if isinstance(result, dict) and result.get('error'):
+        error = result['error']
+        raise RuntimeError(error.get('message', str(error)) if isinstance(error, dict) else str(error))
+    return result
+
+
+def _accessais_selection(body: dict) -> dict:
+    polygon = body.get('polygon') or []
+    if len(polygon) < 3:
+        raise ValueError('draw an AOI polygon with at least three vertices')
+    lons = [float(point[0]) for point in polygon]
+    lats = [float(point[1]) for point in polygon]
+    start = str(body.get('from_date') or '')
+    end = str(body.get('to_date') or '')
+    if not start or not end or date.fromisoformat(start) > date.fromisoformat(end):
+        raise ValueError('enter a valid AccessAIS date range')
+    return {
+        'fromDate': f'{start} 00:00:00',
+        'toDate': f'{end} 00:00:00',
+        'xMin': min(lons), 'yMin': min(lats),
+        'xMax': max(lons), 'yMax': max(lats),
+    }
+
+
+def _write_generated_shapefile(state: SessionState, role: str, polygon: list) -> Path:
+    if role not in {'coast', 'land'}:
+        raise ValueError('generated shapefile role must be coast or land')
+    if len(polygon) < 3:
+        raise ValueError('polygon requires at least three vertices')
+    import geopandas as gpd
+    from shapely.geometry import Polygon
+    geometry = Polygon([(float(point[0]), float(point[1])) for point in polygon])
+    if not geometry.is_valid or geometry.is_empty or geometry.area == 0:
+        raise ValueError('drawn polygon is invalid')
+    role_dir = state.root / 'generated' / role
+    shutil.rmtree(role_dir, ignore_errors=True)
+    role_dir.mkdir(parents=True)
+    path = role_dir / f'{role}.shp'
+    gpd.GeoDataFrame({'source': ['drawn']}, geometry=[geometry], crs='EPSG:4326').to_file(path)
+    state.files[role] = path
+    state.original_names[role] = path.name
+    return path
+
+
+def _write_tide_dfs0(path: Path, predictions: list[dict]) -> None:
+    if not predictions:
+        raise ValueError('NOAA returned no tide predictions')
+    frame = pd.DataFrame(predictions)
+    if not {'t', 'v'} <= set(frame.columns):
+        raise ValueError('NOAA tide response is missing prediction values')
+    series = pd.Series(
+        pd.to_numeric(frame['v'], errors='coerce').to_numpy(),
+        index=pd.to_datetime(frame['t'], errors='coerce'),
+        name='Water Level',
+    ).dropna()
+    if series.empty:
+        raise ValueError('NOAA returned no valid tide predictions')
+    import mikeio
+    from mikeio import DataArray, Dataset, EUMType, EUMUnit, ItemInfo
+    da = DataArray(
+        series.to_numpy(dtype=float),
+        time=series.index,
+        item=ItemInfo('Water Level', EUMType.Water_Level, EUMUnit.meter),
+    )
+    Dataset([da]).to_dfs(path)
 
 
 # ---------------------------------------------------------------------------
@@ -1473,6 +1595,107 @@ def _r_example():
 
     except Exception as exc:
         traceback.print_exc()
+        return jsonify({'error': str(exc)}), 400
+
+
+@app.server.route('/api/generated-shapefile/<role>', methods=['POST'])
+def _r_generated_shapefile(role: str):
+    try:
+        state = _get_session()
+        body = request.get_json(force=True, silent=False) or {}
+        path = _write_generated_shapefile(state, role, body.get('polygon') or [])
+        files = sorted(item.name for item in path.parent.iterdir() if item.is_file())
+        return jsonify({
+            'role': role,
+            'filename': path.name,
+            'path': str(path.relative_to(state.root)),
+            'files': files,
+        })
+    except Exception as exc:
+        return jsonify({'error': str(exc)}), 400
+
+
+@app.server.route('/api/noaa/ais/estimate', methods=['POST'])
+def _r_noaa_ais_estimate():
+    try:
+        _get_session()
+        selection = _accessais_selection(request.get_json(force=True, silent=False) or {})
+        result = _http_json(f'{ACCESSAIS_API_URL}/search/limit', selection)
+        estimate = result.get('data', {}).get('estimate', result.get('estimate', {}))
+        return jsonify({
+            'selection': selection,
+            'bytes': int(float(estimate.get('n_bytes', 0) or 0)),
+        })
+    except Exception as exc:
+        return jsonify({'error': str(exc)}), 400
+
+
+@app.server.route('/api/noaa/ais/order', methods=['POST'])
+def _r_noaa_ais_order():
+    try:
+        _get_session()
+        body = request.get_json(force=True, silent=False) or {}
+        email = str(body.get('email') or '').strip()
+        if '@' not in email:
+            raise ValueError('enter a valid email address')
+        if body.get('accept_terms') is not True:
+            raise ValueError('accept the AccessAIS terms before ordering')
+        selection = _accessais_selection(body)
+        selection['aoiID'] = 'aiswakepy-aoi'
+        result = _http_json(f'{ACCESSAIS_API_URL}/search/job', {
+            'email': email,
+            'newsletter': bool(body.get('newsletter')),
+            'selections': [selection],
+        })
+        job_id = result.get('data', {}).get('id') or result.get('id')
+        if not job_id:
+            raise RuntimeError('AccessAIS did not return an order ID')
+        return jsonify({'order_id': str(job_id)})
+    except Exception as exc:
+        return jsonify({'error': str(exc)}), 400
+
+
+@app.server.route('/api/noaa/tide', methods=['POST'])
+def _r_noaa_tide():
+    try:
+        state = _get_session()
+        body = request.get_json(force=True, silent=False) or {}
+        station = str(body.get('station') or '').strip()
+        start = str(body.get('from_date') or '')
+        end = str(body.get('to_date') or '')
+        datum = str(body.get('datum') or 'MLLW').upper()
+        interval = str(body.get('interval') or '6')
+        if not station or not start or not end or date.fromisoformat(start) > date.fromisoformat(end):
+            raise ValueError('enter a station and valid tide date range')
+        if interval not in {'1', '6', '10', '30', '60', 'h'}:
+            raise ValueError('unsupported tide interval')
+        params = {
+            'begin_date': start.replace('-', ''),
+            'end_date': end.replace('-', ''),
+            'station': station,
+            'product': 'predictions',
+            'datum': datum,
+            'time_zone': 'gmt',
+            'interval': interval,
+            'units': 'metric',
+            'application': 'aiswakepy',
+            'format': 'json',
+        }
+        result = _http_json(f'{COOPS_API_URL}?{urlencode(params)}')
+        role_dir = state.root / 'generated' / 'tide'
+        shutil.rmtree(role_dir, ignore_errors=True)
+        role_dir.mkdir(parents=True)
+        path = role_dir / f'tide_{secure_filename(station)}.dfs0'
+        _write_tide_dfs0(path, result.get('predictions') or [])
+        state.files['tide'] = path
+        state.original_names['tide'] = path.name
+        return jsonify({
+            'role': 'tide',
+            'filename': path.name,
+            'path': str(path.relative_to(state.root)),
+            'points': len(result.get('predictions') or []),
+        })
+    except Exception as exc:
         return jsonify({'error': str(exc)}), 400
 
 
@@ -1778,7 +2001,7 @@ def _export_filtered(state: SessionState, body: dict) -> Path:
         cfg_snap.setdefault('output', {})['directory'] = 'output'
         cfg_snap['ais']['raw_csv'] = ais_relpath
         cfg_snap['ais']['land_shp'] = next(
-            (f'land/{p.name}' for p in (export_root / 'land').glob('*.shp')), '')
+            (f'land/{p.name}' for p in (export_root / 'land').glob('*.shp')), None)
         cfg_snap['coastline']['shapefile'] = next(
             (f'coastline/{p.name}' for p in (export_root / 'coastline').glob('*.shp')), '')
         bathy_files = list((export_root / 'bathymetry').iterdir())
@@ -2035,21 +2258,25 @@ app.layout = html.Div([
                      style={'fontSize': '10px', 'color': '#556', 'whiteSpace': 'pre-wrap',
                             'marginBottom': '4px'}),
             html.Div(id='upload-ais-host'),
+            html.Div(id='generate-ais-host', className='input-generation-row'),
             html.Div(id='pv-ais-info', className='preview-info'),
             html.Div(id='upload-coast-host'),
+            html.Div(id='generate-coast-host', className='input-generation-row'),
             html.Div(id='pv-coast-info', className='preview-info'),
             html.Div(id='upload-land-host'),
+            html.Div(id='generate-land-host', className='input-generation-row'),
             html.Div(id='pv-land-info', className='preview-info'),
             html.Div(id='upload-bathy-host'),
             html.Div(id='pv-bathy-info', className='preview-info'),
             html.Div(id='upload-tide-host'),
+            html.Div(id='generate-tide-host', className='input-generation-row'),
         ], id='upload-panel'),
 
         # ---- Calculate Waves button ----
         html.Div([
             html.Button('Calculate Waves', id='btn-waves', n_clicks=0, disabled=True,
                         title='Run AIS filter + interpolate + vessel params '
-                              '+ wave impact (requires AIS, coastline, land, bathymetry)'),
+                              '+ wave impact (requires AIS and coastline)'),
         ], className='row-buttons'),
 
         # ---- Track visualization filter (disabled until waves are loaded) ----
@@ -2257,6 +2484,8 @@ app.layout = html.Div([
 
         # ── Wave Impact ───────────────────────────────────────────────────
         html.Div('Wave Impact', style=_RSB_SECTION),
+        _rsb_num('Constant Water Depth (constant_depth_m)', 'rsb-constant-depth', 15.0,
+                 'Used when no bathymetry file is uploaded; tide is added when supplied'),
         _rsb_num('Max Wake Ray Distance (max_propagation_m)', 'rsb-max-prop', 2000.0,
                  'Wake rays extending beyond this distance from the vessel are discarded'),
         _rsb_num('Min Recorded Wave Height (wake_cutoff_m)', 'rsb-wake-cutoff', 0.01,
@@ -2320,7 +2549,7 @@ def _build_config(state: SessionState, ais, land, bathy, coast, tide,
                   low_sog=1.0, vel_ratio=2.0, spd_ratio=0.5,
                   waterline=0.8, formula='kriebel', gravity=9.78,
                   max_bl=0.3, min_froude=0.1, max_froude=0.5, max_bf=0.4,
-                  wake_cutoff=0.01) -> dict:
+                  wake_cutoff=0.01, constant_depth=15.0) -> dict:
     cfg = {
         'ais': {'raw_csv': ais, 'land_shp': land,
                 'min_speed_knots': float(min_speed or 0.0),
@@ -2335,7 +2564,12 @@ def _build_config(state: SessionState, ais, land, bathy, coast, tide,
                 'speed_consistency_ratio': float(spd_ratio or 0.5)},
         'vessel': {'cb_method': cb_method or 'L_Le',
                    'waterline_factor': float(waterline or 0.8)},
-        'bathymetry': {'source': bathy or 'placeholder.mesh'},
+        'bathymetry': {
+            'source': bathy or None,
+            'constant_depth_m': float(
+                15.0 if constant_depth is None else constant_depth
+            ),
+        },
         'coastline': {'shapefile': coast},
         'wave': {'max_sog_knots': float(max_sog or 12.0),
                  'formula': formula or 'kriebel',
@@ -2351,7 +2585,7 @@ def _build_config(state: SessionState, ais, land, bathy, coast, tide,
     }
     cfg['ais']['raw_csv'] = str(_session_path(state, ais)) if ais else ais
     cfg['ais']['land_shp'] = str(_session_path(state, land)) if land else land
-    cfg['bathymetry']['source'] = str(_session_path(state, bathy)) if bathy else 'placeholder.mesh'
+    cfg['bathymetry']['source'] = str(_session_path(state, bathy)) if bathy else None
     cfg['coastline']['shapefile'] = str(_session_path(state, coast)) if coast else coast
     if tide:
         cfg['bathymetry']['tide_dfs0'] = str(_session_path(state, tide))
@@ -2392,6 +2626,7 @@ def _kick(state: SessionState, config_dict, stages, label):
     State('rsb-gravity', 'value'), State('rsb-max-bl', 'value'),
     State('rsb-min-froude', 'value'), State('rsb-max-froude', 'value'),
     State('rsb-max-bf', 'value'), State('rsb-wake-cutoff', 'value'),
+    State('rsb-constant-depth', 'value'),
     State('_session', 'data'),
     prevent_initial_call=True,
 )
@@ -2401,6 +2636,7 @@ def kick_waves(n, uploaded_files,
                max_velocity, max_accel, max_dw, low_sog,
                vel_ratio, spd_ratio, waterline, formula,
                gravity, max_bl, min_froude, max_froude, max_bf, wake_cutoff,
+               constant_depth,
                session_data):
     if not n:
         return no_update, no_update, no_update
@@ -2416,9 +2652,7 @@ def kick_waves(n, uploaded_files,
     tide  = (uf.get('tide')  or {}).get('path')
     missing = []
     if not ais:   missing.append('AIS data file')
-    if not land:  missing.append('Land mask shapefile')
     if not coast: missing.append('Coastline shapefile')
-    if not bathy: missing.append('Bathymetry file (required for depth check)')
     if missing:
         warn = '⚠ Cannot calculate waves — missing required inputs:\n  • ' + '\n  • '.join(missing)
         return no_update, no_update, warn
@@ -2427,7 +2661,8 @@ def kick_waves(n, uploaded_files,
                         cb_method, max_prop, max_sog,
                         max_velocity, max_accel, max_dw, low_sog,
                         vel_ratio, spd_ratio, waterline, formula,
-                        gravity, max_bl, min_froude, max_froude, max_bf, wake_cutoff)
+                        gravity, max_bl, min_froude, max_froude, max_bf, wake_cutoff,
+                        constant_depth)
     if _kick(state, cfg, ['filter', 'vessel', 'wave_impact'], 'waves'):
         return False, True, no_update
     return no_update, False, 'Server is busy calculating another session. Try again later.'
@@ -2435,7 +2670,7 @@ def kick_waves(n, uploaded_files,
 
 # btn-waves enabled when required inputs are present in _uploaded_files. Tide is optional.
 app.clientside_callback(
-    "function(uf){ uf=uf||{}; return !(uf.ais&&uf.coast&&uf.land&&uf.bathy); }",
+    "function(uf){ uf=uf||{}; return !(uf.ais&&uf.coast); }",
     Output('btn-waves', 'disabled', allow_duplicate=True),
     Input('_uploaded_files', 'data'),
     prevent_initial_call='initial_duplicate',
@@ -2826,6 +3061,169 @@ async function(n) {
         });
     };
     Object.keys(labels).forEach(k => makeUploadRow(k, labels[k]));
+    const publishGenerated = (role, payload) => {
+        const entry = {path: payload.path, filename: payload.filename};
+        window.__uploaded[role] = entry;
+        const button = document.getElementById(`native-upload-${role}-button`);
+        if (button) {
+            button.textContent = payload.filename;
+            button.title = (payload.files || [payload.filename]).join('\\n');
+        }
+        if (window.dash_clientside?.set_props) {
+            window.dash_clientside.set_props('_uploaded_files',
+                {data: Object.assign({}, window.__uploaded)});
+            const store = labels[role]?.previewStore;
+            if (store) {
+                const preview = document.getElementById(`native-preview-${role}`);
+                if (preview) preview.checked = true;
+                window.dash_clientside.set_props(store,
+                    {data: {visible: true, path: payload.path}});
+            }
+        }
+        setStatus(`${payload.filename} created in temporary session storage.`);
+    };
+    window.__publishGeneratedInput = publishGenerated;
+
+    const ensureGeneratedModals = () => {
+        if (document.getElementById('accessais-modal')) return;
+        document.body.insertAdjacentHTML('beforeend', `
+          <div id="accessais-modal" class="generated-input-modal">
+            <div class="generated-input-dialog">
+              <h3>Order historical AIS from NOAA AccessAIS</h3>
+              <label>Email</label><input id="accessais-email" type="email">
+              <label>Start date</label><input id="accessais-from" type="date">
+              <label>End date</label><input id="accessais-to" type="date">
+              <div class="generated-input-actions">
+                <button id="accessais-draw" type="button">Draw AOI polygon</button>
+                <button id="accessais-estimate" type="button">Estimate</button>
+              </div>
+              <label class="modal-check"><input id="accessais-newsletter" type="checkbox">
+                Subscribe to NOAA updates</label>
+              <label class="modal-check"><input id="accessais-terms" type="checkbox">
+                I accept the AccessAIS terms and privacy notice</label>
+              <div id="accessais-status" class="generated-input-status">Draw an AOI before estimating.</div>
+              <div class="generated-input-actions">
+                <button id="accessais-submit" type="button">Submit email order</button>
+                <button id="accessais-close" type="button">Close</button>
+              </div>
+            </div>
+          </div>
+          <div id="tide-modal" class="generated-input-modal">
+            <div class="generated-input-dialog">
+              <h3>Create tide DFS0 from NOAA CO-OPS</h3>
+              <label>Station ID</label><input id="tide-station" placeholder="e.g. 9414290">
+              <label>Start date</label><input id="tide-from" type="date">
+              <label>End date</label><input id="tide-to" type="date">
+              <label>Datum</label>
+              <select id="tide-datum">
+                <option>MLLW</option><option>MSL</option><option>MHHW</option>
+                <option>MHW</option><option>MTL</option><option>MLW</option>
+                <option>NAVD</option><option>STND</option>
+              </select>
+              <label>Interval</label>
+              <select id="tide-interval">
+                <option value="6">6 minutes</option><option value="1">1 minute</option>
+                <option value="10">10 minutes</option><option value="30">30 minutes</option>
+                <option value="60">60 minutes</option><option value="h">Hourly</option>
+              </select>
+              <div id="tide-status" class="generated-input-status"></div>
+              <div class="generated-input-actions">
+                <button id="tide-create" type="button">Create DFS0</button>
+                <button id="tide-close" type="button">Close</button>
+              </div>
+            </div>
+          </div>`);
+        const accessModal = document.getElementById('accessais-modal');
+        const tideModal = document.getElementById('tide-modal');
+        const accessStatus = document.getElementById('accessais-status');
+        const accessBody = () => ({
+            email: document.getElementById('accessais-email').value,
+            from_date: document.getElementById('accessais-from').value,
+            to_date: document.getElementById('accessais-to').value,
+            polygon: window.__accessAisPolygon || [],
+            newsletter: document.getElementById('accessais-newsletter').checked,
+            accept_terms: document.getElementById('accessais-terms').checked,
+        });
+        document.getElementById('accessais-close').onclick = () => accessModal.classList.remove('open');
+        document.getElementById('tide-close').onclick = () => tideModal.classList.remove('open');
+        document.getElementById('accessais-draw').onclick = () => {
+            accessModal.classList.remove('open');
+            window.__startGeneratedPolygon?.('ais');
+        };
+        document.getElementById('accessais-estimate').onclick = async () => {
+            accessStatus.textContent = 'Estimating download size...';
+            try {
+                const resp = await fetch('/api/noaa/ais/estimate', {
+                    method: 'POST', headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify(accessBody()),
+                });
+                const data = await resp.json();
+                if (!resp.ok || data.error) throw new Error(data.error || resp.statusText);
+                accessStatus.textContent = `Estimated size: ${(data.bytes / 1073741824).toFixed(2)} GB`;
+            } catch (error) {
+                accessStatus.textContent = 'ERROR: ' + error.message;
+            }
+        };
+        document.getElementById('accessais-submit').onclick = async () => {
+            accessStatus.textContent = 'Submitting asynchronous email order...';
+            try {
+                const resp = await fetch('/api/noaa/ais/order', {
+                    method: 'POST', headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify(accessBody()),
+                });
+                const data = await resp.json();
+                if (!resp.ok || data.error) throw new Error(data.error || resp.statusText);
+                accessStatus.textContent = `Order ${data.order_id} submitted. NOAA will email the download.`;
+            } catch (error) {
+                accessStatus.textContent = 'ERROR: ' + error.message;
+            }
+        };
+        document.getElementById('tide-create').onclick = async () => {
+            const status = document.getElementById('tide-status');
+            status.textContent = 'Downloading predictions and creating DFS0...';
+            const body = {
+                station: document.getElementById('tide-station').value,
+                from_date: document.getElementById('tide-from').value,
+                to_date: document.getElementById('tide-to').value,
+                datum: document.getElementById('tide-datum').value,
+                interval: document.getElementById('tide-interval').value,
+            };
+            try {
+                const resp = await fetch('/api/noaa/tide', {
+                    method: 'POST', headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify(body),
+                });
+                const data = await resp.json();
+                if (!resp.ok || data.error) throw new Error(data.error || resp.statusText);
+                publishGenerated('tide', data);
+                status.textContent = `${data.filename} created with ${data.points} predictions.`;
+            } catch (error) {
+                status.textContent = 'ERROR: ' + error.message;
+            }
+        };
+    };
+    ensureGeneratedModals();
+    const generationButtons = {
+        ais: ['generate-ais-host', 'Order from NOAA', () =>
+            document.getElementById('accessais-modal').classList.add('open')],
+        coast: ['generate-coast-host', 'Draw coastline polygon', () =>
+            window.__startGeneratedPolygon?.('coast')],
+        land: ['generate-land-host', 'Draw land-mask polygon', () =>
+            window.__startGeneratedPolygon?.('land')],
+        tide: ['generate-tide-host', 'Create from NOAA', () =>
+            document.getElementById('tide-modal').classList.add('open')],
+    };
+    Object.entries(generationButtons).forEach(([role, spec]) => {
+        const host = document.getElementById(spec[0]);
+        if (!host || host.dataset.ready) return;
+        host.dataset.ready = '1';
+        const button = document.createElement('button');
+        button.type = 'button';
+        button.className = 'input-generation-btn';
+        button.textContent = spec[1];
+        button.onclick = spec[2];
+        host.appendChild(button);
+    });
     const exportButton = document.getElementById('btn-fil-export');
     const exportStatus = document.getElementById('export-status');
     window.__setExportBusy = (busy, message) => {
@@ -3655,6 +4053,11 @@ async function(n) {
         window.__polygonController = polygonController;
         window.__enterWaveBoxMode = () => {
             if (!window.__hasWaves || wMMSI.length === 0) return;
+            window.__cancelFreehandDraw?.();
+            if (window.__generatedPolygonController) {
+                window.__generatedPolygonController.cancel();
+                window.__generatedPolygonController = null;
+            }
             polygonController.setCtrlHeld(window.__ctrlHeld);
             const armed = polygonController.arm();
             if (armed && typeof window.__highlightCtrlHint === 'function') {
@@ -3664,6 +4067,59 @@ async function(n) {
         window.__activateWaveBoxDraw = () => polygonController.activate();
         window.__cancelWaveBoxDraw = () => polygonController.cancel();
         window.__redrawWavePolygon = () => polygonController.redraw();
+        window.__startGeneratedPolygon = (role) => {
+            window.__cancelFreehandDraw?.();
+            polygonController.cancel();
+            if (window.__generatedPolygonController) {
+                window.__generatedPolygonController.cancel();
+                window.__generatedPolygonController.destroy();
+            }
+            const hostButton = document.querySelector(`#generate-${role}-host button`);
+            const defaultText = hostButton?.textContent || 'Draw polygon';
+            const complete = async (polygon) => {
+                if (hostButton) hostButton.textContent = defaultText;
+                window.__generatedPolygonController = null;
+                if (role === 'ais') {
+                    window.__accessAisPolygon = polygon;
+                    const modal = document.getElementById('accessais-modal');
+                    const status = document.getElementById('accessais-status');
+                    if (status) status.textContent =
+                        `AOI ready (${polygon.length} vertices). Estimate before ordering.`;
+                    modal?.classList.add('open');
+                    return;
+                }
+                try {
+                    setStatus(`Creating ${role === 'coast' ? 'coastline' : 'land mask'} shapefile...`);
+                    const resp = await fetch(`/api/generated-shapefile/${role}`, {
+                        method: 'POST',
+                        headers: {'Content-Type': 'application/json'},
+                        body: JSON.stringify({polygon}),
+                    });
+                    const data = await resp.json();
+                    if (!resp.ok || data.error) throw new Error(data.error || resp.statusText);
+                    window.__publishGeneratedInput?.(role, data);
+                } catch (error) {
+                    setStatus('ERROR: ' + error.message);
+                }
+            };
+            const generated = new window.AiswakePolygonController({
+                container,
+                canvas: getOrCreateWaveBoxCanvas(),
+                button: hostButton,
+                getViewport: () => window.deckInstance.getViewports()[0],
+                onComplete: complete,
+                onStateChange: (stateName) => {
+                    if (stateName === 'cancelled' && hostButton) {
+                        hostButton.textContent = defaultText;
+                    }
+                    window.__updateDeckCursor?.();
+                },
+            });
+            window.__generatedPolygonController = generated;
+            generated.setCtrlHeld(window.__ctrlHeld);
+            generated.arm();
+            window.__highlightCtrlHint?.();
+        };
         if (window.__pendingWaveBoxClick) {
             window.__pendingWaveBoxClick = false;
             window.__enterWaveBoxMode();
@@ -4139,6 +4595,9 @@ async function(n) {
             if (typeof window.__rebuild === 'function') window.__rebuild();
             if (window.__freehandArmed && !window.__freehandMode) window.__activateFreehandDraw();
             if (window.__polygonController) window.__polygonController.setCtrlHeld(true);
+            if (window.__generatedPolygonController) {
+                window.__generatedPolygonController.setCtrlHeld(true);
+            }
         });
         window.addEventListener('keyup', (e) => {
             if (e.key !== 'Control' || !window.__ctrlHeld) return;
@@ -4146,6 +4605,9 @@ async function(n) {
             hideTip();
             if (window.__freehandMode && typeof window.__cancelFreehandDraw === 'function') window.__cancelFreehandDraw();
             if (window.__polygonController) window.__polygonController.setCtrlHeld(false);
+            if (window.__generatedPolygonController) {
+                window.__generatedPolygonController.setCtrlHeld(false);
+            }
             window.__updateDeckCursor();
         });
         // Clear inspect mode if window loses focus while Ctrl is held (otherwise
@@ -4156,6 +4618,9 @@ async function(n) {
             hideTip();
             if (window.__freehandMode && typeof window.__cancelFreehandDraw === 'function') window.__cancelFreehandDraw();
             if (window.__polygonController) window.__polygonController.setCtrlHeld(false);
+            if (window.__generatedPolygonController) {
+                window.__generatedPolygonController.setCtrlHeld(false);
+            }
             window.__updateDeckCursor();
         });
         container.addEventListener('mousedown', (e) => {
@@ -4166,6 +4631,9 @@ async function(n) {
                 // Activate armed modes in case keydown didn't fire before Ctrl was held
                 if (window.__freehandArmed && !window.__freehandMode) window.__activateFreehandDraw();
                 if (window.__polygonController) window.__polygonController.setCtrlHeld(true);
+                if (window.__generatedPolygonController) {
+                    window.__generatedPolygonController.setCtrlHeld(true);
+                }
             }
             if (!window.__freehandMode && !window.__polygonController?.getState().drawing) {
                 window.__updateDeckCursor(true);
