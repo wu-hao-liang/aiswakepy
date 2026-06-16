@@ -1106,6 +1106,13 @@ INDEX_TEMPLATE = """<!DOCTYPE html>
                                   color: #d7dee5; cursor: default; opacity: 0.75; }
         #btn-animation.playing { background: linear-gradient(180deg, #5abaaa, #3a9a8a);
                                  border-color: #3a9a8a; }
+        #btn-cusp-debug { position: fixed; top: 48px; right: 110px; z-index: 12;
+                          min-width: 66px; padding: 8px 12px; border-radius: 5px;
+                          border: 1px solid #9a7bb5; color: white; font-weight: 700;
+                          background: linear-gradient(180deg, #a98ad0, #7d5fa8);
+                          box-shadow: 0 2px 8px rgba(0,0,0,0.28); cursor: pointer; }
+        #btn-cusp-debug.active { background: linear-gradient(180deg, #d08a8a, #a85f5f);
+                                 border-color: #a85f5f; }
         #copy-toast { position: fixed; top: 0; left: 0;
                       background: rgba(10,20,40,0.88); color: #8df;
                       border: 1px solid rgba(80,180,240,0.35); border-radius: 6px;
@@ -2220,6 +2227,8 @@ app.layout = html.Div([
     html.Div(id='deck-container'),
     html.Button('Play', id='btn-animation', disabled=True,
                 title='Ctrl+click a track, track point, or wave to select an animation'),
+    html.Button('Debug', id='btn-cusp-debug',
+                title='Toggle cusp debug tags (propagation speed / line orientation / live moving direction)'),
     # MMSI copy toast — appears briefly after Ctrl+click copies MMSI
     html.Div('', id='copy-toast'),
     # Ctrl hint — permanent floating label at bottom-left of canvas
@@ -3278,6 +3287,19 @@ async function(n) {
         });
         window.__animationController = animation;
         if (animationButton) animationButton.addEventListener('click', () => animation.toggle());
+        // Cusp debug overlay toggle (propagation speed / orientation / moving dir tags)
+        window.__cuspDebug = window.__cuspDebug || false;
+        const cuspDebugButton = document.getElementById('btn-cusp-debug');
+        if (cuspDebugButton) {
+            cuspDebugButton.classList.toggle('active', window.__cuspDebug);
+            cuspDebugButton.addEventListener('click', () => {
+                window.__cuspDebug = !window.__cuspDebug;
+                cuspDebugButton.classList.toggle('active', window.__cuspDebug);
+                if (window.deckInstance && typeof window.__rebuild === 'function') {
+                    window.__rebuild();
+                }
+            });
+        }
         const rayPhaseSpeed = ri => {
             const stored = Number(rPhaseSpeed[ri]);
             if (Number.isFinite(stored) && stored > 0) return stored;
@@ -3309,6 +3331,18 @@ async function(n) {
             const angle = Number(rCuspAngle[ri]);
             if (Number.isFinite(cog) && Number.isFinite(angle)) {
                 return rSide(ri) === 'port' ? cog + angle : cog - angle;
+            }
+            return cog;
+        };
+        // Direction the cusp front travels: the divergent-wave / wake direction
+        // (COG +/- theta), which WakeDirection_deg already encodes.
+        const rayMoveDirection = ri => {
+            const stored = Number(rWakeDir[ri]);
+            if (Number.isFinite(stored)) return stored;
+            const cog = rayCog(ri);
+            const theta = Number(rTheta[ri]);
+            if (Number.isFinite(cog) && Number.isFinite(theta)) {
+                return rSide(ri) === 'port' ? cog - theta : cog + theta;
             }
             return cog;
         };
@@ -3988,6 +4022,20 @@ async function(n) {
         };
         const add2 = (a, b) => [a[0] + b[0], a[1] + b[1]];
         const mul2 = (a, s) => [a[0] * s, a[1] * s];
+        // Intersect infinite line p+t*d with q+s*e (2D); null if (near-)parallel.
+        const lineIntersect = (p, d, q, e) => {
+            const denom = d[0] * e[1] - d[1] * e[0];
+            if (Math.abs(denom) < 1e-6) return null;
+            const t = ((q[0] - p[0]) * e[1] - (q[1] - p[1]) * e[0]) / denom;
+            return [p[0] + d[0] * t, p[1] + d[1] * t];
+        };
+        // Compass bearing (deg, 0=N, CW) from lon/lat a to lon/lat b.
+        const bearingDeg = (a, b) => {
+            const latRad = (a[1] || 0) * Math.PI / 180;
+            const east = (b[0] - a[0]) * Math.cos(latRad);
+            const north = (b[1] - a[1]);
+            return (Math.atan2(east, north) * 180 / Math.PI + 360) % 360;
+        };
         const selectedAnimationGeometry = state => {
             const selection = state.selection;
             if (!selection) return null;
@@ -4011,51 +4059,45 @@ async function(n) {
             ) || [];
             const transverseCircles = [];
             const cuspSegments = [];
+            const cuspJoints = [];   // intersection points, drawn in debug mode
+            // Every cusp source collected per side (one per AIS track point, ungated)
+            // so each crest's length can be derived from its track spacing.
+            const cuspBySide = {port: [], stbd: []};
             const emittedTransverse = new Set();
+            // Front positions (abs lon/lat) by ray, kept across frames for the live
+            // movement bearing shown in debug mode.
+            const cuspPrevFront = window.__cuspPrevFront instanceof Map
+                ? window.__cuspPrevFront : new Map();
+            const cuspNextFront = new Map();
             const stride = Math.max(1, Math.ceil(rayIdxs.length / 220));
+            // The vessel sits at the origin in local metres (the live generation point
+            // through which the newest crest passes).
+            const vessel0 = [0, 0];
+            // ---- Collect every source (no time gate) + transverse circles ----
             for (const ri of rayIdxs) {
-                const sourceOffsetS = Math.max(0, (Number(rSourceTime[ri]) - firstNs) / 1e9);
                 const source = [rSourcePos[ri*2], rSourcePos[ri*2+1]];
                 const side = rSide(ri);
-
-                const cuspDistance = Number(rCuspDistance[ri]) || Number(rDistance[ri]) || 0;
-                const cuspProgress = animation.frontProgress(
-                    sourceOffsetS, rayGroupSpeed(ri), cuspDistance);
-                if (cuspProgress > 0 && !(cuspProgress >= 1 && Boolean(rCuspReached[ri]))) {
-                    const cuspEnd = [
-                        rCuspEndPos[ri*2] || 0,
-                        rCuspEndPos[ri*2+1] || 0,
-                    ];
-                    const useStoredEnd = cuspEnd[0] !== 0 || cuspEnd[1] !== 0;
-                    const cuspTarget = useStoredEnd
-                        ? [
-                            source[0] + (cuspEnd[0] - source[0]) * cuspProgress,
-                            source[1] + (cuspEnd[1] - source[1]) * cuspProgress,
-                        ]
-                        : offsetMeters(source,
-                            bearingVector(rayCuspDirection(ri))[0] * cuspDistance * cuspProgress,
-                            bearingVector(rayCuspDirection(ri))[1] * cuspDistance * cuspProgress);
-                    const cuspCenterM = toMeters(cuspTarget, vessel);
-                    const cuspDir = bearingVector(rayCuspDirection(ri));
-                    const halfLengthM = Math.max(35, Math.min(220, 35 + cuspDistance * 0.04));
-                    const p0 = add2(cuspCenterM, mul2(cuspDir, -halfLengthM));
-                    const p1 = add2(cuspCenterM, mul2(cuspDir, halfLengthM));
-                    cuspSegments.push({
-                        source: fromMeters(p0, vessel),
-                        target: fromMeters(p1, vessel),
-                        side,
-                        progress: cuspProgress,
-                        direction: rayCuspDirection(ri),
-                    });
-                }
+                cuspBySide[side].push({
+                    ri,
+                    srcM: toMeters(source, vessel),
+                    srcTime: Number(rSourceTime[ri]),
+                    moveDir: bearingVector(rayMoveDirection(ri)),
+                    lineDir: bearingVector(rayCuspDirection(ri)),
+                    lineOriDeg: Number(rayCuspDirection(ri)),
+                    ca: Number(rCuspAngle[ri]),
+                    groupSpeed: rayGroupSpeed(ri),
+                    cuspDistance: Number(rCuspDistance[ri]) || Number(rDistance[ri]) || 0,
+                    reached: Boolean(rCuspReached[ri]),
+                });
                 if (ri % stride === 0) {
                     const key = `${Number(rSourceTime[ri])}|${source[0].toFixed(6)}|${source[1].toFixed(6)}`;
                     if (!emittedTransverse.has(key)) {
                         emittedTransverse.add(key);
+                        const sourceOffsetS = Math.max(0, (Number(rSourceTime[ri]) - firstNs) / 1e9);
                         const phaseProgress = animation.frontProgress(
                             sourceOffsetS, rayPhaseSpeed(ri), rDistance[ri]);
-                        const radius = animation.transverseRadius(
-                            sourceOffsetS, rTransverseSpeed[ri]);
+                        // Expand circles at the same group speed (0.5*cos(theta)*V).
+                        const radius = animation.transverseRadius(sourceOffsetS, rayGroupSpeed(ri));
                         if (radius > 0) {
                             transverseCircles.push({
                                 position: source,
@@ -4066,7 +4108,118 @@ async function(n) {
                     }
                 }
             }
-            const geometry = {vessel, cuspSegments, transverseCircles};
+            // ---- Build each side's crest arm with determined lengths ----
+            const dist2 = (p, q) => Math.hypot(p[0] - q[0], p[1] - q[1]);
+            const dot2 = (a, b) => a[0]*b[0] + a[1]*b[1];
+            const sub2 = (a, b) => [a[0] - b[0], a[1] - b[1]];
+            for (const side of ['port', 'stbd']) {
+                const all = cuspBySide[side];
+                all.sort((a, b) => a.srcTime - b.srcTime);
+                const N = all.length;
+                if (!N) continue;
+                // Newest source index k: the last source whose midpoint-from-previous
+                // the vessel has passed (appears half a step before its source time).
+                let k = 0;
+                for (let i = 1; i < N; i++) {
+                    if (targetNs >= (all[i-1].srcTime + all[i].srcTime) / 2) k = i; else break;
+                }
+                // Determined per-source crest geometry for active indices [0..k].
+                const cr = [];
+                for (let i = 0; i <= k; i++) {
+                    const s = all[i];
+                    const elapsedS = Math.max(0, (targetNs - s.srcTime) / 1e9);
+                    const frontDist = s.groupSpeed * elapsedS;
+                    // Drop old crests that have fully propagated to shore.
+                    const prog = s.cuspDistance > 0 ? frontDist / s.cuspDistance : 0;
+                    if (prog >= 1 && s.reached) continue;
+                    const C = add2(s.srcM, mul2(s.moveDir, frontDist));   // front/division point
+                    const dPrev = i > 0 ? dist2(s.srcM, all[i-1].srcM)
+                        : (i+1 < N ? dist2(s.srcM, all[i+1].srcM) : 0);
+                    const dNext = i+1 < N ? dist2(s.srcM, all[i+1].srcM)
+                        : (i > 0 ? dist2(s.srcM, all[i-1].srcM) : 0);
+                    const c = Math.cos((s.ca || 0) * Math.PI / 180);
+                    const Lp = 0.5 * c * dPrev;   // prev-half length
+                    const Ln = 0.5 * c * dNext;   // next-half length
+                    // Orientation signed so +u points toward the next (newer) source.
+                    const ref = i+1 < N ? sub2(all[i+1].srcM, s.srcM)
+                        : sub2(s.srcM, all[Math.max(0, i-1)].srcM);
+                    const u = mul2(s.lineDir, dot2(s.lineDir, ref) >= 0 ? 1 : -1);
+                    cr.push({s, C, u, Lp, Ln,
+                        back: add2(C, mul2(u, -Lp)),   // prev/outward end
+                        fwd:  add2(C, mul2(u,  Ln))});  // next/vessel-ward end
+                }
+                const m = cr.length;
+                if (!m) continue;
+                // Newest crest is still being generated: its FRONT point is the live
+                // generation point at the vessel, and the crest extends back from there
+                // by the length already generated (proportional to the path travelled
+                // through this point's ownership interval). The line passes through the
+                // vessel even before the front reaches the AIS source point.
+                {
+                    const nw = cr[m-1];
+                    const sk = all[k];
+                    const tBefore = k > 0 ? (all[k-1].srcTime + sk.srcTime) / 2 : sk.srcTime;
+                    const tAfter = k+1 < N ? (sk.srcTime + all[k+1].srcTime) / 2
+                        : sk.srcTime + (sk.srcTime - tBefore);
+                    let g;
+                    if (targetNs < sk.srcTime) {
+                        // Prev-half: vessel between midpoint-before and the AIS point.
+                        const denom = sk.srcTime - tBefore;
+                        const p1 = denom > 0 ? (targetNs - tBefore) / denom : 1;
+                        g = Math.max(0, Math.min(1, p1)) * nw.Lp;
+                    } else {
+                        // Next-half: vessel past the AIS point toward midpoint-after.
+                        const denom = tAfter - sk.srcTime;
+                        const p2 = denom > 0 ? (targetNs - sk.srcTime) / denom : 1;
+                        g = nw.Lp + Math.max(0, Math.min(1, p2)) * nw.Ln;
+                    }
+                    nw.C = vessel0;                          // front point = vessel
+                    nw.fwd = vessel0;
+                    nw.back = add2(vessel0, mul2(nw.u, -g)); // grown length behind it
+                }
+                // Is X inside a crest's own finite extent (along its direction)?
+                const within = (c0, X) => {
+                    const tB = dot2(sub2(c0.back, c0.C), c0.u);
+                    const tF = dot2(sub2(c0.fwd,  c0.C), c0.u);
+                    const tX = dot2(sub2(X,        c0.C), c0.u);
+                    return tX >= Math.min(tB, tF) - 1e-6 && tX <= Math.max(tB, tF) + 1e-6;
+                };
+                // Neighbour crossings; only trim when inside BOTH finite crests.
+                const join = new Array(Math.max(0, m - 1)).fill(null);
+                for (let i = 0; i < m - 1; i++) {
+                    const X = lineIntersect(cr[i].C, cr[i].u, cr[i+1].C, cr[i+1].u);
+                    const ok = !!X && within(cr[i], X) && within(cr[i+1], X);
+                    join[i] = ok ? X : null;
+                    cuspJoints.push({position: fromMeters(X || cr[i].fwd, vessel),
+                        side, kind: ok ? 'neighbour' : 'rejected'});
+                }
+                cuspJoints.push({position: fromMeters(cr[m-1].fwd, vessel), side, kind: 'vessel'});
+                // Emit segments: shared joints connect neighbours, else full length.
+                for (let i = 0; i < m; i++) {
+                    const c0 = cr[i];
+                    const back = (i > 0 && join[i-1]) ? join[i-1] : c0.back;
+                    const fwd  = (i < m-1 && join[i]) ? join[i] : c0.fwd;
+                    const frontAbs = fromMeters(c0.C, vessel);
+                    const prevFront = cuspPrevFront.get(c0.s.ri);
+                    const movDeg = prevFront
+                        && (Math.abs(frontAbs[0] - prevFront[0]) > 1e-9
+                            || Math.abs(frontAbs[1] - prevFront[1]) > 1e-9)
+                        ? bearingDeg(prevFront, frontAbs) : null;
+                    cuspNextFront.set(c0.s.ri, frontAbs);
+                    cuspSegments.push({
+                        source: fromMeters(back, vessel),
+                        target: fromMeters(fwd, vessel),
+                        labelPos: frontAbs,
+                        side,
+                        direction: c0.s.lineOriDeg,
+                        speedKn: c0.s.groupSpeed * 1.943844,
+                        oriDeg: (c0.s.lineOriDeg % 360 + 360) % 360,
+                        movDeg,
+                    });
+                }
+            }
+            window.__cuspPrevFront = cuspNextFront;
+            const geometry = {vessel, cuspSegments, transverseCircles, cuspJoints};
             window.__animationLastGeometry = {
                 state,
                 rayCount: rayIdxs.length,
@@ -4367,6 +4520,51 @@ async function(n) {
                         getWidth: 3.5,
                         widthMinPixels: 3,
                         pickable: false,
+                    }));
+                    if (window.__cuspDebug) {
+                        // Tag a sampled subset so the canvas stays readable.
+                        const segs = animationGeometry.cuspSegments;
+                        const labelStride = Math.max(1, Math.ceil(segs.length / 28));
+                        const labels = segs.filter((d, i) => i % labelStride === 0);
+                        animationLayerIds.push('animation-cusp-debug');
+                        layers.push(new deck.TextLayer({
+                            id: 'animation-cusp-debug',
+                            data: labels,
+                            getPosition: d => d.labelPos,
+                            getText: d => `${d.speedKn.toFixed(1)} kn`
+                                + `\nori ${Math.round(d.oriDeg)}°`
+                                + `\nmov ${d.movDeg == null ? '--' : Math.round(d.movDeg) + '°'}`,
+                            getColor: d => d.side === 'port'
+                                ? [10, 70, 130, 255] : [150, 55, 10, 255],
+                            getSize: 11,
+                            sizeUnits: 'pixels',
+                            getTextAnchor: 'start',
+                            getAlignmentBaseline: 'center',
+                            background: true,
+                            getBackgroundColor: [255, 255, 255, 205],
+                            backgroundPadding: [3, 2],
+                            fontFamily: 'monospace',
+                            pickable: false,
+                        }));
+                    }
+                }
+                if (window.__cuspDebug && animationGeometry.cuspJoints
+                    && animationGeometry.cuspJoints.length > 0) {
+                    // Draw every intersection point for verification: magenta = an
+                    // accepted neighbour trim, lime = newest-crest vessel-ray end,
+                    // grey = a crossing rejected for falling outside the crest lengths.
+                    animationLayerIds.push('animation-cusp-joints');
+                    layers.push(new deck.ScatterplotLayer({
+                        id: 'animation-cusp-joints',
+                        data: animationGeometry.cuspJoints,
+                        getPosition: d => d.position,
+                        getRadius: d => d.kind === 'rejected' ? 3 : 4, radiusUnits: 'pixels',
+                        radiusMinPixels: 3, radiusMaxPixels: 6,
+                        getFillColor: d => d.kind === 'vessel'
+                            ? [60, 230, 60, 255]
+                            : (d.kind === 'rejected' ? [150, 150, 150, 180] : [240, 40, 200, 255]),
+                        stroked: true, getLineColor: [20, 20, 20, 220],
+                        lineWidthMinPixels: 1, pickable: false,
                     }));
                 }
                 animationLayerIds.push('animation-vessel');
