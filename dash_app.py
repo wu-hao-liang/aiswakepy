@@ -3273,7 +3273,7 @@ async function(n) {
 
         const animationButton = document.getElementById('btn-animation');
         const animation = new window.VesselWaveAnimationController({
-            realTimeScale: 10,
+            realTimeScale: 50,
             onChange: state => {
                 if (animationButton) {
                     animationButton.disabled = !state.selection;
@@ -3366,6 +3366,10 @@ async function(n) {
                 const cuspDist = Number(rCuspDistance[ri]) || Number(rDistance[ri]) || 0;
                 const cuspTravelS = cuspSpeed > 0 ? cuspDist / cuspSpeed : 0;
                 loopDurationS = Math.max(loopDurationS, sourceOffsetS + cuspTravelS);
+                // Let the loop run until the crest front (group speed along Distance_m)
+                // reaches the coastline / max distance, so crests finish propagating.
+                const crestTravelS = cuspSpeed > 0 ? (Number(rDistance[ri]) || 0) / cuspSpeed : 0;
+                loopDurationS = Math.max(loopDurationS, sourceOffsetS + crestTravelS);
             }
             animation.select({
                 segIdx,
@@ -4059,6 +4063,7 @@ async function(n) {
             ) || [];
             const transverseCircles = [];
             const cuspSegments = [];
+            const propagationRays = [];  // debug: source → current front point per crest
             const cuspJoints = [];   // intersection points, drawn in debug mode
             // Every cusp source collected per side (one per AIS track point, ungated)
             // so each crest's length can be derived from its track spacing.
@@ -4086,8 +4091,9 @@ async function(n) {
                     lineOriDeg: Number(rayCuspDirection(ri)),
                     ca: Number(rCuspAngle[ri]),
                     groupSpeed: rayGroupSpeed(ri),
-                    cuspDistance: Number(rCuspDistance[ri]) || Number(rDistance[ri]) || 0,
-                    reached: Boolean(rCuspReached[ri]),
+                    // Distance the front travels along its propagation ray (COG+/-theta)
+                    // before hitting the coastline or the max calculation distance.
+                    propDist: Number(rDistance[ri]) || 0,
                 });
                 if (ri % stride === 0) {
                     const key = `${Number(rSourceTime[ri])}|${source[0].toFixed(6)}|${source[1].toFixed(6)}`;
@@ -4127,11 +4133,14 @@ async function(n) {
                 const cr = [];
                 for (let i = 0; i <= k; i++) {
                     const s = all[i];
-                    const elapsedS = Math.max(0, (targetNs - s.srcTime) / 1e9);
+                    // Propagation time keeps advancing after the vessel reaches the
+                    // track end (simElapsedS runs on to loopDurationS, while targetNs
+                    // freezes), so crests keep moving until they hit shore / the limit.
+                    const elapsedS = Math.max(0, state.simElapsedS - (s.srcTime - firstNs) / 1e9);
                     const frontDist = s.groupSpeed * elapsedS;
-                    // Drop old crests that have fully propagated to shore.
-                    const prog = s.cuspDistance > 0 ? frontDist / s.cuspDistance : 0;
-                    if (prog >= 1 && s.reached) continue;
+                    // The crest keeps propagating while playing, and disappears only
+                    // once its front reaches the coastline / max calculation distance.
+                    if (s.propDist > 0 && frontDist >= s.propDist) continue;
                     const C = add2(s.srcM, mul2(s.moveDir, frontDist));   // front/division point
                     const dPrev = i > 0 ? dist2(s.srcM, all[i-1].srcM)
                         : (i+1 < N ? dist2(s.srcM, all[i+1].srcM) : 0);
@@ -4150,12 +4159,13 @@ async function(n) {
                 }
                 const m = cr.length;
                 if (!m) continue;
-                // Newest crest is still being generated: its FRONT point is the live
-                // generation point at the vessel, and the crest extends back from there
-                // by the length already generated (proportional to the path travelled
-                // through this point's ownership interval). The line passes through the
-                // vessel even before the front reaches the AIS source point.
-                {
+                // While the vessel is still moving, the newest crest is being
+                // generated: its FRONT point is the live generation point at the
+                // vessel, growing by the length generated through this point's
+                // ownership interval (the line passes through the vessel even before
+                // the front reaches the AIS source point). Once the vessel reaches the
+                // track end it stops generating and propagates like the others.
+                if (state.trackProgress < 1) {
                     const nw = cr[m-1];
                     const sk = all[k];
                     const tBefore = k > 0 ? (all[k-1].srcTime + sk.srcTime) / 2 : sk.srcTime;
@@ -4216,10 +4226,15 @@ async function(n) {
                         oriDeg: (c0.s.lineOriDeg % 360 + 360) % 360,
                         movDeg,
                     });
+                    propagationRays.push({
+                        source: fromMeters(c0.s.srcM, vessel),
+                        target: frontAbs,
+                        side,
+                    });
                 }
             }
             window.__cuspPrevFront = cuspNextFront;
-            const geometry = {vessel, cuspSegments, transverseCircles, cuspJoints};
+            const geometry = {vessel, cuspSegments, propagationRays, transverseCircles, cuspJoints};
             window.__animationLastGeometry = {
                 state,
                 rayCount: rayIdxs.length,
@@ -4547,6 +4562,22 @@ async function(n) {
                             pickable: false,
                         }));
                     }
+                }
+                if (window.__cuspDebug && animationGeometry.propagationRays
+                    && animationGeometry.propagationRays.length > 0) {
+                    animationLayerIds.push('animation-cusp-rays');
+                    layers.push(new deck.LineLayer({
+                        id: 'animation-cusp-rays',
+                        data: animationGeometry.propagationRays,
+                        getSourcePosition: d => d.source,
+                        getTargetPosition: d => d.target,
+                        getColor: d => d.side === 'port'
+                            ? [60, 190, 255, 120]
+                            : [255, 135, 70, 120],
+                        getWidth: 1.5,
+                        widthMinPixels: 1,
+                        pickable: false,
+                    }));
                 }
                 if (window.__cuspDebug && animationGeometry.cuspJoints
                     && animationGeometry.cuspJoints.length > 0) {
