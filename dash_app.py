@@ -343,6 +343,9 @@ class SessionState:
     last_access: float = field(default_factory=time.time)
     files: dict[str, Path] = field(default_factory=dict)
     original_names: dict[str, str] = field(default_factory=dict)
+    # Cache of the AIS data bbox (padded), keyed by AIS file path string. Used to
+    # crop the bathymetry preview server-side so it never depends on client timing.
+    ais_bbox_cache: dict[str, tuple] = field(default_factory=dict)
     df_vessels: pd.DataFrame = field(
         default_factory=lambda: pd.DataFrame(columns=VESSEL_COLUMNS))
     df_waves: pd.DataFrame = field(
@@ -864,22 +867,41 @@ INDEX_TEMPLATE = """<!DOCTYPE html>
 <html>
 <head>
     {%metas%}
-    <title>aiswakepy - deck.gl spike</title>
+    <title>AISWAKEPY</title>
     {%favicon%}
     {%css%}
     <script src="https://unpkg.com/deck.gl@9.1.13/dist.min.js"></script>
     <script src="/assets/animation_controller.js"></script>
-    <script type="importmap">
-    {
-      "imports": {
-        "apache-arrow": "https://cdn.jsdelivr.net/npm/apache-arrow@21.0.0/+esm"
-      }
-    }
-    </script>
-    <script type="module">
-        import { tableFromIPC } from 'apache-arrow';
-        window.tableFromIPC = tableFromIPC;
-        window.dispatchEvent(new Event('arrow-ready'));
+    <!-- apache-arrow as a classic UMD global (window.Arrow), loaded the same way
+         as deck.gl above. The ES-module build — whether via <script type="importmap">
+         (needs Safari 16.4+) or dynamic import() of the cross-origin +esm bundle —
+         fails to load on older iPad/iOS WebKit, leaving window.tableFromIPC undefined
+         ("tableFromIPC is not a function"). The UMD bundle is plain ES2015 and runs as
+         an ordinary script on every browser that can already run deck.gl. -->
+    <script src="https://cdn.jsdelivr.net/npm/apache-arrow@21.0.0/Arrow.es2015.min.js"></script>
+    <script>
+        // Bridge the UMD global to the window.tableFromIPC the app expects, and
+        // expose window.__arrowReady (resolves even on failure so downstream
+        // awaits never hang) plus the 'arrow-ready' event init waits on. The
+        // preceding classic <script src> normally executes before this one, so
+        // window.Arrow is already present; the poll only covers a slow/failed load.
+        window.__arrowReady = new Promise(function(resolve) {
+            var waited = 0;
+            (function poll() {
+                if (window.Arrow && typeof window.Arrow.tableFromIPC === 'function') {
+                    window.tableFromIPC = window.Arrow.tableFromIPC;
+                    window.dispatchEvent(new Event('arrow-ready'));
+                    resolve();
+                } else if ((waited += 50) >= 30000) {
+                    window.__arrowError = new Error('apache-arrow UMD bundle did not load');
+                    console.error('apache-arrow failed to load (window.Arrow never appeared)');
+                    window.dispatchEvent(new Event('arrow-ready'));
+                    resolve();
+                } else {
+                    setTimeout(poll, 50);
+                }
+            })();
+        });
     </script>
     <script>
         window.__copyText = function(text) {
@@ -1033,6 +1055,9 @@ INDEX_TEMPLATE = """<!DOCTYPE html>
         #sidebar h4 { margin: 0 0 8px; font-size: 13px; }
         #sidebar label { display: block; font-size: 10px; color: #555;
                          margin: 6px 0 1px; font-weight: 600; }
+        /* First upload row (AIS CSV) sits right under the sidebar's top padding —
+           drop its extra top margin so it isn't pushed down unnecessarily. */
+        #upload-ais-host .upload-control-label { margin-top: 0; }
         .row-with-preview { display: flex; gap: 6px; align-items: center; }
         .row-with-preview > :first-child { flex: 1; min-width: 0; }
         .secondary-btn { background: #eef2f7 !important; color: #3a6080 !important;
@@ -1097,13 +1122,21 @@ INDEX_TEMPLATE = """<!DOCTYPE html>
                         border-radius: 3px; margin: 4px 0; }
         #deck-container { position: fixed; top: 40px; left: 340px; right: 0; bottom: 0;
                           z-index: 1; overflow: hidden; transition: right 0.2s ease; }
-        #btn-animation { padding: 3px 11px; border-radius: 5px; font-size: 15px;
+        #anim-seg-label { margin-left: auto; font: 12px ui-monospace, monospace;
+                          font-weight: 700; color: #2a4a66; white-space: nowrap; }
+        #btn-animation { width: 30px; height: 26px; padding: 0; box-sizing: border-box;
+                         border-radius: 5px; font-size: 14px;
                          border: 1px solid #4a85b5; color: white; font-weight: 700;
                          background: linear-gradient(180deg, #6aabda, #4a85b5);
                          box-shadow: 0 1px 4px rgba(0,0,0,0.28); cursor: pointer;
-                         flex-shrink: 0; line-height: 1; }
-        #btn-animation.playing { background: linear-gradient(180deg, #5abaaa, #3a9a8a);
-                                 border-color: #3a9a8a; }
+                         flex-shrink: 0; line-height: 1;
+                         /* flex-centre the glyph so ▶ and ■ both sit dead-centre and
+                            the button keeps a fixed size when the symbol swaps */
+                         display: inline-flex; align-items: center; justify-content: center; }
+        /* Keep the same blue whether showing play (▶) or pause (■) — the glyph
+           alone conveys state; no colour change on the button. */
+        #btn-animation.playing { background: linear-gradient(180deg, #6aabda, #4a85b5);
+                                 border-color: #4a85b5; }
         #copy-toast { position: fixed; top: 0; left: 0;
                       background: rgba(10,20,40,0.88); color: #8df;
                       border: 1px solid rgba(80,180,240,0.35); border-radius: 6px;
@@ -1112,34 +1145,40 @@ INDEX_TEMPLATE = """<!DOCTYPE html>
                       opacity: 0; transition: opacity 0.25s ease; }
         #copy-toast.visible { opacity: 1; }
         #ctrl-hint { position: fixed; bottom: 20px; left: 350px; z-index: 5;
-                     pointer-events: none; background: rgba(16,18,28,0.88);
+                     pointer-events: auto; background: rgba(16,18,28,0.88);
                      border-radius: 8px; padding: 10px 14px;
                      border: 1px solid rgba(255,255,255,0.08);
-                     box-shadow: 0 2px 12px rgba(0,0,0,0.45); }
+                     box-shadow: 0 2px 12px rgba(0,0,0,0.45);
+                     cursor: pointer; touch-action: manipulation;
+                     user-select: none; -webkit-user-select: none; }
+        #ctrl-hint.ctrl-active { background: rgba(255,215,55,0.96);
+                     border-color: rgba(255,235,120,1);
+                     box-shadow: 0 0 0 4px rgba(255,215,55,0.30),
+                                 0 2px 18px rgba(0,0,0,0.55); }
         #ctrl-hint-title { font-size: 13px; font-weight: 800;
                            color: #eee; letter-spacing: 0.4px;
                            line-height: 1.2; }
         #ctrl-hint-body { font-size: 10px; color: rgba(200,220,255,0.75);
                           margin-top: 4px; line-height: 1.7; }
+        #ctrl-hint.ctrl-active #ctrl-hint-title,
+        #ctrl-hint.ctrl-active #ctrl-hint-body { color: #17243a; }
         .status-highlight { animation: status-highlight 1.1s ease-out; }
-        #ctrl-hint.ctrl-highlight { animation: ctrl-highlight 2.6s ease-out; }
+        /* Short blue attention pulse on arming a mode — deliberately NOT yellow so
+           it isn't mistaken for the yellow ctrl-active (Ctrl held / inspect) state.
+           Keeps the dark background; just flashes a blue ring + slight scale. */
+        #ctrl-hint.ctrl-highlight { animation: ctrl-highlight 0.9s ease-out; }
         @keyframes status-highlight {
             0% { background: rgba(255,220,80,0.9); color: #17243a;
                  box-shadow: 0 0 0 3px rgba(255,220,80,0.35); }
             100% { background: transparent; box-shadow: none; }
         }
         @keyframes ctrl-highlight {
-            0%, 55% { background: rgba(255,215,55,0.98);
-                 color: #17243a; border-color: rgba(255,235,120,1);
-                 box-shadow: 0 0 0 7px rgba(255,215,55,0.42), 0 2px 18px rgba(0,0,0,0.55);
-                 transform: scale(1.08); }
+            0%, 35% { border-color: rgba(106,171,218,0.95);
+                 box-shadow: 0 0 0 5px rgba(106,171,218,0.45), 0 2px 18px rgba(0,0,0,0.55);
+                 transform: scale(1.05); }
             100% { border-color: rgba(255,255,255,0.08);
-                   color: inherit;
-                   background: rgba(16,18,28,0.88);
                    box-shadow: 0 2px 12px rgba(0,0,0,0.45); transform: scale(1); }
         }
-        #ctrl-hint.ctrl-highlight #ctrl-hint-title,
-        #ctrl-hint.ctrl-highlight #ctrl-hint-body { color: #17243a; }
         #tooltip { position: fixed; pointer-events: none; padding: 6px 10px;
                    background: rgba(0,0,0,0.85); color: white; font: 12px monospace;
                    border-radius: 4px; z-index: 100; display: none; white-space: nowrap; }
@@ -1179,7 +1218,13 @@ INDEX_TEMPLATE = """<!DOCTYPE html>
 """
 
 # update_title=None disables Dash's default "Updating..." tab-title swap during callbacks.
-app = Dash(__name__, suppress_callback_exceptions=True, update_title=None)
+app = Dash(__name__, suppress_callback_exceptions=True, update_title=None,
+           # Override Dash's auto-injected viewport so there's a single authoritative
+           # tag. maximum-scale=1 stops accidental pinch-zoom of the page while
+           # interacting with the map; viewport-fit=cover handles the safe-area insets.
+           meta_tags=[{'name': 'viewport',
+                       'content': 'width=device-width, initial-scale=1, '
+                                  'maximum-scale=1, viewport-fit=cover'}])
 app.title = 'aiswakepy'
 app.index_string = INDEX_TEMPLATE
 server = app.server
@@ -1418,6 +1463,8 @@ def _r_upload(role: str):
         filename = path.name
         state.files[role] = path
         state.original_names[role] = filename
+        if role == 'ais':
+            state.ais_bbox_cache.clear()  # new AIS data → drop any cached bbox
         resp: dict = {
             'role': role,
             'filename': filename,
@@ -1443,6 +1490,7 @@ def _r_example():
         if not EXAMPLE_DATA.exists():
             return jsonify({'error': 'example_data/ directory not found in this deployment'}), 404
 
+        state.ais_bbox_cache.clear()  # example replaces session data → drop cached bbox
         loaded: dict[str, dict] = {}
 
         for role, spec in ROLE_SPECS.items():
@@ -1961,12 +2009,35 @@ def _parse_bbox(bbox_str: str) -> tuple | None:
         return None
 
 
+def _session_ais_bbox(state: 'SessionState') -> tuple | None:
+    """Bbox (west, south, east, north) of the session's AIS data, padded 2×
+    (0.5× each side) — same expansion the client applies. Used as the bathy
+    preview crop when the client hasn't supplied a bbox yet (e.g. the first
+    auto-render after upload/example, before __aisBbox is known client-side).
+    Cached per AIS path so the two bathy routes don't re-read the CSV."""
+    ais_path = state.files.get('ais')
+    if not ais_path or not Path(ais_path).exists():
+        return None
+    key = str(ais_path)
+    cached = state.ais_bbox_cache.get(key)
+    if cached is not None:
+        return cached
+    try:
+        bw, bs, be, bn = _preview_ais_bbox(Path(ais_path))['bbox']
+    except Exception:
+        return None
+    dlon, dlat = (be - bw) * 0.5, (bn - bs) * 0.5
+    padded = (bw - dlon, bs - dlat, be + dlon, bn + dlat)
+    state.ais_bbox_cache[key] = padded
+    return padded
+
+
 @app.server.route('/api/preview/bathy.arrow')
 def _r_preview_bathy():
     try:
         state = _get_session()
         p = _session_path(state, request.args.get('path', ''))
-        bbox = _parse_bbox(request.args.get('bbox', ''))
+        bbox = _parse_bbox(request.args.get('bbox', '')) or _session_ais_bbox(state)
         result = _preview_bathy_arrow(p, bbox)
         if result is None:
             return jsonify(error='dfs2 grid preview not implemented'), 400
@@ -1981,7 +2052,7 @@ def _r_preview_bathy_offsets():
     try:
         state = _get_session()
         p = _session_path(state, request.args.get('path', ''))
-        bbox = _parse_bbox(request.args.get('bbox', ''))
+        bbox = _parse_bbox(request.args.get('bbox', '')) or _session_ais_bbox(state)
         result = _preview_bathy_arrow(p, bbox)
         if result is None:
             return jsonify(error='dfs2 grid preview not implemented'), 400
@@ -2088,7 +2159,7 @@ app.layout = html.Div([
                   style={'fontSize': '11px', 'color': '#556', 'whiteSpace': 'nowrap',
                          'overflow': 'hidden', 'textOverflow': 'ellipsis',
                          'maxWidth': '260px', 'flexShrink': '1'}),
-        html.Div('AISWAKEPY_PUBLIC', id='banner-title'),
+        html.Div('AISWAKEPY', id='banner-title'),
         html.Div([
             html.Span(id='ais-time-range', style={'color': '#558', 'marginRight': '4px'}),
             html.Span(id='cnt-vessels', children='vessels 0'),
@@ -2097,7 +2168,10 @@ app.layout = html.Div([
             ' | ', html.Span(id='status', children='loading...'),
             ' | ', html.Span(id='click-info', style={'fontWeight': 'bold'}),
         ], id='banner-meta'),
-        html.Button('▶', id='btn-animation', disabled=True,
+        # Selected-segment label — pushed to the far right (margin-left:auto) so it
+        # sits next to the play button when a track segment is selected.
+        html.Span('', id='anim-seg-label', style={'display': 'none'}),
+        html.Button('▶︎', id='btn-animation', disabled=True,
                     title='Ctrl+click a track, track point, or wave to select an animation',
                     style={'display': 'none'}),
     ], id='status-banner'),
@@ -2229,7 +2303,7 @@ app.layout = html.Div([
             html.Div('+ hover for vessel / track / wave'),
             html.Div('+ click to pin & copy MMSI'),
         ], id='ctrl-hint-body'),
-    ], id='ctrl-hint'),
+    ], id='ctrl-hint', role='button', tabIndex=0, **{'aria-pressed': 'false'}),
     # Freehand draw canvas (overlaid on deck-container, managed by JS)
     html.Canvas(id='freehand-canvas', style={
         'position': 'fixed', 'top': '40px', 'left': '340px', 'right': '0', 'bottom': '0',
@@ -2746,10 +2820,25 @@ async function(n) {
     if (!n || window.__deck_initialized) return window.dash_clientside.no_update;
     const container = document.getElementById('deck-container');
     if (!container) return window.dash_clientside.no_update;
+    // The deck.gl UMD bundle loads from an external CDN; on mobile Safari over
+    // LAN it can take well over the 200ms 'boot' interval to arrive. 'boot' has
+    // max_intervals=1, so a one-shot bail would never retry. Poll (up to 30s)
+    // instead so init survives a slow bundle rather than leaving a blank canvas.
     if (typeof deck === 'undefined') {
-        document.getElementById('status').textContent = 'waiting for deck.gl...';
-        setTimeout(() => { window.__deck_initialized = false; }, 100);
-        return window.dash_clientside.no_update;
+        const statusEl = document.getElementById('status');
+        if (statusEl) statusEl.textContent = 'loading deck.gl...';
+        const ready = await new Promise((resolve) => {
+            let waited = 0;
+            const iv = setInterval(() => {
+                if (typeof deck !== 'undefined') { clearInterval(iv); resolve(true); }
+                else if ((waited += 150) >= 30000) { clearInterval(iv); resolve(false); }
+            }, 150);
+        });
+        if (!ready) {
+            const s = document.getElementById('status');
+            if (s) s.textContent = 'ERROR: deck.gl failed to load (check network)';
+            return window.dash_clientside.no_update;
+        }
     }
     window.__deck_initialized = true;
     if (!window.__sessionId) {
@@ -2791,7 +2880,7 @@ async function(n) {
         }, duration);
     };
     window.__highlightCtrlHint = () =>
-        pulseElement(document.getElementById('ctrl-hint'), 'ctrl-highlight', 2800);
+        pulseElement(document.getElementById('ctrl-hint'), 'ctrl-highlight', 950);
     for (const id of ['upload-status', 'export-status', 'fil-status']) {
         const el = document.getElementById(id);
         if (!el || el.dataset.highlightReady) continue;
@@ -2945,6 +3034,12 @@ async function(n) {
     // ---------- Reusable progress overlay (used post-pipeline for Arrow transfer) ----------
     const fmt = (b) => b > 1e6 ? (b/1e6).toFixed(1)+' MB' : (b/1e3).toFixed(0)+' KB';
     async function fetchAssetsWithProgress(assets, title) {
+        // Every caller parses the returned buffers with window.tableFromIPC, so
+        // make sure apache-arrow has finished loading first. With the deck mount
+        // no longer hard-gated on arrow (see waitArrow), a data load could in
+        // principle start before arrow is ready; this awaits it (resolves even
+        // on load failure, so a genuine CDN outage still surfaces downstream).
+        if (!window.tableFromIPC && window.__arrowReady) await window.__arrowReady;
         const overlay = document.createElement('div');
         overlay.id = 'progress-overlay';
         overlay.innerHTML = `
@@ -3058,9 +3153,17 @@ async function(n) {
         let h = null;
         return (...a) => { clearTimeout(h); h = setTimeout(() => fn(...a), ms); };
     };
+    // Wait for apache-arrow, but never block deck.gl mounting indefinitely: if
+    // the 'arrow-ready' event somehow never fires (e.g. the module load hangs on
+    // iOS WebKit), fall through after a timeout so the basemap still renders.
+    // Arrow-dependent data loads happen later (post-pipeline) and re-await
+    // window.__arrowReady at that point, so a late arrow is still handled.
     const waitArrow = window.tableFromIPC
         ? Promise.resolve()
-        : new Promise(r => window.addEventListener('arrow-ready', r, { once: true }));
+        : Promise.race([
+            window.__arrowReady || new Promise(r => window.addEventListener('arrow-ready', r, { once: true })),
+            new Promise(r => setTimeout(r, 15000)),
+          ]);
 
     const status = document.getElementById('status');
     status.textContent = 'initialising...';
@@ -3266,11 +3369,31 @@ async function(n) {
         const animation = new window.VesselWaveAnimationController({
             realTimeScale: 50,
             onChange: state => {
+                const sel = state.selection;
                 if (animationButton) {
-                    animationButton.style.display = state.selection ? '' : 'none';
-                    animationButton.disabled = !state.selection;
-                    animationButton.textContent = state.playing ? '⏸' : '▶';
+                    animationButton.style.display = sel ? '' : 'none';
+                    animationButton.disabled = !sel;
+                    // Pause = U+23F8 ⏸ (preferred shape) + U+FE0E text-presentation
+                    // selector to request the plain (non-emoji) glyph on iOS.
+                    // Centering is handled by flex layout on #btn-animation in CSS.
+                    animationButton.textContent = state.playing ? '⏸︎' : '▶︎';
                     animationButton.classList.toggle('playing', state.playing);
+                }
+                // When a track segment is selected, free up the top bar: hide the
+                // counts/time/status metadata, and show the selected segment's label
+                // next to the play button on the far right (margin-left:auto in CSS).
+                const bannerMeta = document.getElementById('banner-meta');
+                if (bannerMeta) bannerMeta.style.display = sel ? 'none' : '';
+                const segLabel = document.getElementById('anim-seg-label');
+                if (segLabel) {
+                    if (sel) {
+                        segLabel.textContent = (sel.mmsi != null)
+                            ? `MMSI ${sel.mmsi} · seg ${sel.segmentId}` : '';
+                        segLabel.style.display = '';
+                    } else {
+                        segLabel.style.display = 'none';
+                        segLabel.textContent = '';
+                    }
                 }
                 if (window.deckInstance && typeof window.__rebuild === 'function') {
                     window.__rebuild();
@@ -3640,20 +3763,8 @@ async function(n) {
                 if (typeof window.__updateCascadeTrigger === 'function') window.__updateCascadeTrigger();
                 const p = document.getElementById('sim-panel');
                 if (p) p.style.display = 'none';
-                // Reset armed states and restore button labels
-                if (window.__freehandArmed || window.__freehandMode) {
-                    if (typeof window.__cancelFreehandDraw === 'function') window.__cancelFreehandDraw();
-                    window.__freehandArmed = false;
-                    const bf = document.getElementById('btn-freehand');
-                    if (bf) { bf.textContent = 'Draw line across tracks'; bf.style.opacity = ''; }
-                }
-                if (window.__polygonController) window.__polygonController.cancel();
-                if (window.__similarArmed) {
-                    window.__similarArmed = false;
-                    const bs = document.getElementById('btn-similar');
-                    if (bs) { bs.textContent = 'Select one representative track'; bs.style.opacity = ''; }
-                }
-                window.__updateDeckCursor();
+                // Cancel any active map-draw / pick selection mode + restore labels.
+                window.__cancelOtherSelectionModes();
             } else {
                 // Partial update from "Apply filters" — only vessel types go through Dash.
                 // MMSI/seg are managed client-side by the cascade widget; don't override them.
@@ -3694,6 +3805,28 @@ async function(n) {
         window.__freehandMode  = false;
         window.__cancelFreehandDraw = null;
 
+        // Cancel every map-draw / pick selection mode except the one named, and
+        // restore the button labels. Used both to enforce mutual exclusion when a
+        // new mode is entered (pass the mode being entered) and to clear all modes
+        // on Reset/recalculate (pass nothing). Modes: 'freehand', 'wavebox', 'similar'.
+        window.__cancelOtherSelectionModes = (except) => {
+            if (except !== 'freehand' && (window.__freehandArmed || window.__freehandMode)) {
+                if (typeof window.__cancelFreehandDraw === 'function') window.__cancelFreehandDraw();
+                window.__freehandArmed = false;
+                const bf = document.getElementById('btn-freehand');
+                if (bf) { bf.textContent = 'Draw line across tracks'; bf.style.opacity = ''; }
+            }
+            if (except !== 'wavebox' && window.__polygonController) {
+                window.__polygonController.cancel();
+            }
+            if (except !== 'similar' && window.__similarArmed) {
+                window.__similarArmed = false;
+                const bs = document.getElementById('btn-similar');
+                if (bs) { bs.textContent = 'Select one representative track'; bs.style.opacity = ''; }
+            }
+            if (typeof window.__updateDeckCursor === 'function') window.__updateDeckCursor();
+        };
+
         window.__enterFreehandMode = () => {
             const btn = document.getElementById('btn-freehand');
             if (window.__freehandArmed) {
@@ -3702,6 +3835,7 @@ async function(n) {
                 window.__updateDeckCursor();
                 return;
             }
+            window.__cancelOtherSelectionModes('freehand');  // terminate any other active mode
             window.__freehandArmed = true;
             if (btn) { btn.textContent = 'Hold Ctrl to draw...'; btn.style.opacity = '0.65'; }
             if (typeof window.__highlightCtrlHint === 'function') window.__highlightCtrlHint();
@@ -3875,6 +4009,7 @@ async function(n) {
         window.__polygonController = polygonController;
         window.__enterWaveBoxMode = () => {
             if (!window.__hasWaves || wMMSI.length === 0) return;
+            window.__cancelOtherSelectionModes('wavebox');  // terminate any other active mode
             polygonController.setCtrlHeld(window.__ctrlHeld);
             const armed = polygonController.arm();
             if (armed && typeof window.__highlightCtrlHint === 'function') {
@@ -3923,20 +4058,8 @@ async function(n) {
             }
             const simPanel = document.getElementById('sim-panel');
             if (simPanel) simPanel.style.display = 'none';
-            // Reset armed states and restore button labels
-            if (window.__freehandArmed || window.__freehandMode) {
-                if (typeof window.__cancelFreehandDraw === 'function') window.__cancelFreehandDraw();
-                window.__freehandArmed = false;
-                const bf = document.getElementById('btn-freehand');
-                if (bf) { bf.textContent = 'Draw line across tracks'; bf.style.opacity = ''; }
-            }
-            if (window.__polygonController) window.__polygonController.cancel();
-            if (window.__similarArmed) {
-                window.__similarArmed = false;
-                const bs = document.getElementById('btn-similar');
-                if (bs) { bs.textContent = 'Select one representative track'; bs.style.opacity = ''; }
-            }
-            window.__updateDeckCursor();
+            // Cancel any active map-draw / pick selection mode + restore labels.
+            window.__cancelOtherSelectionModes();
             window.__recomputeVisibility();
         };
 
@@ -3951,6 +4074,7 @@ async function(n) {
                 window.__updateDeckCursor();
                 return 'Similar mode cancelled';
             }
+            window.__cancelOtherSelectionModes('similar');  // terminate any other active mode
             window.__similarArmed = true;
             if (btn) { btn.textContent = 'Ctrl+click a track...'; btn.style.opacity = '0.65'; }
             if (typeof window.__highlightCtrlHint === 'function') window.__highlightCtrlHint();
@@ -4626,6 +4750,7 @@ async function(n) {
         const initialZoom = 10;
         const CURSOR_PENCIL = `url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='22' height='22' viewBox='0 0 22 22'%3E%3Cpath fill='%23ffffff' stroke='%23222222' stroke-width='1.3' stroke-linejoin='round' d='M3 19L15 2l4 4L5 21z'/%3E%3Cpath fill='%23cccccc' stroke='%23555555' stroke-width='1' d='M3 19l4 2-5-5z'/%3E%3Ccircle cx='18' cy='5' r='1' fill='%2380c0ff'/%3E%3C/svg%3E") 0 22, crosshair`;
         window.__ctrlHeld = false;
+        window.__ctrlSources = { keyboard: false, touchToggle: false };
         // Pan + zoom always on. Ctrl key gates hover/click (inspect mode).
         const DEFAULT_CONTROLLER = { type: deck.MapController, dragPan: true,
             dragRotate: false, scrollZoom: true, doubleClickZoom: true, touchZoom: true };
@@ -4658,23 +4783,36 @@ async function(n) {
                 const hasCtrl = window.__ctrlHeld || !!(event?.srcEvent?.ctrlKey);
                 if (!hasCtrl) return;
                 if (!window.__ctrlHeld) { window.__ctrlHeld = true; window.__updateDeckCursor(); }
-                // Similar pick mode: capture the clicked track
-                if (window.__similarArmed && layer && layer.id === 'tracks' && index >= 0) {
-                    window.__similarArmed = false;
-                    window.__updateDeckCursor();
-                    const si = (window.__visibleSegIdxs !== null && filteredSegIdxs.length > 0)
-                        ? filteredSegIdxs[index] : index;
-                    const mmsi = Number(tMMSI[si]);
-                    const seg  = Number(tSeg[si]);
-                    window.__simPickedData = { mmsi, seg };
-                    const lbl = document.getElementById('sim-picked-label');
-                    if (lbl) lbl.textContent = `Picked: MMSI ${mmsi} / seg ${seg}`;
-                    const panel = document.getElementById('sim-panel');
-                    if (panel) panel.style.display = 'block';
-                    const btn = document.getElementById('btn-similar');
-                    if (btn) { btn.textContent = 'Select one representative track'; btn.style.opacity = ''; }
-                    window.__copyText(String(mmsi));
-                    if (typeof window.__showCopyToast === 'function') window.__showCopyToast(mmsi, event?.srcEvent?.clientX, event?.srcEvent?.clientY);
+                // While a map-draw filter mode (free-hand line or wave polygon) is
+                // active, suppress the general track/wave/vessel selection so it can't
+                // fire alongside the draw operation. (Similar mode is handled below.)
+                const polyState = window.__polygonController?.getState();
+                if (window.__freehandArmed || window.__freehandMode ||
+                    polyState?.armed || polyState?.drawing) {
+                    return;
+                }
+                // Similar pick mode: while armed, the ONLY permitted action is
+                // picking a representative track. Suppress the general track/
+                // animation selection entirely (track points, waves, empty space)
+                // so it can't fire alongside — the two modes were contradictory.
+                if (window.__similarArmed) {
+                    if (layer && layer.id === 'tracks' && index >= 0) {
+                        window.__similarArmed = false;
+                        window.__updateDeckCursor();
+                        const si = (window.__visibleSegIdxs !== null && filteredSegIdxs.length > 0)
+                            ? filteredSegIdxs[index] : index;
+                        const mmsi = Number(tMMSI[si]);
+                        const seg  = Number(tSeg[si]);
+                        window.__simPickedData = { mmsi, seg };
+                        const lbl = document.getElementById('sim-picked-label');
+                        if (lbl) lbl.textContent = `Picked: MMSI ${mmsi} / seg ${seg}`;
+                        const panel = document.getElementById('sim-panel');
+                        if (panel) panel.style.display = 'block';
+                        const btn = document.getElementById('btn-similar');
+                        if (btn) { btn.textContent = 'Select one representative track'; btn.style.opacity = ''; }
+                        window.__copyText(String(mmsi));
+                        if (typeof window.__showCopyToast === 'function') window.__showCopyToast(mmsi, event?.srcEvent?.clientX, event?.srcEvent?.clientY);
+                    }
                     return;
                 }
                 if (!layer || index < 0) {
@@ -4742,43 +4880,84 @@ async function(n) {
         window.__updateDeckCursor = (isDragging = false) => {
             container.style.cursor = getCursorForState(isDragging);
         };
+        const syncCtrlHint = () => {
+            const hint = document.getElementById('ctrl-hint');
+            if (!hint) return;
+            const active = !!window.__ctrlHeld;
+            hint.classList.toggle('ctrl-active', active);
+            hint.setAttribute('aria-pressed', active ? 'true' : 'false');
+            hint.title = active ? 'Tap to leave inspect mode' : 'Tap to enter inspect mode';
+            const title = document.getElementById('ctrl-hint-title');
+            if (title) title.textContent = active ? 'Inspect mode ON' : 'Hold Ctrl / Tap:';
+        };
+        window.__syncCtrlMode = () => {
+            const nextHeld = !!(window.__ctrlSources.keyboard || window.__ctrlSources.touchToggle);
+            const changed = nextHeld !== window.__ctrlHeld;
+            window.__ctrlHeld = nextHeld;
+            syncCtrlHint();
+            if (changed) {
+                if (!nextHeld) {
+                    hideTip();
+                    if (window.__freehandMode &&
+                            typeof window.__cancelFreehandDraw === 'function') {
+                        window.__cancelFreehandDraw();
+                    }
+                }
+                if (window.__polygonController) {
+                    window.__polygonController.setCtrlHeld(nextHeld);
+                }
+                if (typeof window.__rebuild === 'function') window.__rebuild();
+            }
+            if (nextHeld) {
+                if (window.__freehandArmed && !window.__freehandMode) {
+                    window.__activateFreehandDraw();
+                }
+                if (window.__polygonController) {
+                    window.__polygonController.setCtrlHeld(true);
+                }
+            }
+            window.__updateDeckCursor();
+            return window.__ctrlHeld;
+        };
+        window.__setCtrlSource = (source, value) => {
+            if (!window.__ctrlSources || !(source in window.__ctrlSources)) return window.__ctrlHeld;
+            window.__ctrlSources[source] = !!value;
+            return window.__syncCtrlMode();
+        };
+        const ctrlHint = document.getElementById('ctrl-hint');
+        if (ctrlHint) {
+            ctrlHint.addEventListener('click', (e) => {
+                e.preventDefault();
+                e.stopPropagation();
+                window.__setCtrlSource('touchToggle', !window.__ctrlSources.touchToggle);
+            });
+            ctrlHint.addEventListener('keydown', (e) => {
+                if (e.key !== 'Enter' && e.key !== ' ') return;
+                e.preventDefault();
+                window.__setCtrlSource('touchToggle', !window.__ctrlSources.touchToggle);
+            });
+            syncCtrlHint();
+        }
         // Ctrl held = inspect mode (hover tooltips + click picking enabled).
         // No INPUT/TEXTAREA guard — __ctrlHeld only affects the map, not DOM inputs;
         // those handle Ctrl+A/C/V natively regardless of this flag.
         window.addEventListener('keydown', (e) => {
-            if (e.key !== 'Control' || window.__ctrlHeld) return;
-            window.__ctrlHeld = true;
-            window.__updateDeckCursor();
-            if (typeof window.__rebuild === 'function') window.__rebuild();
-            if (window.__freehandArmed && !window.__freehandMode) window.__activateFreehandDraw();
-            if (window.__polygonController) window.__polygonController.setCtrlHeld(true);
+            if (e.key !== 'Control') return;
+            window.__setCtrlSource('keyboard', true);
         });
         window.addEventListener('keyup', (e) => {
-            if (e.key !== 'Control' || !window.__ctrlHeld) return;
-            window.__ctrlHeld = false;
-            hideTip();
-            if (window.__freehandMode && typeof window.__cancelFreehandDraw === 'function') window.__cancelFreehandDraw();
-            if (window.__polygonController) window.__polygonController.setCtrlHeld(false);
-            window.__updateDeckCursor();
+            if (e.key !== 'Control') return;
+            window.__setCtrlSource('keyboard', false);
         });
         // Clear inspect mode if window loses focus while Ctrl is held (otherwise
         // ctrl-tabbing away leaves the flag stuck on with no key event to clear it)
         window.addEventListener('blur', () => {
-            if (!window.__ctrlHeld) return;
-            window.__ctrlHeld = false;
-            hideTip();
-            if (window.__freehandMode && typeof window.__cancelFreehandDraw === 'function') window.__cancelFreehandDraw();
-            if (window.__polygonController) window.__polygonController.setCtrlHeld(false);
-            window.__updateDeckCursor();
+            window.__setCtrlSource('keyboard', false);
         });
         container.addEventListener('mousedown', (e) => {
             // Sync Ctrl state from the real event so first-interaction Ctrl+click works
-            if (e.ctrlKey && !window.__ctrlHeld) {
-                window.__ctrlHeld = true;
-                window.__updateDeckCursor();
-                // Activate armed modes in case keydown didn't fire before Ctrl was held
-                if (window.__freehandArmed && !window.__freehandMode) window.__activateFreehandDraw();
-                if (window.__polygonController) window.__polygonController.setCtrlHeld(true);
+            if (e.ctrlKey && !window.__ctrlSources.keyboard) {
+                window.__setCtrlSource('keyboard', true);
             }
             if (!window.__freehandMode && !window.__polygonController?.getState().drawing) {
                 window.__updateDeckCursor(true);
